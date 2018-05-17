@@ -1,0 +1,3 @@
+version=3
+opts=dversionmangle=s/0\+a//,filenamemangle=s/.+\/a(\d\S*)\.tar\.gz/looking-glass-a$1\.tar\.gz/ \
+	https://github.com/gnif/LookingGlass/releases .*/a(\d\S*)\.tar\.gz
