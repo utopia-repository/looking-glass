@@ -1,0 +1,31 @@
+From: Lennart Weller <lhw@ring0.de>
+Date: Mon, 4 Jun 2018 11:25:46 +0200
+Subject: Remove old libssl linking and change build_version to debian package
+ version
+
+---
+ client/Makefile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/client/Makefile b/client/Makefile
+index 3c0f741..86e080a 100644
+--- a/client/Makefile
++++ b/client/Makefile
+@@ -7,7 +7,7 @@ CFLAGS  += -fdata-sections -ffunction-sections
+ LDFLAGS += -Wl,--gc-sections
+ CFLAGS  += -Wfatal-errors
+ 
+-LIBS    = sdl2 SDL2_ttf gl glu libssl openssl spice-protocol fontconfig x11 libconfig
++LIBS    = sdl2 SDL2_ttf gl glu spice-protocol fontconfig x11 libconfig
+ 
+ LIBS    += nettle hogweed
+ CFLAGS  += -D USE_NETTLE
+@@ -21,7 +21,7 @@ LDFLAGS += $(shell pkg-config --libs   $(LIBS))
+ BUILD   ?= .build
+ BIN     ?= bin
+ 
+-CFLAGS  += -DBUILD_VERSION='"$(shell git describe --always --long --dirty --abbrev=10 --tags)"'
++CFLAGS  += -DBUILD_VERSION='"debian/$(DEB_VERSION)"'
+ 
+ OBJS	= main.o \
+ 	  lg-renderer.o \
