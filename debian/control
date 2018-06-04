@@ -3,6 +3,7 @@ Section: net
 Priority: optional
 Maintainer: Lennart Weller <lhw@ring0.de>
 Build-Depends: debhelper (>= 11~),
+               libconfig-dev,
                libfontconfig-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
