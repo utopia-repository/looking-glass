@@ -55,14 +55,21 @@ private:
   HANDLE     m_timer;
   ICapture * m_capture;
 
-  KVMFRDetail   m_detail;
   KVMFRHeader * m_shmHeader;
+
   uint8_t     * m_frame[2];
   size_t        m_frameSize;
   uint64_t      m_dataOffset[2];
   int           m_frameIndex;
 
-  size_t        m_cursorDataSize;
-  uint8_t     * m_cursorData;
-  uint64_t      m_cursorOffset;
+  static DWORD WINAPI _CursorThread(LPVOID lpParameter) { return ((Service *)lpParameter)->CursorThread(); }
+  DWORD CursorThread();
+
+  HANDLE           m_cursorThread;
+  HANDLE           m_cursorEvent;
+  CursorInfo       m_cursorInfo;
+  CRITICAL_SECTION m_cursorCS;
+  size_t           m_cursorDataSize;
+  uint8_t        * m_cursorData;
+  uint64_t         m_cursorOffset;
 };

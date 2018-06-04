@@ -25,6 +25,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 struct CursorInfo
 {
+  bool            updated;
+
   bool            visible;
   bool            hasShape;
   bool            hasPos;
@@ -45,8 +47,6 @@ struct FrameInfo
   unsigned int pitch;
   void * buffer;
   size_t bufferSize;
-
-  struct CursorInfo cursor;
 };
 
 enum GrabStatus
@@ -69,5 +69,5 @@ public:
   virtual bool ReInitialize() = 0;
   virtual enum FrameType GetFrameType() = 0;
   virtual size_t GetMaxFrameSize() = 0;
-  virtual enum GrabStatus GrabFrame(struct FrameInfo & frame) = 0;
+  virtual enum GrabStatus GrabFrame(struct FrameInfo & frame, struct CursorInfo & cursor) = 0;
 };
