@@ -1,5 +1,5 @@
-looking-glass (0+a10-1) UNRELEASED; urgency=medium
+looking-glass (0+a11-1) UNRELEASED; urgency=medium
 
-  * Initial release. (Closes: #XXXXXX)
+  * Initial release. (Closes: #898931)
 
- -- Lennart Weller <lhw@ring0.de>  Thu, 17 May 2018 15:02:50 +0200
+ -- Lennart Weller <lhw@ring0.de>  Mon, 04 Jun 2018 11:01:31 +0200
