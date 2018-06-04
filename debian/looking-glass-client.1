@@ -1,0 +1,95 @@
+.TH LOOKING-GLASS-CLIENT 1 "June 04, 2018"
+.\" Please adjust this date whenever revising the manpage.
+.SH NAME
+looking-glass-client \- Low latency KVM FrameRelay implementation
+.SH SYNOPSIS
+\fBlooking-glass-client\fP [\fIOPTIONS\fP]
+.SH DESCRIPTION
+LookingGlass enables you to use shared memory to pass rendered frames from a
+virtual machine back to the host system.
+
+A LookingGlass Host implementation is required to run on the guest virtual
+machine. It is recommended that the client and host versions match.
+.SH OPTIONS
+.TP
+.BI -h
+Print out this help                                                                                                                                                                         
+.TP
+.BI -C\ \fIPATH\fP
+Specify an additional configuration file to load                                                                                                                                            
+
+A default configuration file can be found at /usr/share/docs/looking-glass/looking-glass.conf
+.TP
+.BI -f\ \fIPATH\fP
+Specify the path to the shared memory file [default: /dev/shm/looking-glass]            
+.TP
+.BI -L\ \fISIZE\fP
+Specify the size in MB of the shared memory file (0 = detect) [default: 0]              
+.TP
+.BI -s
+Disable spice client                  
+.TP
+.BI -c\ \fIHOST\fP
+Specify the spice host or UNIX socket [default: 127.0.0.1]                              
+.TP
+.BI -p\ \fIPORT\fP
+Specify the spice port or 0 for UNIX socket [default: 5900]                             
+.TP
+.BI -j
+Disable cursor position scaling       
+.TP
+.BI -M
+Don't hide the host cursor            
+.TP
+.BI -K
+Set the FPS limit [default: 200]      
+.TP
+.BI -k
+Enable FPS display                    
+.TP
+.BI -g\ \fINAME\fP
+Force the use of a specific renderer  
+.TP
+.BI -o\ \fIOPTION\fP
+Specify a renderer option (ie: opengl:vsync=0)                                          
+
+Alternatively specify "list" to list all renderers and their options                    
+.TP
+.BI -a
+Auto resize the window to the guest   
+.TP
+.BI -n
+Don't allow the window to be manually resized                                           
+.TP
+.BI -r
+Don't maintain the aspect ratio       
+.TP
+.BI -d
+Borderless mode                       
+.TP
+.BI -F
+Borderless fullscreen mode            
+.TP
+.BI -x\ \fIXPOS\fP
+Initial window X position [default: center]                                             
+.TP
+.BI -y\ \fIYPOS\fP
+Initial window Y position [default: center]                                             
+.TP
+.BI -w\ \fIWIDTH\fP
+Initial window width [default: 1024]  
+.TP
+.BI -b\ \fIHEIGHT\fP
+Initial window height [default: 768]  
+.TP
+.BI -Q
+Ignore requests to quit (ie: Alt+F4)  
+.TP
+.BI -l
+License information  
+.RE
+.SH AUTHOR
+looking-glass-client is written by Geoffrey McRae (https://looking-glass.hostfission.com/)
+.PP
+This manual page was written by Lennart Weller <lhw@ring0.de>,
+for the Debian project (but may be used by others).
