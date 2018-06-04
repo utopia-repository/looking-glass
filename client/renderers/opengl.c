@@ -21,6 +21,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdint.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <malloc.h>
 
 #include <SDL2/SDL_ttf.h>
 
@@ -30,24 +31,21 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <GL/glx.h>
 
 #include "debug.h"
-#include "memcpySSE.h"
 #include "utils.h"
+#include "lg-decoders.h"
 
 #define BUFFER_COUNT       2
 
-#define FRAME_TEXTURE      0
-#define FPS_TEXTURE        1
-#define MOUSE_TEXTURE      2
-#define TEXTURE_COUNT      3
-
-static PFNGLXGETVIDEOSYNCSGIPROC  glXGetVideoSyncSGI  = NULL;
-static PFNGLXWAITVIDEOSYNCSGIPROC glXWaitVideoSyncSGI = NULL;
+#define FPS_TEXTURE        0
+#define MOUSE_TEXTURE      1
+#define TEXTURE_COUNT      2
 
 struct Options
 {
   bool mipmap;
   bool vsync;
   bool preventBuffer;
+  bool amdPinnedMem;
 };
 
 static struct Options defaultOptions =
@@ -55,6 +53,7 @@ static struct Options defaultOptions =
   .mipmap        = true,
   .vsync         = true,
   .preventBuffer = true,
+  .amdPinnedMem  = true,
 };
 
 struct Inst
@@ -62,10 +61,11 @@ struct Inst
   LG_RendererParams params;
   struct Options    opt;
 
+  bool              amdPinnedMemSupport;
+  bool              preConfigured;
   bool              configured;
   bool              reconfigure;
   SDL_GLContext     glContext;
-  bool              doneInfo;
 
   SDL_Point         window;
   bool              resizeWindow;
@@ -76,22 +76,27 @@ struct Inst
   GLuint            intFormat;
   GLuint            vboFormat;
   size_t            texSize;
+  const LG_Decoder* decoder;
+  void            * decoderData;
 
   uint64_t          drawStart;
   bool              hasBuffers;
-  GLuint            vboID[1];
+  GLuint            vboID[BUFFER_COUNT];
   uint8_t         * texPixels[BUFFER_COUNT];
   LG_Lock           syncLock;
-  int               texIndex, wTexIndex;
+  bool              texReady;
+  int               texIndex;
   int               texList;
   int               fpsList;
   int               mouseList;
   LG_RendererRect   destRect;
 
-  bool              hasTextures;
+  bool              hasTextures, hasFrames;
+  GLuint            frames[BUFFER_COUNT];
+  GLsync            fences[BUFFER_COUNT];
+  void            * decoderFrames[BUFFER_COUNT];
   GLuint            textures[TEXTURE_COUNT];
 
-  uint              gpuFrameCount;
   bool              fpsTexture;
   uint64_t          lastFrameTime;
   uint64_t          renderTime;
@@ -119,10 +124,12 @@ static bool _check_gl_error(unsigned int line, const char * name);
 #define check_gl_error(name) _check_gl_error(__LINE__, name)
 
 static void deconfigure(struct Inst * this);
+static bool pre_configure(struct Inst * this, SDL_Window *window);
 static bool configure(struct Inst * this, SDL_Window *window);
 static void update_mouse_shape(struct Inst * this, bool * newShape);
 static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
+static void render_wait();
 
 const char * opengl_get_name()
 {
@@ -156,19 +163,6 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
     return false;
-
-  if (!glXGetVideoSyncSGI)
-  {
-    glXGetVideoSyncSGI  = (PFNGLXGETVIDEOSYNCSGIPROC )glXGetProcAddress((const GLubyte *)"glXGetVideoSyncSGI" );
-    glXWaitVideoSyncSGI = (PFNGLXWAITVIDEOSYNCSGIPROC)glXGetProcAddress((const GLubyte *)"glXWaitVideoSyncSGI");
-
-    if (!glXGetVideoSyncSGI || !glXWaitVideoSyncSGI)
-    {
-      glXGetVideoSyncSGI = NULL;
-      DEBUG_ERROR("Failed to get proc addresses");
-      return false;
-    }
-  }
 
   *sdlFlags = SDL_WINDOW_OPENGL;
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
@@ -265,7 +259,13 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
     return true;
   }
 
-  if (!this->configured || memcmp(&this->format, &format, sizeof(LG_RendererFormat)) != 0)
+  if (!this->configured ||
+    this->format.comp   != format.comp   ||
+    this->format.width  != format.width  ||
+    this->format.height != format.height ||
+    this->format.stride != format.stride ||
+    this->format.bpp    != format.bpp
+  )
   {
     memcpy(&this->format, &format, sizeof(LG_RendererFormat));
     this->reconfigure = true;
@@ -274,9 +274,13 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
   }
   LG_UNLOCK(this->formatLock);
 
-  // lock, perform the update, then unlock
   LG_LOCK(this->syncLock);
-  memcpySSE(this->texPixels[this->wTexIndex], data, this->texSize);
+  if (!this->decoder->decode(this->decoderData, data, format.pitch))
+  {
+    DEBUG_ERROR("decode returned failure");
+    LG_UNLOCK(this->syncLock);
+    return false;
+  }
   this->frameUpdate = true;
   LG_UNLOCK(this->syncLock);
 
@@ -290,8 +294,8 @@ bool opengl_render(void * opaque, SDL_Window * window)
   if (!this)
     return false;
 
-  if (!configure(this, window))
-    return true;
+  if (!pre_configure(this, window))
+    return false;
 
   if (this->resizeWindow)
   {
@@ -311,6 +315,23 @@ bool opengl_render(void * opaque, SDL_Window * window)
     );
 
     this->resizeWindow = false;
+  }
+
+  if (!configure(this, window))
+  {
+    render_wait();
+    SDL_GL_SwapWindow(window);
+    return true;
+  }
+
+  if (!draw_frame(this))
+    return false;
+
+  if (!this->texReady)
+  {
+    render_wait();
+    SDL_GL_SwapWindow(window);
+    return true;
   }
 
   if (this->params.showFPS && this->renderTime > 1e9)
@@ -391,14 +412,11 @@ bool opengl_render(void * opaque, SDL_Window * window)
     glEndList();
   }
 
-  if (!draw_frame(this))
-    return false;
-
   bool newShape;
   update_mouse_shape(this, &newShape);
 
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
-
   glCallList(this->texList + this->texIndex);
   draw_mouse(this);
   if (this->fpsTexture)
@@ -406,14 +424,8 @@ bool opengl_render(void * opaque, SDL_Window * window)
 
   if (this->opt.preventBuffer)
   {
-    unsigned int before, after;
-    glXGetVideoSyncSGI(&before);
     SDL_GL_SwapWindow(window);
-
-    // wait for the swap to happen to ensure we dont buffer frames  //
-    glXGetVideoSyncSGI(&after);
-    if (before == after)
-      glXWaitVideoSyncSGI(1, 0, &before);
+    glFinish();
   }
   else
     SDL_GL_SwapWindow(window);
@@ -426,6 +438,12 @@ bool opengl_render(void * opaque, SDL_Window * window)
   this->mouseUpdate   = false;
   this->lastMouseDraw = t;
   return true;
+}
+
+static void render_wait()
+{
+  glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
 }
 
 static void handle_opt_mipmap(void * opaque, const char *value)
@@ -455,6 +473,16 @@ static void handle_opt_prevent_buffer(void * opaque, const char *value)
   this->opt.preventBuffer = LG_RendererValueToBool(value);
 }
 
+static void handle_opt_amd_pinned_mem(void * opaque, const char *value)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  if (!this)
+    return;
+
+  this->opt.amdPinnedMem = LG_RendererValueToBool(value);
+}
+
+
 static LG_RendererOpt opengl_options[] =
 {
   {
@@ -471,9 +499,15 @@ static LG_RendererOpt opengl_options[] =
   },
   {
     .name      = "preventBuffer",
-    .desc      = "Prevent the driver from buffering frames [default: enabled]",
+    .desc      = "Prevent the driver from buffering frames [default: disabled]",
     .validator = LG_RendererValidatorBool,
     .handler   = handle_opt_prevent_buffer
+  },
+  {
+    .name      = "amdPinnedMem",
+    .desc      = "Use GL_AMD_pinned_memory if it is available [default: enabled]",
+    .validator = LG_RendererValidatorBool,
+    .handler   = handle_opt_amd_pinned_mem
   }
 };
 
@@ -503,6 +537,45 @@ static bool _check_gl_error(unsigned int line, const char * name)
   return true;
 }
 
+static bool pre_configure(struct Inst * this, SDL_Window *window)
+{
+  if (this->preConfigured)
+    return true;
+
+  this->glContext = SDL_GL_CreateContext(window);
+  if (!this->glContext)
+  {
+    DEBUG_ERROR("Failed to create the OpenGL context");
+    return false;
+  }
+
+  DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
+  DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
+  DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
+
+  GLint n;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+  for(GLint i = 0; i < n; ++i)
+  {
+    const GLubyte *ext = glGetStringi(GL_EXTENSIONS, i);
+    if (strcmp((const char *)ext, "GL_AMD_pinned_memory") == 0)
+    {
+      if (this->opt.amdPinnedMem)
+      {
+        this->amdPinnedMemSupport = true;
+        DEBUG_INFO("Using GL_AMD_pinned_memory");
+      }
+      else
+        DEBUG_INFO("GL_AMD_pinned_memory is available but not in use");
+      break;
+    }
+  }
+
+  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
+  this->preConfigured = true;
+  return true;
+}
+
 static bool configure(struct Inst * this, SDL_Window *window)
 {
   LG_LOCK(this->formatLock);
@@ -515,109 +588,133 @@ static bool configure(struct Inst * this, SDL_Window *window)
   if (this->configured)
     deconfigure(this);
 
-  this->glContext = SDL_GL_CreateContext(window);
-  if (!this->glContext)
+  switch(this->format.comp)
   {
-    DEBUG_ERROR("Failed to create the OpenGL context");
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-
-  if (!this->doneInfo)
-  {
-    DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
-    DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
-    DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
-    this->doneInfo = true;
-  }
-
-  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
-
-  // check if the GPU supports GL_ARB_buffer_storage first
-  // there is no advantage to this renderer if it is not present.
-  const GLubyte * extensions = glGetString(GL_EXTENSIONS);
-  if (!gluCheckExtension((const GLubyte *)"GL_ARB_buffer_storage", extensions))
-  {
-    DEBUG_INFO("The GPU doesn't support GL_ARB_buffer_storage");
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-
-  // assume 24 and 32 bit formats are RGB and RGBA
-  switch(this->format.bpp)
-  {
-    case 24:
-      this->intFormat = GL_RGB8;
-      this->vboFormat = GL_BGR;
+    case LG_COMPRESSION_NONE:
+      this->decoder = &LGD_NULL;
       break;
 
-    case 32:
+    default:
+      DEBUG_ERROR("Unknown/unsupported compression type");
+      return false;
+  }
+
+  DEBUG_INFO("Using decoder: %s", this->decoder->name);
+
+  if (!this->decoder->create(&this->decoderData))
+  {
+    DEBUG_ERROR("Failed to create the decoder");
+    return false;
+  }
+
+  if (!this->decoder->initialize(
+    this->decoderData,
+    this->format,
+    window))
+  {
+    DEBUG_ERROR("Failed to initialize decoder");
+    return false;
+  }
+
+  switch(this->decoder->get_out_format(this->decoderData))
+  {
+    case LG_OUTPUT_BGRA:
+      this->intFormat = GL_RGBA8;
+      this->vboFormat = GL_BGRA;
+      break;
+
+    case LG_OUTPUT_YUV420:
+      // fixme
       this->intFormat = GL_RGBA8;
       this->vboFormat = GL_BGRA;
       break;
 
     default:
-      DEBUG_INFO("%d bpp not supported", this->format.bpp);
+      DEBUG_ERROR("Format not supported");
       LG_UNLOCK(this->formatLock);
       return false;
   }
 
   // calculate the texture size in bytes
-  this->texSize = this->format.height * this->format.pitch;
+  this->texSize =
+    this->format.height *
+    this->decoder->get_frame_pitch(this->decoderData);
 
   // generate lists for drawing
   this->texList    = glGenLists(BUFFER_COUNT);
   this->fpsList    = glGenLists(1);
   this->mouseList  = glGenLists(1);
 
-  // generate the pixel unpack buffers
-  glGenBuffers(1, this->vboID);
-  if (check_gl_error("glGenBuffers"))
+  // generate the pixel unpack buffers if the decoder isn't going to do it for us
+  if (!this->decoder->has_gl)
   {
-    LG_UNLOCK(this->formatLock);
-    return false;
+    glGenBuffers(BUFFER_COUNT, this->vboID);
+    if (check_gl_error("glGenBuffers"))
+    {
+      LG_UNLOCK(this->formatLock);
+      return false;
+    }
+    this->hasBuffers = true;
+
+    if (this->amdPinnedMemSupport)
+    {
+      const int pagesize = getpagesize();
+      this->texPixels[0] = memalign(pagesize, this->texSize * BUFFER_COUNT);
+      memset(this->texPixels[0], 0, this->texSize * BUFFER_COUNT);
+      for(int i = 1; i < BUFFER_COUNT; ++i)
+        this->texPixels[i] = this->texPixels[0] + this->texSize;
+
+      for(int i = 0; i < BUFFER_COUNT; ++i)
+      {
+        glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, this->vboID[i]);
+
+        if (check_gl_error("glBindBuffer"))
+        {
+          LG_UNLOCK(this->formatLock);
+          return false;
+        }
+        glBufferData(
+          GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD,
+          this->texSize,
+          this->texPixels[i],
+          GL_STREAM_DRAW);
+
+        if (check_gl_error("glBufferData"))
+        {
+          LG_UNLOCK(this->formatLock);
+          return false;
+        }
+      }
+      glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0);
+    }
+    else
+    {
+      for(int i = 0; i < BUFFER_COUNT; ++i)
+      {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[i]);
+        if (check_gl_error("glBindBuffer"))
+        {
+          LG_UNLOCK(this->formatLock);
+          return false;
+        }
+
+        glBufferData(
+          GL_PIXEL_UNPACK_BUFFER,
+          this->texSize,
+          NULL,
+          GL_STREAM_DRAW
+        );
+        if (check_gl_error("glBufferData"))
+        {
+          LG_UNLOCK(this->formatLock);
+          return false;
+        }
+      }
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
   }
-  this->hasBuffers = true;
 
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[0]);
-  if (check_gl_error("glBindBuffer"))
-  {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-
-  glBufferStorage(
-    GL_PIXEL_UNPACK_BUFFER,
-    this->texSize * BUFFER_COUNT,
-    NULL,
-    GL_MAP_WRITE_BIT      |
-    GL_MAP_PERSISTENT_BIT
-  );
-  if (check_gl_error("glBufferStorage"))
-  {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-
-  this->texPixels[0] = glMapBufferRange(
-    GL_PIXEL_UNPACK_BUFFER,
-    0,
-    this->texSize * BUFFER_COUNT,
-    GL_MAP_WRITE_BIT         |
-    GL_MAP_PERSISTENT_BIT    |
-    GL_MAP_FLUSH_EXPLICIT_BIT
-  );
-
-  if (check_gl_error("glMapBufferRange"))
-  {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-
-  for(int i = 1; i < BUFFER_COUNT; ++i)
-    this->texPixels[i] = this->texPixels[i-1] + this->texSize;
-
-  // create the textures
+  // create the overlay textures
   glGenTextures(TEXTURE_COUNT, this->textures);
   if (check_gl_error("glGenTextures"))
   {
@@ -626,51 +723,72 @@ static bool configure(struct Inst * this, SDL_Window *window)
   }
   this->hasTextures = true;
 
-  // create the frame texture
-  glBindTexture(GL_TEXTURE_2D, this->textures[FRAME_TEXTURE]);
-  if (check_gl_error("glBindTexture"))
+  // create the frame textures
+  glGenTextures(BUFFER_COUNT, this->frames);
+  if (check_gl_error("glGenTextures"))
   {
     LG_UNLOCK(this->formatLock);
     return false;
   }
+  this->hasFrames = true;
 
-  glTexImage2D(
-    GL_TEXTURE_2D,
-    0,
-    this->intFormat,
-    this->format.width,
-    this->format.height * BUFFER_COUNT,
-    0,
-    this->vboFormat,
-    GL_UNSIGNED_BYTE,
-    (void*)0
-  );
-  if (check_gl_error("glTexImage2D"))
+  for(int i = 0; i < BUFFER_COUNT; ++i)
   {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
+    // bind and create the new texture
+    glBindTexture(GL_TEXTURE_2D, this->frames[i]);
+    if (check_gl_error("glBindTexture"))
+    {
+      LG_UNLOCK(this->formatLock);
+      return false;
+    }
 
-  // configure the texture
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexImage2D(
+      GL_TEXTURE_2D,
+      0,
+      this->intFormat,
+      this->format.width,
+      this->format.height,
+      0,
+      this->vboFormat,
+      GL_UNSIGNED_BYTE,
+      (void*)0
+    );
+    if (check_gl_error("glTexImage2D"))
+    {
+      LG_UNLOCK(this->formatLock);
+      return false;
+    }
 
-  for (int i = 0; i < BUFFER_COUNT; ++i)
-  {
-    const float ts = (1.0f / BUFFER_COUNT) * i;
-    const float te = (1.0f / BUFFER_COUNT) + ts;
+    if (this->decoder->has_gl)
+    {
+      if (!this->decoder->init_gl_texture(
+        this->decoderData,
+        GL_TEXTURE_2D,
+        this->frames[i],
+        &this->decoderFrames[i]))
+      {
+        LG_UNLOCK(this->formatLock);
+        return false;
+      }
+    }
+    else
+    {
+      // configure the texture
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S    , GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T    , GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    }
 
     // create the display lists
     glNewList(this->texList + i, GL_COMPILE);
-      glBindTexture(GL_TEXTURE_2D, this->textures[FRAME_TEXTURE]);
+      glBindTexture(GL_TEXTURE_2D, this->frames[i]);
       glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
       glBegin(GL_TRIANGLE_STRIP);
-        glTexCoord2f(0.0f, ts); glVertex2i(0                 , 0                  );
-        glTexCoord2f(1.0f, ts); glVertex2i(this->format.width, 0                  );
-        glTexCoord2f(0.0f, te); glVertex2i(0                 , this->format.height);
-        glTexCoord2f(1.0f, te); glVertex2i(this->format.width, this->format.height);
+        glTexCoord2f(0.0f, 0.0f); glVertex2i(0                 , 0                  );
+        glTexCoord2f(1.0f, 0.0f); glVertex2i(this->format.width, 0                  );
+        glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , this->format.height);
+        glTexCoord2f(1.0f, 1.0f); glVertex2i(this->format.width, this->format.height);
      glEnd();
     glEndList();
   }
@@ -685,7 +803,6 @@ static bool configure(struct Inst * this, SDL_Window *window)
 
   this->resizeWindow = true;
   this->drawStart    = nanotime();
-  glXGetVideoSyncSGI(&this->gpuFrameCount);
 
   this->configured  = true;
   this->reconfigure = false;
@@ -705,16 +822,57 @@ static void deconfigure(struct Inst * this)
     this->hasTextures = false;
   }
 
+  if (this->hasFrames)
+  {
+    if (this->decoder->has_gl)
+    {
+      for(int i = 0; i < BUFFER_COUNT; ++i)
+      {
+        if (this->decoderFrames[i])
+          this->decoder->free_gl_texture(
+            this->decoderData,
+            this->decoderFrames[i]
+          );
+        this->decoderFrames[i] = NULL;
+      }
+    }
+
+    glDeleteTextures(BUFFER_COUNT, this->frames);
+    this->hasFrames = false;
+  }
+
   if (this->hasBuffers)
   {
-    glDeleteBuffers(1, this->vboID);
+    glDeleteBuffers(BUFFER_COUNT, this->vboID);
     this->hasBuffers = false;
+  }
+
+  if (this->amdPinnedMemSupport)
+  {
+    if (this->texPixels[0])
+      free(this->texPixels[0]);
+
+    for(int i = 0; i < BUFFER_COUNT; ++i)
+    {
+      if (this->fences[i])
+      {
+        glDeleteSync(this->fences[i]);
+        this->fences[i] = NULL;
+      }
+      this->texPixels[i] = NULL;
+    }
   }
 
   if (this->glContext)
   {
     SDL_GL_DeleteContext(this->glContext);
     this->glContext = NULL;
+  }
+
+  if (this->decoderData)
+  {
+    this->decoder->destroy(this->decoderData);
+    this->decoderData = NULL;
   }
 
   this->configured = false;
@@ -736,9 +894,26 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
   const int               pitch  = this->mousePitch;
   const uint8_t *         data   = this->mouseData;
 
+  // tmp buffer for masked colour
+  uint32_t tmp[width * height];
+
   this->mouseType = cursor;
   switch(cursor)
   {
+    case LG_CURSOR_MASKED_COLOR:
+    {
+      for(int i = 0; i < width * height; ++i)
+      {
+        const uint32_t c = ((uint32_t *)data)[i];
+        tmp[i] = (c & ~0xFF000000) | (c & 0xFF000000 ? 0x0 : 0xFF000000);
+      }
+      data = (uint8_t *)tmp;
+      // fall through to LG_CURSOR_COLOR
+      //
+      // technically we should also create an XOR texture from the data but this
+      // usage seems very rare in modern software.
+    }
+
     case LG_CURSOR_COLOR:
     {
       glBindTexture(GL_TEXTURE_2D, this->textures[MOUSE_TEXTURE]);
@@ -843,12 +1018,6 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
       glEndList();
       break;
     }
-
-    case LG_CURSOR_MASKED_COLOR:
-    {
-      //TODO
-      break;
-    }
   }
 
   this->mouseUpdate = true;
@@ -864,51 +1033,108 @@ static bool draw_frame(struct Inst * this)
     return true;
   }
 
-  this->texIndex = this->wTexIndex;
-  if (++this->wTexIndex == BUFFER_COUNT)
-    this->wTexIndex = 0;
+  if (++this->texIndex == BUFFER_COUNT)
+    this->texIndex = 0;
+
   this->frameUpdate = false;
   LG_UNLOCK(this->syncLock);
 
   LG_LOCK(this->formatLock);
+  if (this->decoder->has_gl)
+  {
+    if (!this->decoder->update_gl_texture(
+      this->decoderData,
+      this->decoderFrames[this->texIndex]
+    ))
+    {
+      LG_UNLOCK(this->formatLock);
+      DEBUG_ERROR("Failed to update the texture from the decoder");
+      return false;
+    }
+  }
+  else
+  {
+    if (glIsSync(this->fences[this->texIndex]))
+    {
+      switch(glClientWaitSync(this->fences[this->texIndex], 0, GL_TIMEOUT_IGNORED))
+      {
+        case GL_ALREADY_SIGNALED:
+          break;
 
-  // bind the texture and update it
-  glBindTexture(GL_TEXTURE_2D        , this->textures[FRAME_TEXTURE]);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[0]               );
-  glPixelStorei(GL_UNPACK_ALIGNMENT  , 4                            );
-  glPixelStorei(GL_UNPACK_ROW_LENGTH , this->format.stride          );
+        case GL_CONDITION_SATISFIED:
+          DEBUG_WARN("Had to wait for the sync");
+          break;
 
-  // copy the buffer to the texture
-  glFlushMappedBufferRange(
-    GL_PIXEL_UNPACK_BUFFER,
-    this->texSize * this->texIndex,
-    this->texSize
-  );
+        case GL_TIMEOUT_EXPIRED:
+          DEBUG_WARN("Timeout expired, DMA transfers are too slow!");
+          break;
 
-  // update the texture
-  glTexSubImage2D(
-    GL_TEXTURE_2D,
-    0,
-    0,
-    this->texIndex * this->format.height,
-    this->format.width ,
-    this->format.height,
-    this->vboFormat,
-    GL_UNSIGNED_BYTE,
-    (void*)(this->texIndex * this->texSize)
-  );
-  if (check_gl_error("glTexSubImage2D"))
-    DEBUG_ERROR("texIndex: %u, width: %u, height: %u, vboFormat: %x, texSize: %lu",
-      this->texIndex, this->format.width, this->format.height, this->vboFormat, this->texSize
+        case GL_WAIT_FAILED:
+          DEBUG_ERROR("Wait failed %s", gluErrorString(glGetError()));
+          break;
+      }
+
+      glDeleteSync(this->fences[this->texIndex]);
+      this->fences[this->texIndex] = NULL;
+    }
+
+    const uint8_t * data = this->decoder->get_buffer(this->decoderData);
+    if (!data)
+    {
+      LG_UNLOCK(this->formatLock);
+      DEBUG_ERROR("Failed to get the buffer from the decoder");
+      return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, this->frames[this->texIndex]);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[this->texIndex]);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT  , 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH ,
+      this->decoder->get_frame_stride(this->decoderData)
     );
 
-  // unbind the buffer
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    // update the buffer, this performs a DMA transfer if possible
+    glBufferSubData(
+      GL_PIXEL_UNPACK_BUFFER,
+      0,
+      this->texSize,
+      data
+    );
+    check_gl_error("glBufferSubData");
+
+    // update the texture
+    glTexSubImage2D(
+      GL_TEXTURE_2D,
+      0,
+      0,
+      0,
+      this->format.width ,
+      this->format.height,
+      this->vboFormat,
+      GL_UNSIGNED_BYTE,
+      (void*)0
+    );
+    if (check_gl_error("glTexSubImage2D"))
+    {
+      DEBUG_ERROR("texIndex: %u, width: %u, height: %u, vboFormat: %x, texSize: %lu",
+        this->texIndex, this->format.width, this->format.height, this->vboFormat, this->texSize
+      );
+    }
+
+    // set a fence so we don't overwrite a buffer in use
+    this->fences[this->texIndex] =
+      glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+    // unbind the buffer
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  }
 
   const bool mipmap = this->opt.mipmap && (
     (this->format.width  > this->destRect.w) ||
     (this->format.height > this->destRect.h));
 
+  glBindTexture(GL_TEXTURE_2D, this->frames[this->texIndex]);
   if (mipmap)
   {
     glGenerateMipmap(GL_TEXTURE_2D);
@@ -920,9 +1146,10 @@ static bool draw_frame(struct Inst * this)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   }
-
   glBindTexture(GL_TEXTURE_2D, 0);
+
   LG_UNLOCK(this->formatLock);
+  this->texReady = true;
   return true;
 }
 

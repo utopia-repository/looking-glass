@@ -29,7 +29,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "Service.h"
 
 #include <io.h>
-#include <fcntl.h>
+#include <fcntl.h> 
 #include <iostream>
 
 int parseArgs(struct StartupArgs & args);
@@ -52,6 +52,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR szCmdParam
 {
   CrashHandler::Initialize();
   TraceUtil::Initialize();
+  CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
   SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 

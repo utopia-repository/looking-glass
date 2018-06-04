@@ -18,6 +18,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
 #include "spice.h"
+#include "utils.h"
 #include "debug.h"
 
 #include <string.h>
@@ -26,12 +27,9 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdio.h>
 #include <stdint.h>
 
-#include <openssl/rsa.h>
-#include <openssl/evp.h>
-#include <openssl/x509.h>
-
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -41,6 +39,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <spice/error_codes.h>
 
 #include "messages.h"
+#include "rsa.h"
 
 #ifdef DEBUG_SPICE_MOUSE
   #define DEBUG_MOUSE(fmt, args...) DEBUG_PRINT("[M]", fmt, ##args)
@@ -67,6 +66,7 @@ struct SpiceChannel
   uint32_t ackFrequency;
   uint32_t ackCount;
   uint32_t serial;
+  LG_Lock  lock;
 };
 
 struct SpiceKeyboard
@@ -74,7 +74,7 @@ struct SpiceKeyboard
   uint32_t modifiers;
 };
 
-#define SPICE_MOUSE_QUEUE_SIZE 32
+#define SPICE_MOUSE_QUEUE_SIZE 64
 
 struct SpiceMouse
 {
@@ -84,12 +84,22 @@ struct SpiceMouse
   SpiceMsgcMouseMotion queue[SPICE_MOUSE_QUEUE_SIZE];
   int                  rpos, wpos;
   int                  queueLen;
+  LG_Lock              lock;
+};
+
+union SpiceAddr
+{
+  struct sockaddr     addr;
+  struct sockaddr_in  in;
+  struct sockaddr_in6 in6;
+  struct sockaddr_un  un;
 };
 
 struct Spice
 {
-  char   password[32];
-  struct sockaddr_in addr;
+  char            password[32];
+  short           family;
+  union SpiceAddr addr;
 
   uint32_t sessionID;
   uint32_t channelID;
@@ -130,11 +140,26 @@ bool    spice_discard  (const struct SpiceChannel * channel, ssize_t size);
 
 bool spice_connect(const char * host, const short port, const char * password)
 {
-  strncpy(spice.password, password, sizeof(spice.password));
-  memset(&spice.addr, 0, sizeof(struct sockaddr_in));
-  inet_pton(AF_INET, host, &spice.addr.sin_addr);
-  spice.addr.sin_family = AF_INET;
-  spice.addr.sin_port   = htons(port);
+  strncpy(spice.password, password, sizeof(spice.password) - 1);
+  memset(&spice.addr, 0, sizeof(spice.addr));
+
+  if (port == 0)
+  {
+    spice.family = AF_UNIX;
+    spice.addr.un.sun_family = spice.family;
+    strncpy(spice.addr.un.sun_path, host, sizeof(spice.addr.un.sun_path) - 1);
+    DEBUG_INFO("Remote: %s", host);
+  }
+  else
+  {
+    spice.family = AF_INET;
+    inet_pton(spice.family, host, &spice.addr.in.sin_addr);
+    spice.addr.in.sin_family = spice.family;
+    spice.addr.in.sin_port   = htons(port);
+    DEBUG_INFO("Remote: %s:%d", host, port);
+  }
+
+  LG_LOCK_INIT(spice.mouse.lock);
 
   spice.channelID = 0;
   if (!spice_connect_channel(&spice.scMain))
@@ -152,6 +177,8 @@ void spice_disconnect()
 {
   spice_disconnect_channel(&spice.scMain  );
   spice_disconnect_channel(&spice.scInputs);
+
+  LG_LOCK_FREE(spice.mouse.lock);
 
   spice.sessionID = 0;
 }
@@ -207,15 +234,14 @@ bool spice_process()
 
       if (spice.scInputs.connected && i == spice.scInputs.socket)
       {
-        if (spice_on_inputs_channel_read())
+        if (!spice_process_ack(&spice.scInputs))
         {
-          if (!spice_process_ack(&spice.scInputs))
-          {
-            DEBUG_ERROR("failed to process ack on inputs channel");
-            return false;
-          }
-          continue;
+          DEBUG_ERROR("failed to process ack on inputs channel");
+          return false;
         }
+
+        if (spice_on_inputs_channel_read())
+          continue;
         else
         {
           DEBUG_ERROR("failed to perform read on inputs channel");
@@ -460,6 +486,7 @@ bool spice_on_inputs_channel_read()
     {
       DEBUG_PROTO("SPICE_MSG_INPUTS_MOUSE_MOTION_ACK");
       int sent = 0;
+      LG_LOCK(spice.mouse.lock);
       while(spice.mouse.queueLen && sent < 4)
       {
         SpiceMsgcMouseMotion *msg = &spice.mouse.queue[spice.mouse.rpos];
@@ -467,6 +494,7 @@ bool spice_on_inputs_channel_read()
         {
           DEBUG_ERROR("failed to send post ack");
           spice.mouse.sentCount = sent;
+          LG_UNLOCK(spice.mouse.lock);
           return false;
         }
 
@@ -478,6 +506,7 @@ bool spice_on_inputs_channel_read()
       }
 
       spice.mouse.sentCount = sent;
+      LG_UNLOCK(spice.mouse.lock);
       return true;
     }
   }
@@ -496,14 +525,39 @@ bool spice_connect_channel(struct SpiceChannel * channel)
   channel->ackCount     = 0;
   channel->serial       = 0;
 
-  channel->socket = socket(AF_INET, SOCK_STREAM, 0);
+  LG_LOCK_INIT(channel->lock);
+
+  size_t addrSize;
+  switch(spice.family)
+  {
+    case AF_UNIX:
+      addrSize = sizeof(spice.addr.un);
+      break;
+
+    case AF_INET:
+      addrSize = sizeof(spice.addr.in);
+      break;
+
+    case AF_INET6:
+      addrSize = sizeof(spice.addr.in6);
+      break;
+
+    default:
+      DEBUG_ERROR("Unsupported socket family");
+      return false;
+  }
+
+  channel->socket = socket(spice.family, SOCK_STREAM, 0);
   if (channel->socket == -1)
     return false;
 
-  int flag = 1;
-  setsockopt(channel->socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+  if (spice.family != AF_UNIX)
+  {
+    int flag = 1;
+    setsockopt(channel->socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int));
+  }
 
-  if (connect(channel->socket, (const struct sockaddr *)&spice.addr, sizeof(spice.addr)) == -1)
+  if (connect(channel->socket, &spice.addr.addr, addrSize) == -1)
   {
     DEBUG_ERROR("socket connect failure");
     close(channel->socket);
@@ -573,44 +627,22 @@ bool spice_connect_channel(struct SpiceChannel * channel)
   spice_read(channel, &capsCommon , sizeof(capsCommon ));
   spice_read(channel, &capsChannel, sizeof(capsChannel));
 
-  BIO *bioKey = BIO_new(BIO_s_mem());
-  if (!bioKey)
+  struct spice_password pass;
+  if (!spice_rsa_encrypt_password(reply.pub_key, spice.password, &pass))
   {
-    DEBUG_ERROR("failed to allocate bioKey");
     spice_disconnect_channel(channel);
     return false;
   }
 
-  BIO_write(bioKey, reply.pub_key, SPICE_TICKET_PUBKEY_BYTES);
-  EVP_PKEY *rsaKey = d2i_PUBKEY_bio(bioKey, NULL);
-  RSA *rsa = EVP_PKEY_get1_RSA(rsaKey);
-
-  char enc[RSA_size(rsa)];
-  if (RSA_public_encrypt(
-        strlen(spice.password) + 1,
-        (uint8_t*)spice.password,
-        (uint8_t*)enc,
-        rsa,
-        RSA_PKCS1_OAEP_PADDING
-  ) <= 0)
+  if (!spice_write(channel, pass.data, pass.size))
   {
-    DEBUG_ERROR("rsa public encrypt failed");
-    spice_disconnect_channel(channel);
-    EVP_PKEY_free(rsaKey);
-    BIO_free(bioKey);
-    return false;
-  }
-
-  ssize_t rsaSize = RSA_size(rsa);
-  EVP_PKEY_free(rsaKey);
-  BIO_free(bioKey);
-
-  if (!spice_write(channel, enc, rsaSize))
-  {
+    spice_rsa_free_password(&pass);
     DEBUG_ERROR("failed to write encrypted data");
     spice_disconnect_channel(channel);
     return false;
   }
+
+  spice_rsa_free_password(&pass);
 
   uint32_t linkResult;
   if (!spice_read(channel, &linkResult, sizeof(linkResult)))
@@ -635,8 +667,19 @@ bool spice_connect_channel(struct SpiceChannel * channel)
 void spice_disconnect_channel(struct SpiceChannel * channel)
 {
   if (channel->connected)
+  {
+    shutdown(channel->socket, SHUT_WR);
+
+    char buffer[1024];
+    ssize_t len = 0;
+    do
+      len = read(channel->socket, buffer, sizeof(buffer));
+    while(len > 0);
+
     close(channel->socket);
+  }
   channel->connected = false;
+  LG_LOCK_FREE(channel->lock);
 }
 
 // ============================================================================
@@ -666,6 +709,8 @@ ssize_t spice_write(const struct SpiceChannel * channel, const void * buffer, co
 
 bool spice_write_msg(struct SpiceChannel * channel, uint32_t type, const void * buffer, const ssize_t size)
 {
+  LG_LOCK(channel->lock);
+
   SpiceDataHeader header;
   header.serial   = channel->serial++;
   header.type     = type;
@@ -675,15 +720,18 @@ bool spice_write_msg(struct SpiceChannel * channel, uint32_t type, const void * 
   if (spice_write(channel, &header, sizeof(header)) != sizeof(header))
   {
     DEBUG_ERROR("failed to write message header");
+    LG_UNLOCK(channel->lock);
     return false;
   }
 
   if (spice_write(channel, buffer, size) != size)
   {
     DEBUG_ERROR("failed to write message body");
+    LG_UNLOCK(channel->lock);
     return false;
   }
 
+  LG_UNLOCK(channel->lock);
   return true;
 }
 
@@ -819,11 +867,13 @@ bool spice_mouse_motion(int32_t x, int32_t y)
     return false;
   }
 
+  LG_LOCK(spice.mouse.lock);
   if (spice.mouse.sentCount == 4)
   {
     if (spice.mouse.queueLen == SPICE_MOUSE_QUEUE_SIZE)
     {
       DEBUG_ERROR("mouse motion ringbuffer full!");
+      LG_UNLOCK(spice.mouse.lock);
       return false;
     }
 
@@ -837,6 +887,7 @@ bool spice_mouse_motion(int32_t x, int32_t y)
       spice.mouse.wpos = 0;
 
     ++spice.mouse.queueLen;
+    LG_UNLOCK(spice.mouse.lock);
     return true;
   }
 
@@ -846,6 +897,7 @@ bool spice_mouse_motion(int32_t x, int32_t y)
   msg.button_state = spice.mouse.buttonState;
 
   ++spice.mouse.sentCount;
+  LG_UNLOCK(spice.mouse.lock);
   return spice_write_msg(&spice.scInputs, SPICE_MSGC_INPUTS_MOUSE_MOTION, &msg, sizeof(msg));
 }
 

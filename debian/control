@@ -6,7 +6,7 @@ Build-Depends: debhelper (>= 11~),
                libfontconfig-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
-               libssl-dev
+               nettle-dev
 Standards-Version: 4.1.4
 Homepage: https://github.com/gnif/LookingGlass/
 Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
