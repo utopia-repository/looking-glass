@@ -14,7 +14,7 @@ Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
 Vcs-Git: https://salsa.debian.org/lhw-guest/looking-glass.git
 
 Package: looking-glass-client
-Architecture: any
+Architecture: amd64 i386
 Depends: ${misc:Depends}, ${misc:Pre-Depends}, ${shlibs:Depends}
 Description: Low latency KVM FrameRelay implementation for guests with VGA PCI Passthrough
  LookingGlass enables you to use shared memory to pass rendered frames from a
