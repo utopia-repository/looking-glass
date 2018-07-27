@@ -14,7 +14,7 @@ Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
 Vcs-Git: https://salsa.debian.org/lhw-guest/looking-glass.git
 
 Package: looking-glass-client
-Architecture: amd64 i386
+Architecture: amd64
 Depends: ${misc:Depends}, ${misc:Pre-Depends}, ${shlibs:Depends}
 Enhances: qemu, qemu-kvm, xen
 Description: Low latency KVM FrameRelay implementation for VGA Passthrough
