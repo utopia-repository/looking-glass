@@ -24,6 +24,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
+#include "KVMFR.h"
+
 #define IS_LG_RENDERER_VALID(x) \
   ((x)->get_name       && \
    (x)->create         && \
@@ -32,7 +34,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
    (x)->on_resize      && \
    (x)->on_mouse_shape && \
    (x)->on_mouse_event && \
-   (x)->render)
+   (x)->on_alert       && \
+   (x)->render_startup && \
+   (x)->render         && \
+   (x)->update_fps)
 
 #define LGR_OPTION_COUNT(x) (sizeof(x) / sizeof(LG_RendererOpt))
 
@@ -58,31 +63,26 @@ typedef LG_RendererOpt * LG_RendererOptions;
 
 typedef struct LG_RendererParams
 {
-  TTF_Font * font;
+//  TTF_Font * font;
+//  TTF_Font * alertFont;
   bool       showFPS;
 }
 LG_RendererParams;
 
-typedef enum LG_RendererComp
-{
-  LG_COMPRESSION_NONE,
-  LG_COMPRESSION_H264
-}
-LG_RendererComp;
-
 typedef struct LG_RendererFormat
 {
-  LG_RendererComp comp;    // compression format
-  unsigned int    width;   // image width
-  unsigned int    height;  // image height
-  unsigned int    stride;  // scanline width (zero if compresed)
-  unsigned int    pitch;   // scanline bytes (or compressed size)
-  unsigned int    bpp;     // bits per pixel (zero if compressed)
+  FrameType    type;    // frame type
+  unsigned int width;   // image width
+  unsigned int height;  // image height
+  unsigned int stride;  // scanline width (zero if compresed)
+  unsigned int pitch;   // scanline bytes (or compressed size)
+  unsigned int bpp;     // bits per pixel (zero if compressed)
 }
 LG_RendererFormat;
 
 typedef struct LG_RendererRect
 {
+  bool         valid;
   int          x;
   int          y;
   unsigned int w;
@@ -98,6 +98,15 @@ typedef enum LG_RendererCursor
 }
 LG_RendererCursor;
 
+typedef enum LG_RendererOnAlert
+{
+  LG_ALERT_INFO   ,
+  LG_ALERT_SUCCESS,
+  LG_ALERT_WARNING,
+  LG_ALERT_ERROR
+}
+LG_RendererAlert;
+
 typedef const char * (* LG_RendererGetName     )();
 typedef bool         (* LG_RendererCreate      )(void ** opaque, const LG_RendererParams params);
 typedef bool         (* LG_RendererInitialize  )(void * opaque, Uint32 * sdlFlags);
@@ -106,7 +115,9 @@ typedef void         (* LG_RendererOnResize    )(void * opaque, const int width,
 typedef bool         (* LG_RendererOnMouseShape)(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data);
 typedef bool         (* LG_RendererOnMouseEvent)(void * opaque, const bool visible , const int x, const int y);
 typedef bool         (* LG_RendererOnFrameEvent)(void * opaque, const LG_RendererFormat format, const uint8_t * data);
+typedef void         (* LG_RendererOnAlert     )(void * opaque, const LG_RendererAlert alert, const char * message, bool ** closeFlag);
 typedef bool         (* LG_RendererRender      )(void * opaque, SDL_Window *window);
+typedef void         (* LG_RendererUpdateFPS   )(void * opaque, const float avgUPS, const float avgFPS);
 
 typedef struct LG_Renderer
 {
@@ -120,7 +131,10 @@ typedef struct LG_Renderer
   LG_RendererOnMouseShape on_mouse_shape;
   LG_RendererOnMouseEvent on_mouse_event;
   LG_RendererOnFrameEvent on_frame_event;
+  LG_RendererOnAlert      on_alert;
+  LG_RendererRender       render_startup;
   LG_RendererRender       render;
+  LG_RendererUpdateFPS    update_fps;
 }
 LG_Renderer;
 

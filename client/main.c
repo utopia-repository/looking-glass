@@ -21,7 +21,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <signal.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
-#include <SDL2/SDL_ttf.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pwd.h>
@@ -35,7 +34,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdbool.h>
 #include <assert.h>
 #include <libconfig.h>
-#include <fontconfig/fontconfig.h>
 
 #include "debug.h"
 #include "utils.h"
@@ -51,22 +49,30 @@ struct AppState
   bool                 started;
   bool                 keyDown[SDL_NUM_SCANCODES];
 
-  TTF_Font           * font;
+  bool                 haveSrcSize;
+  int                  windowW, windowH;
   SDL_Point            srcSize;
   LG_RendererRect      dstRect;
   SDL_Point            cursor;
   bool                 cursorVisible;
   bool                 haveCursorPos;
   float                scaleX, scaleY;
+  float                accX, accY;
 
   const LG_Renderer  * lgr ;
   void               * lgrData;
+  bool                 lgrResize;
 
   SDL_Window         * window;
   int                  shmFD;
   struct KVMFRHeader * shm;
   unsigned int         shmSize;
-  int64_t              fpsSleep;
+
+  uint64_t          frameTime;
+  uint64_t          lastFrameTime;
+  uint64_t          renderTime;
+  uint64_t          frameCount;
+  uint64_t          renderCount;
 };
 
 typedef struct RenderOpts
@@ -98,6 +104,10 @@ struct AppParams
   bool         scaleMouseInput;
   bool         hideMouse;
   bool         ignoreQuit;
+  bool         allowScreensaver;
+  bool         grabKeyboard;
+  SDL_Scancode captureKey;
+  bool         disableAlerts;
 
   bool         forceRenderer;
   unsigned int forceRendererIndex;
@@ -128,79 +138,101 @@ struct AppParams params =
   .scaleMouseInput  = true,
   .hideMouse        = true,
   .ignoreQuit       = false,
+  .allowScreensaver = true,
+  .grabKeyboard     = true,
+  .captureKey       = SDL_SCANCODE_SCROLLLOCK,
+  .disableAlerts    = false,
   .forceRenderer    = false
 };
 
-static inline void updatePositionInfo()
+static void updatePositionInfo()
 {
-  if (!state.started)
-    return;
-
-  int w, h;
-  SDL_GetWindowSize(state.window, &w, &h);
-
-  if (params.keepAspect)
+  if (state.haveSrcSize)
   {
-    const float srcAspect = (float)state.srcSize.y / (float)state.srcSize.x;
-    const float wndAspect = (float)h / (float)w;
-    if (wndAspect < srcAspect)
+    if (params.keepAspect)
     {
-      state.dstRect.w = (float)h / srcAspect;
-      state.dstRect.h = h;
-      state.dstRect.x = (w >> 1) - (state.dstRect.w >> 1);
-      state.dstRect.y = 0;
+      const float srcAspect = (float)state.srcSize.y / (float)state.srcSize.x;
+      const float wndAspect = (float)state.windowH / (float)state.windowW;
+      if (wndAspect < srcAspect)
+      {
+        state.dstRect.w = (float)state.windowH / srcAspect;
+        state.dstRect.h = state.windowH;
+        state.dstRect.x = (state.windowW >> 1) - (state.dstRect.w >> 1);
+        state.dstRect.y = 0;
+      }
+      else
+      {
+        state.dstRect.w = state.windowW;
+        state.dstRect.h = (float)state.windowW * srcAspect;
+        state.dstRect.x = 0;
+        state.dstRect.y = (state.windowH >> 1) - (state.dstRect.h >> 1);
+      }
     }
     else
     {
-      state.dstRect.w = w;
-      state.dstRect.h = (float)w * srcAspect;
       state.dstRect.x = 0;
-      state.dstRect.y = (h >> 1) - (state.dstRect.h >> 1);
+      state.dstRect.y = 0;
+      state.dstRect.w = state.windowW;
+      state.dstRect.h = state.windowH;
     }
-  }
-  else
-  {
-    state.dstRect.x = 0;
-    state.dstRect.y = 0;
-    state.dstRect.w = w;
-    state.dstRect.h = h;
+    state.dstRect.valid = true;
+
+    state.scaleX = (float)state.srcSize.y / (float)state.dstRect.h;
+    state.scaleY = (float)state.srcSize.x / (float)state.dstRect.w;
   }
 
-  state.scaleX = (float)state.srcSize.y / (float)state.dstRect.h;
-  state.scaleY = (float)state.srcSize.x / (float)state.dstRect.w;
-
-  DEBUG_INFO("client %dx%d, guest %dx%d, target %dx%d, scaleX: %.2f, scaleY %.2f",
-    w, h,
-    state.srcSize.x, state.srcSize.y,
-    state.dstRect.w, state.dstRect.h,
-    state.scaleX   , state.scaleY
-  );
-
-  if (w != state.srcSize.x || h != state.srcSize.y)
-    DEBUG_WARN("Window size doesn't match guest resolution, cursor alignment may not be reliable");
-
-  if (state.lgr)
-    state.lgr->on_resize(state.lgrData, w, h, state.dstRect);
+  state.lgrResize = true;
 }
 
 int renderThread(void * unused)
 {
+  if (!state.lgr->render_startup(state.lgrData, state.window))
+    return 1;
+
+  struct timespec time;
+  clock_gettime(CLOCK_MONOTONIC, &time);
+
   while(state.running)
   {
-    const uint64_t start = microtime();
+    if (state.lgrResize)
+    {
+      if (state.lgr)
+        state.lgr->on_resize(state.lgrData, state.windowW, state.windowH, state.dstRect);
+      state.lgrResize = false;
+    }
 
     if (!state.lgr->render(state.lgrData, state.window))
       break;
 
-    const uint64_t total = microtime() - start;
-    if (total < state.fpsSleep)
+    if (params.showFPS)
     {
-      usleep(state.fpsSleep - total);
-      int64_t delta   = (1000000 / params.fpsLimit) - (microtime() - start);
-      state.fpsSleep += delta / 16;
-      if (state.fpsSleep < 0)
-        state.fpsSleep = 0;
+      const uint64_t t    = nanotime();
+      state.renderTime   += t - state.lastFrameTime;
+      state.lastFrameTime = t;
+      ++state.renderCount;
+
+      if (state.renderTime > 1e9)
+      {
+        const float avgUPS = 1000.0f / (((float)state.renderTime / state.frameCount ) / 1e6f);
+        const float avgFPS = 1000.0f / (((float)state.renderTime / state.renderCount) / 1e6f);
+        state.lgr->update_fps(state.lgrData, avgUPS, avgFPS);
+
+        state.renderTime  = 0;
+        state.frameCount  = 0;
+        state.renderCount = 0;
+      }
     }
+
+    uint64_t nsec = time.tv_nsec + state.frameTime;
+    if (nsec > 1e9)
+    {
+      time.tv_nsec = nsec - 1e9;
+      ++time.tv_sec;
+    }
+    else
+      time.tv_nsec = nsec;
+
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &time, NULL);
   }
 
   return 0;
@@ -222,7 +254,7 @@ int cursorThread(void * unused)
       if (!state.running)
         return 0;
 
-      usleep(1000);
+      usleep(1);
       continue;
     }
 
@@ -276,13 +308,17 @@ int cursorThread(void * unused)
     // now we have taken the mouse data, we can flag to the host we are ready
     state.shm->cursor.flags = 0;
 
+    bool showCursor = header.flags & KVMFR_CURSOR_FLAG_VISIBLE;
     if (header.flags & KVMFR_CURSOR_FLAG_POS)
     {
       state.cursor.x      = header.x;
       state.cursor.y      = header.y;
-      state.cursorVisible = header.flags & KVMFR_CURSOR_FLAG_VISIBLE;
       state.haveCursorPos = true;
+    }
 
+    if (showCursor != state.cursorVisible || header.flags & KVMFR_CURSOR_FLAG_POS)
+    {
+      state.cursorVisible = showCursor;
       state.lgr->on_mouse_event
       (
         state.lgrData,
@@ -302,18 +338,17 @@ int frameThread(void * unused)
   KVMFRFrame header;
 
   memset(&header, 0, sizeof(struct KVMFRFrame));
+  SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 
   while(state.running)
   {
     // poll until we have a new frame
-    if(!(state.shm->frame.flags & KVMFR_FRAME_FLAG_UPDATE))
+    while(!(state.shm->frame.flags & KVMFR_FRAME_FLAG_UPDATE))
     {
       if (!state.running)
         break;
 
-      // allow for a maximum refresh of 400fps (1000/400 = 2.5ms), this should
-      // befreqent enough without chewing up too much CPU time
-      usleep(2500);
+      usleep(1);
       continue;
     }
 
@@ -335,12 +370,14 @@ int frameThread(void * unused)
       header.dataPos > state.shmSize ||
       header.pitch   < header.width
     ){
+      DEBUG_WARN("Bad header");
       usleep(1000);
       continue;
     }
 
     // setup the renderer format with the frame format details
     LG_RendererFormat lgrFormat;
+    lgrFormat.type   = header.type;
     lgrFormat.width  = header.width;
     lgrFormat.height = header.height;
     lgrFormat.stride = header.stride;
@@ -349,16 +386,17 @@ int frameThread(void * unused)
     size_t dataSize;
     switch(header.type)
     {
-      case FRAME_TYPE_ARGB:
+      case FRAME_TYPE_RGBA:
+      case FRAME_TYPE_BGRA:
+      case FRAME_TYPE_RGBA10:
         dataSize       = lgrFormat.height * lgrFormat.pitch;
-        lgrFormat.comp = LG_COMPRESSION_NONE;
         lgrFormat.bpp  = 32;
         break;
 
-      case FRAME_TYPE_H264:
-        dataSize       = lgrFormat.pitch;
-        lgrFormat.comp = LG_COMPRESSION_H264;
-        lgrFormat.bpp  = 0;
+      case FRAME_TYPE_YUV420:
+        dataSize       = lgrFormat.height * lgrFormat.width;
+        dataSize      += (dataSize / 4) * 2;
+        lgrFormat.bpp  = 12;
         break;
 
       default:
@@ -381,6 +419,7 @@ int frameThread(void * unused)
     {
       state.srcSize.x = header.width;
       state.srcSize.y = header.height;
+      state.haveSrcSize = true;
       if (params.autoResize)
         SDL_SetWindowSize(state.window, header.width, header.height);
       updatePositionInfo();
@@ -393,6 +432,7 @@ int frameThread(void * unused)
       break;
     }
 
+    ++state.frameCount;
     if (!state.started)
     {
       state.started = true;
@@ -437,24 +477,35 @@ int eventFilter(void * userdata, SDL_Event * event)
   static bool serverMode   = false;
   static bool realignGuest = true;
 
-  if (event->type == SDL_WINDOWEVENT)
+  switch(event->type)
   {
-    switch(event->window.event)
+    case SDL_QUIT:
     {
-      case SDL_WINDOWEVENT_ENTER:
-        realignGuest = true;
-        break;
-
-      case SDL_WINDOWEVENT_SIZE_CHANGED:
-        updatePositionInfo();
-        realignGuest = true;
-        break;
+      if (!params.ignoreQuit)
+        state.running = false;
+      return 0;
     }
-    return 0;
+
+    case SDL_WINDOWEVENT:
+    {
+      switch(event->window.event)
+      {
+        case SDL_WINDOWEVENT_ENTER:
+          realignGuest = true;
+          break;
+
+        case SDL_WINDOWEVENT_SIZE_CHANGED:
+          SDL_GetWindowSize(state.window, &state.windowW, &state.windowH);
+          updatePositionInfo();
+          realignGuest = true;
+          break;
+      }
+      return 0;
+    }
   }
 
   if (!params.useSpice)
-    return 1;
+    return 0;
 
   switch(event->type)
   {
@@ -479,7 +530,7 @@ int eventFilter(void * userdata, SDL_Event * event)
       {
         x = event->motion.x - state.dstRect.x;
         y = event->motion.y - state.dstRect.y;
-        if (params.scaleMouseInput)
+        if (params.scaleMouseInput && !serverMode)
         {
           x = (float)x * state.scaleX;
           y = (float)y * state.scaleY;
@@ -487,6 +538,8 @@ int eventFilter(void * userdata, SDL_Event * event)
         x -= state.cursor.x;
         y -= state.cursor.y;
         realignGuest = false;
+        state.accX = 0;
+        state.accY = 0;
 
         if (!spice_mouse_motion(x, y))
           DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
@@ -497,11 +550,16 @@ int eventFilter(void * userdata, SDL_Event * event)
       y = event->motion.yrel;
       if (x != 0 || y != 0)
       {
-        if (params.scaleMouseInput)
+        if (params.scaleMouseInput && !serverMode)
         {
-          x = (float)x * state.scaleX;
-          y = (float)y * state.scaleY;
+          state.accX += (float)x * state.scaleX;
+          state.accY += (float)y * state.scaleY;
+          x = floor(state.accX);
+          y = floor(state.accY);
+          state.accX -= x;
+          state.accY -= y;
         }
+
         if (!spice_mouse_motion(x, y))
         {
           DEBUG_ERROR("SDL_MOUSEMOTION: failed to send message");
@@ -515,7 +573,7 @@ int eventFilter(void * userdata, SDL_Event * event)
     case SDL_KEYDOWN:
     {
       SDL_Scancode sc = event->key.keysym.scancode;
-      if (sc == SDL_SCANCODE_SCROLLLOCK)
+      if (sc == params.captureKey)
       {
         if (event->key.repeat)
           break;
@@ -523,7 +581,16 @@ int eventFilter(void * userdata, SDL_Event * event)
         serverMode = !serverMode;
         spice_mouse_mode(serverMode);
         SDL_SetRelativeMouseMode(serverMode);
+        SDL_SetWindowGrab(state.window, serverMode);
         DEBUG_INFO("Server Mode: %s", serverMode ? "on" : "off");
+
+        if (state.lgr && !params.disableAlerts)
+          state.lgr->on_alert(
+            state.lgrData,
+            serverMode ? LG_ALERT_SUCCESS  : LG_ALERT_WARNING,
+            serverMode ? "Capture Enabled" : "Capture Disabled",
+            NULL
+          );
 
         if (!serverMode)
           realignGuest = true;
@@ -550,7 +617,7 @@ int eventFilter(void * userdata, SDL_Event * event)
     case SDL_KEYUP:
     {
       SDL_Scancode sc = event->key.keysym.scancode;
-      if (sc == SDL_SCANCODE_SCROLLLOCK)
+      if (sc == params.captureKey)
         break;
 
       // avoid sending key up events when we didn't send a down
@@ -609,11 +676,9 @@ int eventFilter(void * userdata, SDL_Event * event)
         break;
       }
       break;
-
-    default:
-      return 1;
   }
 
+  // consume all events
   return 0;
 }
 
@@ -693,10 +758,34 @@ int run()
   DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
 
   memset(&state, 0, sizeof(state));
-  state.running  = true;
-  state.scaleX   = 1.0f;
-  state.scaleY   = 1.0f;
-  state.fpsSleep = 1000000 / params.fpsLimit;
+  state.running   = true;
+  state.scaleX    = 1.0f;
+  state.scaleY    = 1.0f;
+  state.frameTime = 1e9 / params.fpsLimit;
+
+  char* XDG_SESSION_TYPE = getenv("XDG_SESSION_TYPE");
+
+  if (XDG_SESSION_TYPE == NULL) {
+    XDG_SESSION_TYPE = "unspecified";
+  }
+
+  if (strcmp(XDG_SESSION_TYPE, "wayland") == 0) {
+     DEBUG_INFO("Wayland detected");
+     int err = setenv("SDL_VIDEODRIVER", "wayland", 1);
+     if (err < 0) {
+       DEBUG_ERROR("Unable to set the env variable SDL_VIDEODRIVER: %d", err);
+       return -1;
+     }
+     DEBUG_INFO("SDL_VIDEODRIVER has been set to wayland");
+  }
+
+  // warn about using FPS display until we can fix the font rendering to prevent lag spikes
+  if (params.showFPS)
+  {
+    DEBUG_WARN("================================================================================");
+    DEBUG_WARN("WARNING: The FPS display causes microstutters, this is a known issue"            );
+    DEBUG_WARN("================================================================================");
+  }
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0)
   {
@@ -708,48 +797,8 @@ int run()
   // SIGINT and the user sending a close event, such as ALT+F4
   signal(SIGINT, intHandler);
 
-  if (params.showFPS)
-  {
-    if (TTF_Init() < 0)
-    {
-      DEBUG_ERROR("TTL_Init Failed");
-      return -1;
-    }
-
-    FcConfig  * config = FcInitLoadConfigAndFonts();
-    if (!config)
-    {
-      DEBUG_ERROR("FcInitLoadConfigAndFonts Failed");
-      return -1;
-    }
-
-    FcPattern * pat = FcNameParse((const FcChar8*)"FreeMono");
-    FcConfigSubstitute (config, pat, FcMatchPattern);
-    FcDefaultSubstitute(pat);
-    FcResult result;
-    FcChar8 * file = NULL;
-    FcPattern * font = FcFontMatch(config, pat, &result);
-
-    if (font && (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch))
-    {
-      state.font = TTF_OpenFont((char *)file, 14);
-      if (!state.font)
-      {
-        DEBUG_ERROR("TTL_OpenFont Failed");
-        return -1;
-      }
-    }
-    else
-    {
-      DEBUG_ERROR("Failed to locate a font for FPS display");
-      return -1;
-    }
-    FcPatternDestroy(pat);
-  }
-
   LG_RendererParams lgrParams;
-  lgrParams.font     = state.font;
-  lgrParams.showFPS  = params.showFPS;
+  lgrParams.showFPS = params.showFPS;
   Uint32 sdlFlags;
 
   if (params.forceRenderer)
@@ -799,11 +848,19 @@ int run()
     )
   );
 
-  if (params.ignoreQuit)
-    SDL_SetHint(SDL_HINT_WINDOWS_NO_CLOSE_ON_ALT_F4, "1");
+  if (state.window == NULL) {
+    DEBUG_ERROR("Could not create an SDL window: %s\n", SDL_GetError());
+    return 1;
+  }
 
   if (params.fullscreen)
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+
+  if (params.allowScreensaver)
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+
+  if (!params.center)
+    SDL_SetWindowPosition(state.window, params.x, params.y);
 
   // set the compositor hint to bypass for low latency
   SDL_SysWMinfo wminfo;
@@ -829,6 +886,9 @@ int run()
         1
       );
     }
+  } else {
+    DEBUG_ERROR("Could not get SDL window information %s", SDL_GetError());
+    return -1;
   }
 
   if (!state.window)
@@ -861,6 +921,13 @@ int run()
       break;
     }
 
+    // start the renderThread so we don't just display junk
+    if (!(t_render = SDL_CreateThread(renderThread, "renderThread", NULL)))
+    {
+      DEBUG_ERROR("render create thread failed");
+      break;
+    }
+
     if (params.useSpice)
     {
       if (!spice_connect(params.spiceHost, params.spicePort, ""))
@@ -888,13 +955,6 @@ int run()
     SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "1", SDL_HINT_OVERRIDE);
     SDL_SetEventFilter(eventFilter, NULL);
 
-    // start the renderThread so we don't just display junk
-    if (!(t_render = SDL_CreateThread(renderThread, "renderThread", NULL)))
-    {
-      DEBUG_ERROR("render create thread failed");
-      break;
-    }
-
     // flag the host that we are starting up this is important so that
     // the host wakes up if it is waiting on an interrupt, the host will
     // also send us the current mouse shape since we won't know it yet
@@ -902,18 +962,7 @@ int run()
     __sync_or_and_fetch(&state.shm->flags, KVMFR_HEADER_FLAG_RESTART);
 
     while(state.running && (state.shm->flags & KVMFR_HEADER_FLAG_RESTART))
-    {
-      SDL_Event event;
-      while(SDL_PollEvent(&event))
-      {
-        if (event.type == SDL_QUIT)
-        {
-          state.running = false;
-          break;
-        }
-      }
-      usleep(1000);
-    }
+      SDL_WaitEventTimeout(NULL, 1000);
 
     if (!state.running)
       break;
@@ -947,19 +996,32 @@ int run()
       break;
     }
 
+    bool *closeAlert = NULL;
     while(state.running)
     {
-      SDL_Event event;
-      while(SDL_PollEvent(&event))
+      SDL_WaitEventTimeout(NULL, 1000);
+
+      if (closeAlert == NULL)
       {
-        if (event.type == SDL_QUIT)
+        if (state.shm->flags & KVMFR_HEADER_FLAG_PAUSED)
         {
-          if (!params.ignoreQuit)
-            state.running = false;
-          break;
+          if (state.lgr && !params.disableAlerts)
+            state.lgr->on_alert(
+              state.lgrData,
+              LG_ALERT_WARNING,
+              "Stream Paused",
+              &closeAlert
+            );
         }
       }
-      usleep(1000);
+      else
+      {
+        if (!(state.shm->flags & KVMFR_HEADER_FLAG_PAUSED))
+        {
+          *closeAlert = true;
+          closeAlert  = NULL;
+        }
+      }
     }
 
     break;
@@ -1010,7 +1072,6 @@ int run()
     close(state.shmFD);
   }
 
-  TTF_Quit();
   SDL_Quit();
   return 0;
 }
@@ -1054,6 +1115,11 @@ void doHelp(char * app)
     "  -w WIDTH  Initial window width [current: %u]\n"
     "  -b HEIGHT Initial window height [current: %u]\n"
     "  -Q        Ignore requests to quit (ie: Alt+F4)\n"
+    "  -S        Disable the screensaver\n"
+    "  -G        Don't capture the keyboard in capture mode\n"
+    "  -m CODE   Specify the capture key [current: %u (%s)]\n"
+    "            See https://wiki.libsdl.org/SDLScancodeLookup for valid values\n"
+    "  -q        Disable alert messages [current: %s]\n"
     "\n"
     "  -l        License information\n"
     "\n",
@@ -1067,7 +1133,10 @@ void doHelp(char * app)
     params.center ? "center" : x,
     params.center ? "center" : y,
     params.w,
-    params.h
+    params.h,
+    params.captureKey,
+    params.disableAlerts ? "disabled" : "enabled",
+    SDL_GetScancodeName(params.captureKey)
   );
 }
 
@@ -1144,15 +1213,17 @@ static bool load_config(const char * configFile)
       }
     }
 
-    if (config_setting_lookup_bool(global, "scaleMouseInput", &itmp)) params.scaleMouseInput = (itmp != 0);
-    if (config_setting_lookup_bool(global, "hideMouse"      , &itmp)) params.hideMouse       = (itmp != 0);
-    if (config_setting_lookup_bool(global, "showFPS"        , &itmp)) params.showFPS         = (itmp != 0);
-    if (config_setting_lookup_bool(global, "autoResize"     , &itmp)) params.autoResize      = (itmp != 0);
-    if (config_setting_lookup_bool(global, "allowResize"    , &itmp)) params.allowResize     = (itmp != 0);
-    if (config_setting_lookup_bool(global, "keepAspect"     , &itmp)) params.keepAspect      = (itmp != 0);
-    if (config_setting_lookup_bool(global, "borderless"     , &itmp)) params.borderless      = (itmp != 0);
-    if (config_setting_lookup_bool(global, "fullScreen"     , &itmp)) params.fullscreen      = (itmp != 0);
-    if (config_setting_lookup_bool(global, "ignoreQuit"     , &itmp)) params.ignoreQuit      = (itmp != 0);
+    if (config_setting_lookup_bool(global, "scaleMouseInput" , &itmp)) params.scaleMouseInput  = (itmp != 0);
+    if (config_setting_lookup_bool(global, "hideMouse"       , &itmp)) params.hideMouse        = (itmp != 0);
+    if (config_setting_lookup_bool(global, "showFPS"         , &itmp)) params.showFPS          = (itmp != 0);
+    if (config_setting_lookup_bool(global, "autoResize"      , &itmp)) params.autoResize       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "allowResize"     , &itmp)) params.allowResize      = (itmp != 0);
+    if (config_setting_lookup_bool(global, "keepAspect"      , &itmp)) params.keepAspect       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "borderless"      , &itmp)) params.borderless       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "fullScreen"      , &itmp)) params.fullscreen       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "ignoreQuit"      , &itmp)) params.ignoreQuit       = (itmp != 0);
+    if (config_setting_lookup_bool(global, "allowScreensaver", &itmp)) params.allowScreensaver = (itmp != 0);
+    if (config_setting_lookup_bool(global, "disableAlerts"   , &itmp)) params.disableAlerts    = (itmp != 0);
 
     if (config_setting_lookup_int(global, "x", &params.x)) params.center = false;
     if (config_setting_lookup_int(global, "y", &params.y)) params.center = false;
@@ -1188,6 +1259,17 @@ static bool load_config(const char * configFile)
         return false;
       }
       params.fpsLimit = (unsigned int)itmp;
+    }
+
+    if (config_setting_lookup_int(global, "captureKey", &itmp))
+    {
+      if (itmp <= SDL_SCANCODE_UNKNOWN || itmp > SDL_SCANCODE_APP2)
+      {
+        DEBUG_ERROR("Invalid capture key value, see https://wiki.libsdl.org/SDLScancodeLookup");
+        config_destroy(&cfg);
+        return false;
+      }
+      params.captureKey = (SDL_Scancode)itmp;
     }
   }
 
@@ -1282,7 +1364,7 @@ int main(int argc, char * argv[])
 
   for(;;)
   {
-    switch(getopt(argc, argv, "hC:f:L:sc:p:jMvK:kg:o:anrdFx:y:w:b:Ql"))
+    switch(getopt(argc, argv, "hC:f:L:sc:p:jMvK:kg:o:anrdFx:y:w:b:QSGm:lq"))
     {
       case '?':
       case 'h':
@@ -1503,6 +1585,22 @@ int main(int argc, char * argv[])
         params.ignoreQuit = true;
         continue;
 
+      case 'S':
+        params.allowScreensaver = false;
+        continue;
+
+      case 'G':
+        params.grabKeyboard = false;
+        continue;
+
+      case 'm':
+        params.captureKey = atoi(optarg);
+        continue;
+
+      case 'q':
+        params.disableAlerts = true;
+        continue;
+
       case 'l':
         doLicense();
         return 0;
@@ -1515,6 +1613,11 @@ int main(int argc, char * argv[])
     fprintf(stderr, "A non option was supplied\n");
     doHelp(argv[0]);
     return -1;
+  }
+
+  if (params.grabKeyboard)
+  {
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
   }
 
   const int ret = run();

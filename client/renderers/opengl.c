@@ -22,10 +22,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <stdbool.h>
 #include <unistd.h>
 #include <malloc.h>
+#include <math.h>
 
 #include <SDL2/SDL_ttf.h>
 
-#define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <GL/glx.h>
@@ -33,12 +33,19 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "debug.h"
 #include "utils.h"
 #include "lg-decoders.h"
+#include "lg-fonts.h"
+#include "ll.h"
 
 #define BUFFER_COUNT       2
 
 #define FPS_TEXTURE        0
 #define MOUSE_TEXTURE      1
-#define TEXTURE_COUNT      2
+#define ALERT_TEXTURE      2
+#define TEXTURE_COUNT      3
+
+#define ALERT_TIMEOUT_FLAG ((uint64_t)-1)
+
+#define FADE_TIME 1000000
 
 struct Options
 {
@@ -56,25 +63,39 @@ static struct Options defaultOptions =
   .amdPinnedMem  = true,
 };
 
+struct Alert
+{
+  bool          ready;
+  bool          useCloseFlag;
+
+  LG_FontBitmap *text;
+  float         r, g, b, a;
+  uint64_t      timeout;
+  bool          closeFlag;
+};
+
 struct Inst
 {
   LG_RendererParams params;
   struct Options    opt;
 
   bool              amdPinnedMemSupport;
-  bool              preConfigured;
+  bool              renderStarted;
   bool              configured;
   bool              reconfigure;
   SDL_GLContext     glContext;
 
   SDL_Point         window;
-  bool              resizeWindow;
   bool              frameUpdate;
+
+  const LG_Font   * font;
+  LG_FontObj        fontObj, alertFontObj;
 
   LG_Lock           formatLock;
   LG_RendererFormat format;
   GLuint            intFormat;
   GLuint            vboFormat;
+  GLuint            dataFormat;
   size_t            texSize;
   const LG_Decoder* decoder;
   void            * decoderData;
@@ -96,12 +117,14 @@ struct Inst
   GLsync            fences[BUFFER_COUNT];
   void            * decoderFrames[BUFFER_COUNT];
   GLuint            textures[TEXTURE_COUNT];
+  struct ll       * alerts;
+  int               alertList;
+
+  bool              waiting;
+  uint64_t          waitFadeTime;
+  bool              waitDone;
 
   bool              fpsTexture;
-  uint64_t          lastFrameTime;
-  uint64_t          renderTime;
-  uint64_t          frameCount;
-  uint64_t          renderCount;
   SDL_Rect          fpsRect;
 
   LG_Lock           mouseLock;
@@ -114,7 +137,6 @@ struct Inst
 
   bool              mouseUpdate;
   bool              newShape;
-  uint64_t          lastMouseDraw;
   LG_RendererCursor mouseType;
   bool              mouseVisible;
   SDL_Rect          mousePos;
@@ -124,12 +146,11 @@ static bool _check_gl_error(unsigned int line, const char * name);
 #define check_gl_error(name) _check_gl_error(__LINE__, name)
 
 static void deconfigure(struct Inst * this);
-static bool pre_configure(struct Inst * this, SDL_Window *window);
 static bool configure(struct Inst * this, SDL_Window *window);
 static void update_mouse_shape(struct Inst * this, bool * newShape);
 static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
-static void render_wait();
+static void render_wait(struct Inst * this);
 
 const char * opengl_get_name()
 {
@@ -155,6 +176,21 @@ bool opengl_create(void ** opaque, const LG_RendererParams params)
   LG_LOCK_INIT(this->syncLock  );
   LG_LOCK_INIT(this->mouseLock );
 
+  this->font = LG_Fonts[0];
+  if (!this->font->create(&this->fontObj, NULL, 14))
+  {
+    DEBUG_ERROR("Unable to create the font renderer");
+    return false;
+  }
+
+  if (!this->font->create(&this->alertFontObj, NULL, 18))
+  {
+    DEBUG_ERROR("Unable to create the font renderer");
+    return false;
+  }
+
+  this->alerts = ll_new();
+
   return true;
 }
 
@@ -164,8 +200,13 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
   if (!this)
     return false;
 
+  this->waiting  = true;
+  this->waitDone = false;
+
   *sdlFlags = SDL_WINDOW_OPENGL;
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
+  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
   return true;
 }
 
@@ -175,13 +216,39 @@ void opengl_deinitialize(void * opaque)
   if (!this)
     return;
 
+  if (this->renderStarted)
+  {
+    glDeleteLists(this->texList  , BUFFER_COUNT);
+    glDeleteLists(this->mouseList, 1);
+    glDeleteLists(this->fpsList  , 1);
+    glDeleteLists(this->alertList, 1);
+  }
+
   deconfigure(this);
   if (this->mouseData)
     free(this->mouseData);
 
+  if (this->glContext)
+  {
+    SDL_GL_DeleteContext(this->glContext);
+    this->glContext = NULL;
+  }
+
   LG_LOCK_FREE(this->formatLock);
   LG_LOCK_FREE(this->syncLock  );
   LG_LOCK_FREE(this->mouseLock );
+
+  struct Alert * alert;
+  while(ll_shift(this->alerts, (void **)&alert))
+  {
+    if (alert->text)
+      this->font->release(this->alertFontObj, alert->text);
+    free(alert);
+  }
+  ll_free(this->alerts);
+
+  if (this->font && this->fontObj)
+    this->font->destroy(this->fontObj);
 
   free(this);
 }
@@ -189,14 +256,31 @@ void opengl_deinitialize(void * opaque)
 void opengl_on_resize(void * opaque, const int width, const int height, const LG_RendererRect destRect)
 {
   struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return;
 
   this->window.x = width;
   this->window.y = height;
-  memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
 
-  this->resizeWindow = true;
+  if (destRect.valid)
+    memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
+
+  // setup the projection matrix
+  glViewport(0, 0, this->window.x, this->window.y);
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  gluOrtho2D(0, this->window.x, this->window.y, 0);
+
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+
+  if (this->destRect.valid)
+  {
+    glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
+    glScalef(
+      (float)this->destRect.w / (float)this->format.width,
+      (float)this->destRect.h / (float)this->format.height,
+      1.0f
+    );
+  }
 }
 
 bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data)
@@ -260,7 +344,7 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
   }
 
   if (!this->configured ||
-    this->format.comp   != format.comp   ||
+    this->format.type   != format.type   ||
     this->format.width  != format.width  ||
     this->format.height != format.height ||
     this->format.stride != format.stride ||
@@ -284,7 +368,149 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
   this->frameUpdate = true;
   LG_UNLOCK(this->syncLock);
 
-  ++this->frameCount;
+  if (this->waiting)
+  {
+    this->waiting      = false;
+    this->waitFadeTime = microtime() + FADE_TIME;
+  }
+
+  return true;
+}
+
+void opengl_on_alert(void * opaque, const LG_RendererAlert alert, const char * message, bool ** closeFlag)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  struct Alert * a = malloc(sizeof(struct Alert));
+  memset(a, 0, sizeof(struct Alert));
+
+  switch(alert)
+  {
+    case LG_ALERT_INFO:
+      a->r = 0.0f;
+      a->g = 0.0f;
+      a->b = 0.8f;
+      a->a = 0.8f;
+      break;
+
+    case LG_ALERT_SUCCESS:
+      a->r = 0.0f;
+      a->g = 0.8f;
+      a->b = 0.0f;
+      a->a = 0.8f;
+      break;
+
+    case LG_ALERT_WARNING:
+      a->r = 0.8f;
+      a->g = 0.5f;
+      a->b = 0.0f;
+      a->a = 0.8f;
+      break;
+
+    case LG_ALERT_ERROR:
+      a->r = 1.0f;
+      a->g = 0.0f;
+      a->b = 0.0f;
+      a->a = 0.8f;
+      break;
+  }
+
+  if (!(a->text = this->font->render(this->alertFontObj, 0xffffff00, message)))
+  {
+    DEBUG_ERROR("Failed to render alert text: %s", TTF_GetError());
+    free(a);
+    return;
+  }
+
+  if (closeFlag)
+  {
+    a->useCloseFlag = true;
+    *closeFlag = &a->closeFlag;
+  }
+
+  ll_push(this->alerts, a);
+}
+
+void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
+{
+  glBindTexture(GL_TEXTURE_2D       , texture      );
+  glPixelStorei(GL_UNPACK_ALIGNMENT , 4            );
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, bitmap->width);
+  glTexImage2D(
+    GL_TEXTURE_2D,
+    0,
+    bitmap->bpp,
+    bitmap->width,
+    bitmap->height,
+    0,
+    GL_BGRA,
+    GL_UNSIGNED_BYTE,
+    bitmap->pixels
+  );
+
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+bool opengl_render_startup(void * opaque, SDL_Window * window)
+{
+  struct Inst * this = (struct Inst *)opaque;
+
+  this->glContext = SDL_GL_CreateContext(window);
+  if (!this->glContext)
+  {
+    DEBUG_ERROR("Failed to create the OpenGL context");
+    return false;
+  }
+
+  DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
+  DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
+  DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
+
+  GLint n;
+  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+  for(GLint i = 0; i < n; ++i)
+  {
+    const GLubyte *ext = glGetStringi(GL_EXTENSIONS, i);
+    if (strcmp((const char *)ext, "GL_AMD_pinned_memory") == 0)
+    {
+      if (this->opt.amdPinnedMem)
+      {
+        this->amdPinnedMemSupport = true;
+        DEBUG_INFO("Using GL_AMD_pinned_memory");
+      }
+      else
+        DEBUG_INFO("GL_AMD_pinned_memory is available but not in use");
+      break;
+    }
+  }
+
+  glEnable(GL_TEXTURE_2D);
+  glEnable(GL_COLOR_MATERIAL);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBlendEquation(GL_FUNC_ADD);
+  glEnable(GL_MULTISAMPLE);
+
+  // generate lists for drawing
+  this->texList   = glGenLists(BUFFER_COUNT);
+  this->mouseList = glGenLists(1);
+  this->fpsList   = glGenLists(1);
+  this->alertList = glGenLists(1);
+
+  // create the overlay textures
+  glGenTextures(TEXTURE_COUNT, this->textures);
+  if (check_gl_error("glGenTextures"))
+  {
+    LG_UNLOCK(this->formatLock);
+    return false;
+  }
+  this->hasTextures = true;
+
+  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
+  this->renderStarted = true;
   return true;
 }
 
@@ -294,133 +520,95 @@ bool opengl_render(void * opaque, SDL_Window * window)
   if (!this)
     return false;
 
-  if (!pre_configure(this, window))
-    return false;
-
-  if (this->resizeWindow)
-  {
-    // setup the projection matrix
-    glViewport(0, 0, this->window.x, this->window.y);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluOrtho2D(0, this->window.x, this->window.y, 0);
-
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
-    glScalef(
-      (float)this->destRect.w / (float)this->format.width,
-      (float)this->destRect.h / (float)this->format.height,
-      1.0f
-    );
-
-    this->resizeWindow = false;
-  }
-
-  if (!configure(this, window))
-  {
-    render_wait();
-    SDL_GL_SwapWindow(window);
-    return true;
-  }
-
-  if (!draw_frame(this))
-    return false;
-
-  if (!this->texReady)
-  {
-    render_wait();
-    SDL_GL_SwapWindow(window);
-    return true;
-  }
-
-  if (this->params.showFPS && this->renderTime > 1e9)
-  {
-    char str[128];
-    const float avgFPS    = 1000.0f / (((float)this->renderTime / this->frameCount ) / 1e6f);
-    const float renderFPS = 1000.0f / (((float)this->renderTime / this->renderCount) / 1e6f);
-    snprintf(str, sizeof(str), "UPS: %8.4f, FPS: %8.4f", avgFPS, renderFPS);
-    SDL_Color color = {0xff, 0xff, 0xff};
-    SDL_Surface *textSurface = NULL;
-    if (!(textSurface = TTF_RenderText_Blended(this->params.font, str, color)))
-    {
-      DEBUG_ERROR("Failed to render text");
-      LG_UNLOCK(this->formatLock);
+  if (configure(this, window))
+    if (!draw_frame(this))
       return false;
-    }
-
-    glBindTexture(GL_TEXTURE_2D       , this->textures[FPS_TEXTURE]);
-    glPixelStorei(GL_UNPACK_ALIGNMENT , 4                          );
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, textSurface->w             );
-    glTexImage2D(
-      GL_TEXTURE_2D,
-      0,
-      textSurface->format->BytesPerPixel,
-      textSurface->w,
-      textSurface->h,
-      0,
-      GL_BGRA,
-      GL_UNSIGNED_BYTE,
-      textSurface->pixels
-    );
-
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    this->fpsRect.x = 5;
-    this->fpsRect.y = 5;
-    this->fpsRect.w = textSurface->w;
-    this->fpsRect.h = textSurface->h;
-
-    SDL_FreeSurface(textSurface);
-
-    this->renderTime  = 0;
-    this->frameCount  = 0;
-    this->renderCount = 0;
-    this->fpsTexture  = true;
-
-    glNewList(this->fpsList, GL_COMPILE);
-      glPushMatrix();
-      glLoadIdentity();
-
-      glEnable(GL_BLEND);
-      glDisable(GL_TEXTURE_2D);
-      glColor4f(0.0f, 0.0f, 1.0f, 0.5f);
-      glBegin(GL_TRIANGLE_STRIP);
-        glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
-        glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
-        glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
-        glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
-      glEnd();
-      glEnable(GL_TEXTURE_2D);
-
-      glBindTexture(GL_TEXTURE_2D, this->textures[FPS_TEXTURE]);
-      glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-      glBegin(GL_TRIANGLE_STRIP);
-        glTexCoord2f(0.0f , 0.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
-        glTexCoord2f(1.0f , 0.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
-        glTexCoord2f(0.0f , 1.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
-        glTexCoord2f(1.0f,  1.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
-      glEnd();
-      glDisable(GL_BLEND);
-
-      glPopMatrix();
-    glEndList();
-  }
-
-  bool newShape;
-  update_mouse_shape(this, &newShape);
 
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
-  glCallList(this->texList + this->texIndex);
-  draw_mouse(this);
+
+  if (this->waiting)
+    render_wait(this);
+  else
+  {
+    bool newShape;
+    update_mouse_shape(this, &newShape);
+    glCallList(this->texList + this->texIndex);
+    draw_mouse(this);
+
+    if (!this->waitDone)
+      render_wait(this);
+  }
+
   if (this->fpsTexture)
     glCallList(this->fpsList);
+
+  struct Alert * alert;
+  while(ll_peek_head(this->alerts, (void **)&alert))
+  {
+    if (!alert->ready)
+    {
+      bitmap_to_texture(alert->text, this->textures[ALERT_TEXTURE]);
+
+      glNewList(this->alertList, GL_COMPILE);
+        const int p = 4;
+        const int w = alert->text->width  + p * 2;
+        const int h = alert->text->height + p * 2;
+        glTranslatef(-(w / 2), -(h / 2), 0.0f);
+        glEnable(GL_BLEND);
+        glDisable(GL_TEXTURE_2D);
+        glColor4f(alert->r, alert->g, alert->b, alert->a);
+        glBegin(GL_TRIANGLE_STRIP);
+          glVertex2i(0, 0);
+          glVertex2i(w, 0);
+          glVertex2i(0, h);
+          glVertex2i(w, h);
+        glEnd();
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, this->textures[ALERT_TEXTURE]);
+        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+        glTranslatef(p, p, 0.0f);
+        glBegin(GL_TRIANGLE_STRIP);
+          glTexCoord2f(0.0f, 0.0f); glVertex2i(0                 , 0                  );
+          glTexCoord2f(1.0f, 0.0f); glVertex2i(alert->text->width, 0                  );
+          glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , alert->text->height);
+          glTexCoord2f(1.0f, 1.0f); glVertex2i(alert->text->width, alert->text->height);
+        glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_BLEND);
+      glEndList();
+
+      if (!alert->useCloseFlag)
+        alert->timeout = microtime() + 2*1000000;
+      alert->ready   = true;
+
+      this->font->release(this->fontObj, alert->text);
+      alert->text  = NULL;
+      alert->ready = true;
+    }
+    else
+    {
+      bool close = false;
+      if (alert->useCloseFlag)
+        close = alert->closeFlag;
+      else if (alert->timeout < microtime())
+        close = true;
+
+      if (close)
+      {
+        free(alert);
+        ll_shift(this->alerts, NULL);
+        continue;
+      }
+    }
+
+    glPushMatrix();
+      glLoadIdentity();
+      glTranslatef(this->window.x / 2, this->window.y / 2, 0.0f);
+      glCallList(this->alertList);
+    glPopMatrix();
+    break;
+  }
 
   if (this->opt.preventBuffer)
   {
@@ -430,20 +618,156 @@ bool opengl_render(void * opaque, SDL_Window * window)
   else
     SDL_GL_SwapWindow(window);
 
-  const uint64_t t    = nanotime();
-  this->renderTime   += t - this->lastFrameTime;
-  this->lastFrameTime = t;
-  ++this->renderCount;
-
-  this->mouseUpdate   = false;
-  this->lastMouseDraw = t;
+  this->mouseUpdate = false;
   return true;
 }
 
-static void render_wait()
+void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
 {
-  glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT);
+  struct Inst * this = (struct Inst *)opaque;
+  if (!this->params.showFPS)
+    return;
+
+  char str[128];
+  snprintf(str, sizeof(str), "UPS: %8.4f, FPS: %8.4f", avgUPS, avgFPS);
+
+  LG_FontBitmap *textSurface = NULL;
+  if (!(textSurface = this->font->render(this->fontObj, 0xffffff00, str)))
+    DEBUG_ERROR("Failed to render text");
+
+  bitmap_to_texture(textSurface, this->textures[FPS_TEXTURE]);
+
+  this->fpsRect.x = 5;
+  this->fpsRect.y = 5;
+  this->fpsRect.w = textSurface->width;
+  this->fpsRect.h = textSurface->height;
+
+  this->font->release(this->fontObj, textSurface);
+
+  this->fpsTexture  = true;
+
+  glNewList(this->fpsList, GL_COMPILE);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glEnable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    glColor4f(0.0f, 0.0f, 1.0f, 0.5f);
+    glBegin(GL_TRIANGLE_STRIP);
+      glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
+      glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
+      glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
+      glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
+    glEnd();
+    glEnable(GL_TEXTURE_2D);
+
+    glBindTexture(GL_TEXTURE_2D, this->textures[FPS_TEXTURE]);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_TRIANGLE_STRIP);
+      glTexCoord2f(0.0f , 0.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
+      glTexCoord2f(1.0f , 0.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
+      glTexCoord2f(0.0f , 1.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
+      glTexCoord2f(1.0f,  1.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
+    glEnd();
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_BLEND);
+
+    glPopMatrix();
+  glEndList();
+}
+
+void draw_torus(float x, float y, float inner, float outer, unsigned int pts)
+{
+  glBegin(GL_QUAD_STRIP);
+  for (unsigned int i = 0; i <= pts; ++i)
+  {
+    float angle = (i / (float)pts) * M_PI * 2.0f;
+    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
+    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
+  }
+  glEnd();
+}
+
+void draw_torus_arc(float x, float y, float inner, float outer, unsigned int pts, float s, float e)
+{
+  glBegin(GL_QUAD_STRIP);
+  for (unsigned int i = 0; i <= pts; ++i)
+  {
+    float angle = s + ((i / (float)pts) * e);
+    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
+    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
+  }
+  glEnd();
+}
+
+static void render_wait(struct Inst * this)
+{
+  float a;
+  if (this->waiting)
+    a = 1.0f;
+  else
+  {
+    uint64_t t = microtime();
+    if (t > this->waitFadeTime)
+    {
+      glDisable(GL_MULTISAMPLE);
+      this->waitDone = true;
+      return;
+    }
+
+    uint64_t delta = this->waitFadeTime - t;
+    a = 1.0f / FADE_TIME * delta;
+  }
+
+  glEnable(GL_BLEND);
+  glPushMatrix();
+  glLoadIdentity();
+  glTranslatef(this->window.x / 2.0f, this->window.y / 2.0f, 0.0f);
+
+  //draw the background gradient
+  glBegin(GL_TRIANGLE_FAN);
+  glColor4f(0.234375f, 0.015625f, 0.425781f, a);
+  glVertex2f(0, 0);
+  glColor4f(0, 0, 0, a);
+  for (unsigned int i = 0; i <= 100; ++i)
+  {
+    float angle = (i / (float)100) * M_PI * 2.0f;
+    glVertex2f(cos(angle) * this->window.x, sin(angle) * this->window.y);
+  }
+  glEnd();
+
+  // draw the logo
+  glColor4f(1.0f, 1.0f, 1.0f, a);
+  glScalef (2.0f, 2.0f, 1.0f);
+
+  draw_torus    (  0,  0, 40, 42, 60);
+  draw_torus    (  0,  0, 32, 34, 60);
+  draw_torus    (-50, -3,  2,  4, 30);
+  draw_torus    ( 50, -3,  2,  4, 30);
+  draw_torus_arc(  0,  0, 51, 49, 60, 0.0f, M_PI);
+
+  glBegin(GL_QUADS);
+    glVertex2f(-1 , 50);
+    glVertex2f(-1 , 76);
+    glVertex2f( 1 , 76);
+    glVertex2f( 1 , 50);
+    glVertex2f(-14, 76);
+    glVertex2f(-14, 78);
+    glVertex2f( 14, 78);
+    glVertex2f( 14, 76);
+    glVertex2f(-21, 83);
+    glVertex2f(-21, 85);
+    glVertex2f( 21, 85);
+    glVertex2f( 21, 83);
+  glEnd();
+
+  draw_torus_arc(-14, 83, 5, 7, 10, M_PI       , M_PI / 2.0f);
+  draw_torus_arc( 14, 83, 5, 7, 10, M_PI * 1.5f, M_PI / 2.0f);
+
+  //FIXME: draw the diagnoal marks on the circle
+
+  glPopMatrix();
+  glDisable(GL_BLEND);
 }
 
 static void handle_opt_mipmap(void * opaque, const char *value)
@@ -523,7 +847,10 @@ const LG_Renderer LGR_OpenGL =
   .on_mouse_shape = opengl_on_mouse_shape,
   .on_mouse_event = opengl_on_mouse_event,
   .on_frame_event = opengl_on_frame_event,
-  .render         = opengl_render
+  .on_alert       = opengl_on_alert,
+  .render_startup = opengl_render_startup,
+  .render         = opengl_render,
+  .update_fps     = opengl_update_fps
 };
 
 static bool _check_gl_error(unsigned int line, const char * name)
@@ -534,45 +861,6 @@ static bool _check_gl_error(unsigned int line, const char * name)
 
   const GLubyte * errStr = gluErrorString(error);
   DEBUG_ERROR("%d: %s = %d (%s)", line, name, error, errStr);
-  return true;
-}
-
-static bool pre_configure(struct Inst * this, SDL_Window *window)
-{
-  if (this->preConfigured)
-    return true;
-
-  this->glContext = SDL_GL_CreateContext(window);
-  if (!this->glContext)
-  {
-    DEBUG_ERROR("Failed to create the OpenGL context");
-    return false;
-  }
-
-  DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
-  DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
-  DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
-
-  GLint n;
-  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-  for(GLint i = 0; i < n; ++i)
-  {
-    const GLubyte *ext = glGetStringi(GL_EXTENSIONS, i);
-    if (strcmp((const char *)ext, "GL_AMD_pinned_memory") == 0)
-    {
-      if (this->opt.amdPinnedMem)
-      {
-        this->amdPinnedMemSupport = true;
-        DEBUG_INFO("Using GL_AMD_pinned_memory");
-      }
-      else
-        DEBUG_INFO("GL_AMD_pinned_memory is available but not in use");
-      break;
-    }
-  }
-
-  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
-  this->preConfigured = true;
   return true;
 }
 
@@ -588,10 +876,16 @@ static bool configure(struct Inst * this, SDL_Window *window)
   if (this->configured)
     deconfigure(this);
 
-  switch(this->format.comp)
+  switch(this->format.type)
   {
-    case LG_COMPRESSION_NONE:
+    case FRAME_TYPE_BGRA:
+    case FRAME_TYPE_RGBA:
+    case FRAME_TYPE_RGBA10:
       this->decoder = &LGD_NULL;
+      break;
+
+    case FRAME_TYPE_YUV420:
+      this->decoder = &LGD_YUV420;
       break;
 
     default:
@@ -619,14 +913,28 @@ static bool configure(struct Inst * this, SDL_Window *window)
   switch(this->decoder->get_out_format(this->decoderData))
   {
     case LG_OUTPUT_BGRA:
-      this->intFormat = GL_RGBA8;
-      this->vboFormat = GL_BGRA;
+      this->intFormat  = GL_RGBA8;
+      this->vboFormat  = GL_BGRA;
+      this->dataFormat = GL_UNSIGNED_BYTE;
+      break;
+
+    case LG_OUTPUT_RGBA:
+      this->intFormat  = GL_RGBA8;
+      this->vboFormat  = GL_RGBA;
+      this->dataFormat = GL_UNSIGNED_BYTE;
+      break;
+
+    case LG_OUTPUT_RGBA10:
+      this->intFormat  = GL_RGB10_A2;
+      this->vboFormat  = GL_RGBA;
+      this->dataFormat = GL_UNSIGNED_INT_2_10_10_10_REV;
       break;
 
     case LG_OUTPUT_YUV420:
       // fixme
-      this->intFormat = GL_RGBA8;
-      this->vboFormat = GL_BGRA;
+      this->intFormat  = GL_RGBA8;
+      this->vboFormat  = GL_BGRA;
+      this->dataFormat = GL_UNSIGNED_BYTE;
       break;
 
     default:
@@ -639,11 +947,6 @@ static bool configure(struct Inst * this, SDL_Window *window)
   this->texSize =
     this->format.height *
     this->decoder->get_frame_pitch(this->decoderData);
-
-  // generate lists for drawing
-  this->texList    = glGenLists(BUFFER_COUNT);
-  this->fpsList    = glGenLists(1);
-  this->mouseList  = glGenLists(1);
 
   // generate the pixel unpack buffers if the decoder isn't going to do it for us
   if (!this->decoder->has_gl)
@@ -714,15 +1017,6 @@ static bool configure(struct Inst * this, SDL_Window *window)
     }
   }
 
-  // create the overlay textures
-  glGenTextures(TEXTURE_COUNT, this->textures);
-  if (check_gl_error("glGenTextures"))
-  {
-    LG_UNLOCK(this->formatLock);
-    return false;
-  }
-  this->hasTextures = true;
-
   // create the frame textures
   glGenTextures(BUFFER_COUNT, this->frames);
   if (check_gl_error("glGenTextures"))
@@ -750,7 +1044,7 @@ static bool configure(struct Inst * this, SDL_Window *window)
       this->format.height,
       0,
       this->vboFormat,
-      GL_UNSIGNED_BYTE,
+      this->dataFormat,
       (void*)0
     );
     if (check_gl_error("glTexImage2D"))
@@ -790,20 +1084,14 @@ static bool configure(struct Inst * this, SDL_Window *window)
         glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , this->format.height);
         glTexCoord2f(1.0f, 1.0f); glVertex2i(this->format.width, this->format.height);
      glEnd();
+     glBindTexture(GL_TEXTURE_2D, 0);
     glEndList();
   }
 
   glBindTexture(GL_TEXTURE_2D, 0);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-  glEnable(GL_TEXTURE_2D);
-  glEnable(GL_COLOR_MATERIAL);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  glBlendEquation(GL_FUNC_ADD);
-
-  this->resizeWindow = true;
-  this->drawStart    = nanotime();
-
+  this->drawStart   = nanotime();
   this->configured  = true;
   this->reconfigure = false;
 
@@ -861,12 +1149,6 @@ static void deconfigure(struct Inst * this)
       }
       this->texPixels[i] = NULL;
     }
-  }
-
-  if (this->glContext)
-  {
-    SDL_GL_DeleteContext(this->glContext);
-    this->glContext = NULL;
   }
 
   if (this->decoderData)
@@ -1014,6 +1296,7 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
           glTexCoord2f(0.0f, 1.0f); glVertex2i(0    , hheight);
           glTexCoord2f(1.0f, 1.0f); glVertex2i(width, hheight);
         glEnd();
+        glBindTexture(GL_TEXTURE_2D, 0);
         glDisable(GL_COLOR_LOGIC_OP);
       glEndList();
       break;
@@ -1112,7 +1395,7 @@ static bool draw_frame(struct Inst * this)
       this->format.width ,
       this->format.height,
       this->vboFormat,
-      GL_UNSIGNED_BYTE,
+      this->dataFormat,
       (void*)0
     );
     if (check_gl_error("glTexSubImage2D"))

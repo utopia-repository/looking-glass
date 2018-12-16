@@ -19,6 +19,15 @@
     <Filter Include="Source Files\Capture">
       <UniqueIdentifier>{0a865d22-907e-44ea-a230-ad7ede7edeb0}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\MFT">
+      <UniqueIdentifier>{bd9c6e76-f398-49eb-acfb-3f50cd99724c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\MFT">
+      <UniqueIdentifier>{fead4000-1954-4480-8ee7-b817d7042761}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Shaders">
+      <UniqueIdentifier>{afb06b60-4959-4447-92ec-75cc07995a8f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ivshmem.cpp">
@@ -42,10 +51,13 @@
     <ClCompile Include="CrashHandler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="MultiMemcpy.cpp">
+    <ClCompile Include="TraceUtil.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="TraceUtil.cpp">
+    <ClCompile Include="MFT\H264.cpp">
+      <Filter>Source Files\MFT</Filter>
+    </ClCompile>
+    <ClCompile Include="TextureConverter.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -74,10 +86,16 @@
     <ClInclude Include="CrashHandler.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="MultiMemcpy.h">
+    <ClInclude Include="TraceUtil.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="TraceUtil.h">
+    <ClInclude Include="MFT\H264.h">
+      <Filter>Header Files\MFT</Filter>
+    </ClInclude>
+    <ClInclude Include="Com.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="TextureConverter.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -85,5 +103,16 @@
     <MASM Include="..\common\memcpySSE.asm">
       <Filter>Source Files</Filter>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="Shaders\Vertex.hlsl">
+      <Filter>Source Files\Shaders</Filter>
+    </FxCompile>
+    <FxCompile Include="Shaders\RGBtoYUV.hlsl">
+      <Filter>Source Files\Shaders</Filter>
+    </FxCompile>
+    <FxCompile Include="Shaders\Pixel.hlsl">
+      <Filter>Source Files\Shaders</Filter>
+    </FxCompile>
   </ItemGroup>
 </Project>

@@ -20,42 +20,22 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #pragma once
 
 #include "ICapture.h"
-#include "MultiMemcpy.h"
+#include "Com.h"
+#include "TextureConverter.h"
+#include "MFT/H264.h"
+
+#include <list>
 
 #define W32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shlwapi.h>
-#include <dxgi1_2.h>
-#include <d3d11.h>
-#include <mftransform.h>
 #include <stdio.h>
-#include <comdef.h>
 
-_COM_SMARTPTR_TYPEDEF(IDXGIFactory1         , __uuidof(IDXGIFactory1         ));
-_COM_SMARTPTR_TYPEDEF(ID3D11Device          , __uuidof(ID3D11Device          ));
-_COM_SMARTPTR_TYPEDEF(ID3D11DeviceContext   , __uuidof(ID3D11DeviceContext   ));
-_COM_SMARTPTR_TYPEDEF(ID3D10Multithread     , __uuidof(ID3D10Multithread     ));
-_COM_SMARTPTR_TYPEDEF(IDXGIDevice           , __uuidof(IDXGIDevice           ));
-_COM_SMARTPTR_TYPEDEF(IDXGIOutput1          , __uuidof(IDXGIOutput1          ));
-_COM_SMARTPTR_TYPEDEF(IDXGIOutput           , __uuidof(IDXGIOutput           ));
-_COM_SMARTPTR_TYPEDEF(IDXGIAdapter1         , __uuidof(IDXGIAdapter1         ));
-_COM_SMARTPTR_TYPEDEF(IDXGIOutputDuplication, __uuidof(IDXGIOutputDuplication));
-_COM_SMARTPTR_TYPEDEF(ID3D11Texture2D       , __uuidof(ID3D11Texture2D       ));
-_COM_SMARTPTR_TYPEDEF(IDXGIResource         , __uuidof(IDXGIResource         ));
-
-_COM_SMARTPTR_TYPEDEF(IMFActivate           , __uuidof(IMFActivate           ));
-_COM_SMARTPTR_TYPEDEF(IMFAttributes         , __uuidof(IMFAttributes         ));
-_COM_SMARTPTR_TYPEDEF(IMFDXGIDeviceManager  , __uuidof(IMFDXGIDeviceManager  ));
-_COM_SMARTPTR_TYPEDEF(IMFTransform          , __uuidof(IMFTransform          ));
-_COM_SMARTPTR_TYPEDEF(IMFMediaEventGenerator, __uuidof(IMFMediaEventGenerator));
-_COM_SMARTPTR_TYPEDEF(IMFMediaType          , __uuidof(IMFMediaType          ));
-_COM_SMARTPTR_TYPEDEF(IMFSample             , __uuidof(IMFSample             ));
-_COM_SMARTPTR_TYPEDEF(IMFMediaBuffer        , __uuidof(IMFMediaBuffer        ));
-_COM_SMARTPTR_TYPEDEF(IMF2DBuffer           , __uuidof(IMF2DBuffer           ));
+#define DXGI_CURSOR_RING_SIZE 3
 
 namespace Capture
 {
-  class DXGI : public ICapture, public IMFAsyncCallback
+  class DXGI : public ICapture
   {
   public:
     DXGI();
@@ -63,6 +43,7 @@ namespace Capture
 
     const char * GetName() { return "DXGI"; }
 
+    bool CanInitialize();
     bool Initialize(CaptureOptions * options);
 
     void DeInitialize();
@@ -79,86 +60,48 @@ namespace Capture
 
     enum FrameType GetFrameType();
     size_t GetMaxFrameSize();
-    enum GrabStatus GrabFrame(struct FrameInfo & frame, struct CursorInfo & cursor);
-
-    /*
-    Junk needed for the horrid IMFAsyncCallback interface
-    */
-    STDMETHODIMP QueryInterface(REFIID riid, void ** ppv)
-    {
-      if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
-        *ppv = static_cast<IMFAsyncCallback*>(this);
-        AddRef();
-        return S_OK;
-      } else {
-        *ppv = NULL;
-        return E_NOINTERFACE;
-      }
-    }
-
-    STDMETHODIMP_(ULONG) AddRef()
-    {
-      return InterlockedIncrement(&m_cRef);
-    }
-
-    STDMETHODIMP_(ULONG) Release()
-    {
-      long cRef = InterlockedDecrement(&m_cRef);
-      if (!cRef)
-        delete this;
-      return cRef;
-    }
-
-    STDMETHODIMP GetParameters(DWORD *pdwFlags, DWORD *pdwQueue) { return E_NOTIMPL; }
-    STDMETHODIMP Invoke(IMFAsyncResult *pAsyncResult);
+    unsigned int Capture();
+    GrabStatus GetFrame (struct FrameInfo & frame );
+    bool GetCursor(CursorInfo & cursor);
+    void FreeCursor();
+    GrabStatus DiscardFrame();
 
   private:
+
     bool InitRawCapture();
-    bool InitH264Capture();
+    bool InitYUV420Capture();
 
-    GrabStatus GrabFrameTexture(struct FrameInfo & frame, struct CursorInfo & cursor, ID3D11Texture2DPtr & texture, bool & timeout);
-    GrabStatus GrabFrameRaw    (struct FrameInfo & frame, struct CursorInfo & cursor);
-    GrabStatus GrabFrameH264   (struct FrameInfo & frame, struct CursorInfo & cursor);
+    CursorInfo         m_cursorRing[DXGI_CURSOR_RING_SIZE];
+    unsigned int       m_cursorRPos, m_cursorWPos;
 
-    void WaitForDesktop();
+    ID3D11Texture2DPtr m_ftexture;
 
+    GrabStatus ReleaseFrame();
+    GrabStatus GrabFrameRaw    (struct FrameInfo & frame);
+    GrabStatus GrabFrameYUV420 (struct FrameInfo & frame);
 
-    long             m_cRef;
     CaptureOptions * m_options;
 
     bool           m_initialized;
+    bool           m_started;
     unsigned int   m_width;
     unsigned int   m_height;
+    DXGI_FORMAT    m_pixelFormat;
     enum FrameType m_frameType;
 
-    MultiMemcpy                     m_memcpy;
     IDXGIFactory1Ptr                m_dxgiFactory;
     ID3D11DevicePtr                 m_device;
     D3D_FEATURE_LEVEL               m_featureLevel;
     ID3D11DeviceContextPtr          m_deviceContext;
-    IDXGIOutput1Ptr                 m_output;
+    IDXGIOutput5Ptr                 m_output;
     IDXGIOutputDuplicationPtr       m_dup;
     bool                            m_releaseFrame;
-    ID3D11Texture2DPtr              m_texture;
-    D3D11_MAPPED_SUBRESOURCE        m_mapping;
-    bool                            m_surfaceMapped;
+    ID3D11Texture2DPtr              m_texture[3];
+    TextureConverter              * m_textureConverter;
+    MFT::H264                     * m_h264;
 
-    HANDLE                          m_encodeEvent;
-    HANDLE                          m_shutdownEvent;
-    bool                            m_encodeNeedsData;
-    bool                            m_encodeHasData;
-    CRITICAL_SECTION                m_encodeCS;
-
-    UINT                            m_resetToken;
-    IMFDXGIDeviceManagerPtr         m_mfDeviceManager;
-    IMFActivatePtr                  m_mfActivation;
-    IMFTransformPtr                 m_mfTransform;
-    IMFMediaEventGeneratorPtr       m_mediaEventGen;
-
-    BYTE *                          m_pointer;
-    UINT                            m_pointerBufSize;
-    UINT                            m_pointerSize;
+    int                             m_lastCursorX, m_lastCursorY;
     BOOL                            m_lastMouseVis;
-    POINT                           m_lastMousePos;
+    POINT                           m_hotSpot;
   };
 };
