@@ -1,2 +1,2 @@
-bin/looking-glass-client usr/bin/
 ../debian/looking-glass.conf etc/
+../obj-*/looking-glass-client usr/bin/
