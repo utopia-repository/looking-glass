@@ -19,6 +19,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include "Service.h"
 #include "IVSHMEM.h"
+#include "TraceUtil.h"
 
 #include "common/debug.h"
 #include "common/KVMFR.h"
@@ -51,6 +52,7 @@ bool Service::Initialize(ICapture * captureDevice)
   if (m_initialized)
     DeInitialize();
 
+  m_tryTarget  = 0;
   m_capture = captureDevice;
   if (!m_ivshmem->Initialize())
   {
@@ -87,13 +89,6 @@ bool Service::Initialize(ICapture * captureDevice)
     return false;
   }
 
-  m_timer = CreateWaitableTimer(NULL, TRUE, NULL);
-  if (!m_timer)
-  {
-    DEBUG_ERROR("Failed to create waitable timer");
-    return false;
-  }
-
   // Create the cursor thread
   m_cursorThread = CreateThread(NULL, 0, _CursorThread, this, 0, NULL);
   m_cursorEvent  = CreateEvent (NULL, FALSE, FALSE, L"CursorEvent");
@@ -104,11 +99,13 @@ bool Service::Initialize(ICapture * captureDevice)
   m_shmHeader->version = KVMFR_HEADER_VERSION;
 
   // zero and tell the client we have restarted
-  ZeroMemory(&m_shmHeader->frame , sizeof(KVMFRFrame ));
-  ZeroMemory(&m_shmHeader->cursor, sizeof(KVMFRCursor));
+  ZeroMemory(&(m_shmHeader->frame ), sizeof(KVMFRFrame ));
+  ZeroMemory(&(m_shmHeader->cursor), sizeof(KVMFRCursor));
   m_shmHeader->flags &= ~KVMFR_HEADER_FLAG_RESTART;
 
+  m_haveFrame   = false;
   m_initialized = true;
+  m_running     = true;
   return true;
 }
 
@@ -120,42 +117,46 @@ bool Service::InitPointers()
   m_shmHeader      = reinterpret_cast<KVMFRHeader *>(m_memory);
   m_cursorData     = (uint8_t *)ALIGN_UP(m_memory + sizeof(KVMFRHeader));
   m_cursorDataSize = 1048576; // 1MB fixed for cursor size, should be more then enough
-  m_frame[0]       = (uint8_t *)ALIGN_UP(m_cursorData + m_cursorDataSize);
-  m_frameSize      = ALIGN_DN((m_ivshmem->GetSize() - (m_frame[0] - m_memory)) >> 1);
-  m_frame[1]       = (uint8_t *)ALIGN_DN(m_frame[0] + m_frameSize);
+  m_cursorOffset   = m_cursorData - m_memory;
 
-
-  m_cursorOffset  = m_cursorData - m_memory;
-  m_dataOffset[0] = m_frame[0]   - m_memory;
-  m_dataOffset[1] = m_frame[1]   - m_memory;
+  uint8_t * m_frames = (uint8_t *)ALIGN_UP(m_cursorData + m_cursorDataSize);
+  m_frameSize = ALIGN_DN((m_ivshmem->GetSize() - (m_frames - m_memory)) / MAX_FRAMES);
 
   DEBUG_INFO("Total Available : %3u MB", (unsigned int)(m_ivshmem->GetSize() / 1024 / 1024));
   DEBUG_INFO("Max Cursor Size : %3u MB", (unsigned int)(m_cursorDataSize / 1024 / 1024));
   DEBUG_INFO("Max Frame Size  : %3u MB", (unsigned int)(m_frameSize / 1024 / 1024));
-  DEBUG_INFO("Cursor          : %p (0x%08x)", m_cursorData, (int)m_cursorOffset );
-  DEBUG_INFO("Frame 1         : %p (0x%08x)", m_frame[0]  , (int)m_dataOffset[0]);
-  DEBUG_INFO("Frame 2         : %p (0x%08x)", m_frame[1]  , (int)m_dataOffset[1]);
+  DEBUG_INFO("Cursor          : %p (0x%08x)", m_cursorData, (int)m_cursorOffset);
+
+  for (int i = 0; i < MAX_FRAMES; ++i)
+  {
+    m_frame[i] = m_frames + i * m_frameSize;
+    m_dataOffset[i] = m_frame[i] - m_memory;
+    DEBUG_INFO("Frame %d         : %p (0x%08x)", i, m_frame[i], (int)m_dataOffset[i]);
+  }
 
   return true;
 }
 
 void Service::DeInitialize()
 {
-  if (m_timer)
-  {
-    CloseHandle(m_timer);
-    m_timer = NULL;
-  }
+  m_running = false;
+
+  WaitForSingleObject(m_cursorThread, INFINITE);
+  CloseHandle(m_cursorThread);
+  CloseHandle(m_cursorEvent);
 
   m_shmHeader      = NULL;
   m_cursorData     = NULL;
-  m_frame[0]       = NULL;
-  m_frame[1]       = NULL;
-  m_cursorOffset   = 0;
-  m_dataOffset[0]  = 0;
-  m_dataOffset[1]  = 0;
   m_cursorDataSize = 0;
-  m_frameSize      = 0;
+  m_cursorOffset   = 0;
+  m_haveFrame      = false;
+
+  for(int i = 0; i < MAX_FRAMES; ++i)
+  {
+    m_frame     [i] = NULL;
+    m_dataOffset[i] = 0;
+  }
+  m_frameSize = 0;
 
   m_ivshmem->DeInitialize();
 
@@ -165,145 +166,135 @@ void Service::DeInitialize()
     m_capture = NULL;
   }
 
-  WaitForSingleObject(m_cursorThread, INFINITE);
-  CloseHandle(m_cursorThread);
-  CloseHandle(m_cursorEvent );
-
   m_memory = NULL;
   m_initialized = false;
 }
 
-bool Service::Process()
+bool Service::ReInit(volatile char * flags)
+{
+  DEBUG_INFO("ReInitialize Requested");
+
+  INTERLOCKED_OR8(flags, KVMFR_HEADER_FLAG_PAUSED);
+  if (WTSGetActiveConsoleSessionId() != m_consoleSessionID)
+  {
+    DEBUG_INFO("User switch detected, waiting to regain control");
+    while (WTSGetActiveConsoleSessionId() != m_consoleSessionID)
+      Sleep(100);
+  }
+
+  while (!m_capture->CanInitialize())
+    Sleep(100);
+
+  if (!m_capture->ReInitialize())
+  {
+    DEBUG_ERROR("ReInitialize Failed");
+    return false;
+  }
+
+  if (m_capture->GetMaxFrameSize() > m_frameSize)
+  {
+    DEBUG_ERROR("Maximum frame size of %zd bytes excceds maximum space available", m_capture->GetMaxFrameSize());
+    return false;
+  }
+
+  INTERLOCKED_AND8(flags, ~KVMFR_HEADER_FLAG_PAUSED);
+  return true;
+}
+
+ProcessStatus Service::Process()
 {
   if (!m_initialized)
-    return false;
+    return PROCESS_STATUS_ERROR;
 
-  volatile uint8_t *flags = &m_shmHeader->flags;
+  volatile char * flags = (volatile char *)&(m_shmHeader->flags);
 
-  // wait for the host to notify that is it is ready to proceed
-  while (true)
+  // check if the client has flagged a restart
+  if (*flags & KVMFR_HEADER_FLAG_RESTART)
   {
-    const uint8_t f = *flags;
-
-    // check if the client has flagged a restart
-    if (f & KVMFR_HEADER_FLAG_RESTART)
+    DEBUG_INFO("Restart Requested");
+    if (!m_capture->ReInitialize())
     {
-      DEBUG_INFO("Restart Requested");
-      if (!m_capture->ReInitialize())
-      {
-        DEBUG_ERROR("ReInitialize Failed");
-        return false;
-      }
-
-      if (m_capture->GetMaxFrameSize() > m_frameSize)
-      {
-        DEBUG_ERROR("Maximum frame size of %zd bytes excceds maximum space available", m_capture->GetMaxFrameSize());
-        return false;
-      }
-
-      INTERLOCKED_AND8((volatile char *)flags, ~(KVMFR_HEADER_FLAG_RESTART));
-      break;
+      DEBUG_ERROR("ReInitialize Failed");
+      return PROCESS_STATUS_ERROR;
     }
 
-    // check if the client has flagged it's ready for a frame
-    if (!(m_shmHeader->frame.flags & KVMFR_FRAME_FLAG_UPDATE))
-      break;
+    if (m_capture->GetMaxFrameSize() > m_frameSize)
+    {
+      DEBUG_ERROR("Maximum frame size of %zd bytes exceeds maximum space available", m_capture->GetMaxFrameSize());
+      return PROCESS_STATUS_ERROR;
+    }
 
-    // wait for 2ms before polling again
-    Sleep(2);
+    INTERLOCKED_AND8(flags, ~(KVMFR_HEADER_FLAG_RESTART));
   }
 
-  struct FrameInfo  frame;
-  struct CursorInfo cursor;
-  ZeroMemory(&frame , sizeof(struct FrameInfo ));
-  ZeroMemory(&cursor, sizeof(struct CursorInfo));
-  frame.buffer     = m_frame[m_frameIndex];
-  frame.bufferSize = m_frameSize;
+  unsigned int status;
+  bool notify = false;
 
-  bool ok         = false;
-  bool cursorOnly = false;
-  for(int i = 0; i < 2; ++i)
+  status = m_capture->Capture();
+  if (status & GRAB_STATUS_ERROR)
   {
-    // capture a frame of data
-    switch (m_capture->GrabFrame(frame, cursor))
-    {
-      case GRAB_STATUS_OK:
-        ok = true;
-        break;
-
-      case GRAB_STATUS_CURSOR:
-        ok         = true;
-        cursorOnly = true;
-        break;
-
-      case GRAB_STATUS_ERROR:
-        DEBUG_ERROR("Capture failed");
-        return false;
-
-      case GRAB_STATUS_REINIT:
-        DEBUG_INFO("ReInitialize Requested");
-        if(WTSGetActiveConsoleSessionId() != m_consoleSessionID)
-        {
-          DEBUG_INFO("User switch detected, waiting to regain control");
-          *flags |= KVMFR_HEADER_FLAG_PAUSED;
-          while (WTSGetActiveConsoleSessionId() != m_consoleSessionID)
-            Sleep(100);
-          *flags &= ~KVMFR_HEADER_FLAG_PAUSED;
-        }
-
-        if (!m_capture->ReInitialize())
-        {
-          DEBUG_ERROR("ReInitialize Failed");
-          return false;
-        }
-
-        if (m_capture->GetMaxFrameSize() > m_frameSize)
-        {
-          DEBUG_ERROR("Maximum frame size of %zd bytes excceds maximum space available", m_capture->GetMaxFrameSize());
-          return false;
-        }
-        continue;
-    }
-
-    if (ok)
-      break;
+    DEBUG_WARN("Capture error, retrying");
+    return PROCESS_STATUS_RETRY;
   }
 
-  if (!ok)
+  if (status & GRAB_STATUS_TIMEOUT)
   {
-    DEBUG_ERROR("Capture retry count exceeded");
-    return false;
+    // timeouts should not count towards a failure to capture
+    if (!m_haveFrame)
+      return PROCESS_STATUS_OK;
+
+    notify = true;
   }
 
-  if (cursor.updated)
+  if (status & GRAB_STATUS_REINIT)
   {
-    EnterCriticalSection(&m_cursorCS);
-    if (cursor.hasPos)
-    {
-      m_cursorInfo.hasPos = true;
-      m_cursorInfo.x      = cursor.x;
-      m_cursorInfo.y      = cursor.y;
-    }
+    if (!ReInit(flags))
+      return PROCESS_STATUS_ERROR;
 
-    if (cursor.hasShape)
-    {
-      m_cursorInfo.hasShape = true;
-      m_cursorInfo.dataSize = cursor.dataSize;
-      m_cursorInfo.type     = cursor.type;
-      m_cursorInfo.w        = cursor.w;
-      m_cursorInfo.h        = cursor.h;
-      m_cursorInfo.pitch    = cursor.pitch;
-      m_cursorInfo.shape    = cursor.shape;
-    }
+    // re-init request should not count towards a failure to capture
+    return PROCESS_STATUS_OK;
+  }
 
-    m_cursorInfo.visible = cursor.visible;
-    LeaveCriticalSection(&m_cursorCS);
+  if ((status & (GRAB_STATUS_OK | GRAB_STATUS_TIMEOUT)) == 0)
+  {
+    DEBUG_ERROR("Capture interface returned an unexpected result");
+    return PROCESS_STATUS_ERROR;
+  }
+
+  if (status & GRAB_STATUS_CURSOR)
     SetEvent(m_cursorEvent);
-  }
 
-  if (!cursorOnly)
-  {
-    KVMFRFrame * fi = &m_shmHeader->frame;
+  volatile KVMFRFrame * fi = &(m_shmHeader->frame);
+  if (status & GRAB_STATUS_FRAME)
+  { 
+    FrameInfo frame  = { 0 };
+    frame.buffer     = m_frame[m_frameIndex];
+    frame.bufferSize = m_frameSize;
+
+    GrabStatus result = m_capture->GetFrame(frame);
+    if (result != GRAB_STATUS_OK)
+    {
+      if (result == GRAB_STATUS_REINIT)
+      {
+        if (!ReInit(flags))
+          return PROCESS_STATUS_ERROR;
+
+        // re-init request should not count towards a failure to capture
+        return PROCESS_STATUS_OK;
+      }
+
+      DEBUG_INFO("GetFrame failed");
+      return PROCESS_STATUS_ERROR;
+    }
+
+    /* don't touch the frame information until the client is done with it */
+    while (fi->flags & KVMFR_FRAME_FLAG_UPDATE)
+    {
+      /* this generally never occurs */
+      Sleep(1);
+      if (*flags & KVMFR_HEADER_FLAG_RESTART)
+        break;
+    }
 
     fi->type    = m_capture->GetFrameType();
     fi->width   = frame.width;
@@ -311,75 +302,88 @@ bool Service::Process()
     fi->stride  = frame.stride;
     fi->pitch   = frame.pitch;
     fi->dataPos = m_dataOffset[m_frameIndex];
-    if (++m_frameIndex == 2)
+
+    if (++m_frameIndex == MAX_FRAMES)
       m_frameIndex = 0;
 
+    // remember that we have a valid frame
+    m_haveFrame = true;
+    notify = true;
+  }
+
+  if (notify)
+  {
+    /* don't touch the frame inforamtion until the client is done with it */
+    while (fi->flags & KVMFR_FRAME_FLAG_UPDATE)
+    {
+      if (*flags & KVMFR_HEADER_FLAG_RESTART)
+        break;
+    }
     // signal a frame update
     fi->flags |= KVMFR_FRAME_FLAG_UPDATE;
   }
 
   // update the flags
-  INTERLOCKED_AND8((volatile char *)flags, KVMFR_HEADER_FLAG_RESTART);
-//  _mm_sfence();
-
-  return true;
+  INTERLOCKED_AND8(flags, KVMFR_HEADER_FLAG_RESTART);
+  return PROCESS_STATUS_OK;
 }
 
 DWORD Service::CursorThread()
 {
-  while(m_capture)
+  while(m_running)
   {
     if (WaitForSingleObject(m_cursorEvent, 1000) != WAIT_OBJECT_0)
       continue;
 
-    KVMFRCursor * cursor = &m_shmHeader->cursor;
-    // wait until the client is ready
-    while (cursor->flags != 0)
+    CursorInfo ci;
+    while (m_capture->GetCursor(ci))
     {
-      Sleep(2);
-      if (!m_capture)
-        return 0;
-    }
-
-    EnterCriticalSection(&m_cursorCS);
-    if (m_cursorInfo.hasPos)
-    {
-      m_cursorInfo.hasPos = false;
-
-      // tell the client where the cursor is
-      cursor->flags |= KVMFR_CURSOR_FLAG_POS;
-      cursor->x = m_cursorInfo.x;
-      cursor->y = m_cursorInfo.y;
-
-      if (m_cursorInfo.visible)
-        cursor->flags |= KVMFR_CURSOR_FLAG_VISIBLE;
-      else
-        cursor->flags &= ~KVMFR_CURSOR_FLAG_VISIBLE;
-    }
-
-    if (m_cursorInfo.hasShape)
-    {
-      m_cursorInfo.hasShape = false;
-      if (m_cursorInfo.dataSize > m_cursorDataSize)
-        DEBUG_ERROR("Cursor size exceeds allocated space");
-      else
+      volatile KVMFRCursor * cursor = &(m_shmHeader->cursor);
+      // wait until the client is ready
+      while (cursor->flags != 0)
       {
-        // give the client the new cursor shape
-        cursor->flags |= KVMFR_CURSOR_FLAG_SHAPE;
-        ++cursor->version;
-
-        cursor->type    = m_cursorInfo.type;
-        cursor->width   = m_cursorInfo.w;
-        cursor->height  = m_cursorInfo.h;
-        cursor->pitch   = m_cursorInfo.pitch;
-        cursor->dataPos = m_cursorOffset;
-
-        memcpy(m_cursorData, m_cursorInfo.shape, m_cursorInfo.dataSize);
+        Sleep(1);
+        if (!m_capture)
+          return 0;
       }
-    }
 
-    LeaveCriticalSection(&m_cursorCS);
-    cursor->flags |= KVMFR_CURSOR_FLAG_UPDATE;
+      uint8_t flags = 0;
+
+      if (ci.hasPos)
+      {
+        // tell the client where the cursor is
+        flags |= KVMFR_CURSOR_FLAG_POS;
+        cursor->x = ci.x;
+        cursor->y = ci.y;
+      }
+
+      if (ci.hasShape)
+      {
+        if (ci.shape.pointerSize > m_cursorDataSize)
+          DEBUG_ERROR("Cursor size exceeds allocated space");
+        else
+        {
+          // give the client the new cursor shape
+          flags |= KVMFR_CURSOR_FLAG_SHAPE;
+          ++cursor->version;
+
+          cursor->type    = ci.type;
+          cursor->width   = ci.w;
+          cursor->height  = ci.h;
+          cursor->pitch   = ci.pitch;
+          cursor->dataPos = m_cursorOffset;
+
+          memcpy(m_cursorData, ci.shape.buffer, ci.shape.bufferSize);
+        }
+      }
+
+      if (ci.visible)
+        flags |= KVMFR_CURSOR_FLAG_VISIBLE;
+
+      flags |= KVMFR_CURSOR_FLAG_UPDATE;
+      cursor->flags = flags;
+      m_capture->FreeCursor();
+    }
   }
 
   return 0;

@@ -19,6 +19,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include <windows.h>
 #include <shlwapi.h>
+#include <avrt.h>
 
 #include "common/debug.h"
 #include "vendor/getopt/getopt.h"
@@ -41,6 +42,8 @@ void doLicense();
 bool consoleActive = false;
 void setupConsole();
 
+extern "C" NTSYSAPI NTSTATUS NTAPI NtSetTimerResolution(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+
 struct StartupArgs
 {
   bool foreground;
@@ -53,8 +56,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR szCmdParam
   CrashHandler::Initialize();
   TraceUtil::Initialize();
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-
-  SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
 
   struct StartupArgs args;
   args.foreground = false;
@@ -89,6 +90,19 @@ int run(struct StartupArgs & args)
   if (args.foreground)
     setupConsole();
 
+  /* increase the system timer resolution */
+  ULONG currentRes;
+  NtSetTimerResolution(0, TRUE, &currentRes);
+
+  /* boost our thread priority class as high as possible */
+  SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+
+  /* use MMCSS to boost our priority for capture */
+  DWORD taskIndex = 0;
+  HANDLE task = AvSetMmThreadCharacteristics(L"Capture", &taskIndex);
+  if (!task || (AvSetMmThreadPriority(task, AVRT_PRIORITY_CRITICAL) == FALSE))
+    DEBUG_WARN("Failed to boosted priority using MMCSS");
+
   ICapture * captureDevice;
   if (args.captureDevice == NULL)
     captureDevice = CaptureFactory::DetectDevice(&args.captureOptions);
@@ -114,11 +128,35 @@ int run(struct StartupArgs & args)
   if (!svc->Initialize(captureDevice))
     return -1;
 
-  while (true)
-    if (!svc->Process())
-      break;
+  int retry = 0;
+  bool running = true;
+  while (running)
+  {
+    switch (svc->Process())
+    {
+      case PROCESS_STATUS_OK:
+        retry = 0;
+        break;
+
+      case PROCESS_STATUS_RETRY:
+        if (retry++ == 3)
+        {
+          fprintf(stderr, "Too many consecutive retries, aborting");
+          running = false;
+        }
+        break;
+
+      case PROCESS_STATUS_ERROR:
+        fprintf(stderr, "Capture process returned error");
+        running = false;
+    }
+  }
 
   svc->DeInitialize();
+
+  if (task)
+    AvRevertMmThreadCharacteristics(task);
+
   return 0;
 }
 

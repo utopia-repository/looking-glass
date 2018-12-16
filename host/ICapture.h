@@ -23,20 +23,24 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <vector>
 #include <windows.h>
 
+struct CursorBuffer
+{
+  unsigned int bufferSize;
+  char       * buffer;
+  unsigned int pointerSize;
+};
+
 struct CursorInfo
 {
-  bool            updated;
-
   bool            visible;
-  bool            hasShape;
   bool            hasPos;
+  bool            hasShape;
   int             x, y;
 
   enum CursorType type;
   unsigned int    w, h;
   unsigned int    pitch;
-  void          * shape;
-  unsigned int    dataSize;
+  CursorBuffer    shape;
 };
 
 struct FrameInfo
@@ -51,10 +55,12 @@ struct FrameInfo
 
 enum GrabStatus
 {
-  GRAB_STATUS_OK,
-  GRAB_STATUS_REINIT,
-  GRAB_STATUS_CURSOR,
-  GRAB_STATUS_ERROR
+  GRAB_STATUS_OK      = 1,
+  GRAB_STATUS_TIMEOUT = 2,
+  GRAB_STATUS_REINIT  = 4,
+  GRAB_STATUS_CURSOR  = 8,
+  GRAB_STATUS_FRAME   = 16,
+  GRAB_STATUS_ERROR   = 32
 };
 
 typedef std::vector<const char *> CaptureOptions;
@@ -64,10 +70,15 @@ class ICapture
 public:
   virtual const char * GetName() = 0;
 
+  virtual bool CanInitialize() = 0;
   virtual bool Initialize(CaptureOptions * options) = 0;
   virtual void DeInitialize() = 0;
   virtual bool ReInitialize() = 0;
   virtual enum FrameType GetFrameType() = 0;
   virtual size_t GetMaxFrameSize() = 0;
-  virtual enum GrabStatus GrabFrame(struct FrameInfo & frame, struct CursorInfo & cursor) = 0;
+  virtual unsigned int Capture() = 0;
+  virtual enum GrabStatus GetFrame(struct FrameInfo & frame) = 0;
+  virtual bool GetCursor(CursorInfo & cursor) = 0;
+  virtual void FreeCursor() = 0;
+  virtual enum GrabStatus DiscardFrame() = 0;
 };

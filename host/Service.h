@@ -26,6 +26,15 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "IVSHMEM.h"
 #include "ICapture.h"
 
+#define MAX_FRAMES 2
+
+enum ProcessStatus
+{
+  PROCESS_STATUS_OK,
+  PROCESS_STATUS_RETRY,
+  PROCESS_STATUS_ERROR
+};
+
 class Service
 {
 public:
@@ -38,17 +47,22 @@ public:
 
   bool Initialize(ICapture * captureDevice);
   void DeInitialize();
-  bool Process();
+  ProcessStatus Process();
 
 private:
   bool InitPointers();
 
   static Service * m_instance;
+  int m_tryTarget;
+  int m_lastTryCount;
 
   Service();
   ~Service();
 
+  bool ReInit(volatile char * flags);
+
   bool       m_initialized;
+  bool       m_running;
   DWORD      m_consoleSessionID;
   uint8_t  * m_memory;
   IVSHMEM  * m_ivshmem;
@@ -57,9 +71,10 @@ private:
 
   KVMFRHeader * m_shmHeader;
 
-  uint8_t     * m_frame[2];
+  bool          m_haveFrame;
+  uint8_t     * m_frame[MAX_FRAMES];
   size_t        m_frameSize;
-  uint64_t      m_dataOffset[2];
+  uint64_t      m_dataOffset[MAX_FRAMES];
   int           m_frameIndex;
 
   static DWORD WINAPI _CursorThread(LPVOID lpParameter) { return ((Service *)lpParameter)->CursorThread(); }
@@ -67,7 +82,6 @@ private:
 
   HANDLE           m_cursorThread;
   HANDLE           m_cursorEvent;
-  CursorInfo       m_cursorInfo;
   CRITICAL_SECTION m_cursorCS;
   size_t           m_cursorDataSize;
   uint8_t        * m_cursorData;
