@@ -1,5 +1,5 @@
 From: Lennart Weller <lhw@ring0.de>
-Date: Mon, 17 Dec 2018 12:05:29 +0100
+Date: Tue, 18 Dec 2018 12:19:11 +0100
 Subject: Makefile changes for debian packaging
 
  - Change build_version to debian package version for easier debugging
@@ -9,7 +9,7 @@ Subject: Makefile changes for debian packaging
  1 file changed, 2 insertions(+), 9 deletions(-)
 
 diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
-index e83aaf9..48a600e 100644
+index e83aaf9..651739a 100644
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
 @@ -3,7 +3,7 @@ project(looking-glass-client C)
@@ -17,7 +17,7 @@ index e83aaf9..48a600e 100644
  set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/")
  
 -SET(CMAKE_C_FLAGS "-std=gnu99 -g -O3 -march=native -Wall -Werror -Wfatal-errors -ffast-math -fdata-sections -ffunction-sections")
-+SET(CMAKE_C_FLAGS "$ENV{CFLAGS} $ENV{CPPFLAGS} -std=gnu99 -march=native -ffast-math -fdata-sections -ffunction-sections")
++SET(CMAKE_C_FLAGS "$ENV{CFLAGS} $ENV{CPPFLAGS} -std=gnu99 -ffast-math -fdata-sections -ffunction-sections")
  SET(CMAKE_EXE_LINKER_FLAGS "-Wl,--gc-sections")
  
  find_package(PkgConfig)
