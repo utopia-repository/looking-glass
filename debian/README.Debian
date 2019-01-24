@@ -1,5 +1,8 @@
-Client
-======
+Looking Glass Documentation
+===========================
+
+
+### Client
 This package currently only supplies the client part of Looking Glass.
 The client requires some manual changes to the configuration of libvirt to work with your virtual machine.
 
@@ -32,7 +35,7 @@ The client requires some manual changes to the configuration of libvirt to work 
        example would be 32MB**
 
     2. Configuring QEMU
-       Similiar to the libvirt installation above you need to calculate the
+       Similar to the libvirt installation above you need to calculate the
        required memory size for your desired monitor resolution. And edit the value
        in line below.
        For your virtual machine start with QEMU you need to add the following lines
@@ -41,8 +44,8 @@ The client requires some manual changes to the configuration of libvirt to work 
        -device ivshmem-plain,memdev=ivshmem,bus=pcie.0 \
        -object memory-backend-file,id=ivshmem,share=on,mem-path=/dev/shm/looking-glass,size=32M
        ```
-Server
-======
+### Server
+
 1. Download
    Currently the Windows server binary can be found on the [Github Releases](https://github.com/gnif/LookingGlass/releases) site of the project.
    Simply download the matching release binary for this package i.e. a12 for the
