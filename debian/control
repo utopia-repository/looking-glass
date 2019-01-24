@@ -23,4 +23,5 @@ Description: Low latency KVM FrameRelay implementation for VGA Passthrough
  virtual machine back to the host system.
  .
  A LookingGlass Host implementation is required to run on the guest virtual
- machine. It is recommended that the client and host versions match.
+ machine. It is recommended that the client and host versions match. See the
+ README.Debian for more information.

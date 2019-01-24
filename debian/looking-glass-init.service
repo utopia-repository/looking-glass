@@ -1,0 +1,11 @@
+[Unit]
+Description=Create shared memory for looking glass
+
+[Service]
+Type=oneshot
+ExecStart=touch /dev/shm/looking-glass
+ExecStart=chown root:kvm /dev/shm/looking-glass
+ExecStart=chmod 660 /dev/shm/looking-glass
+
+[Install]
+WantedBy=multi-user.target

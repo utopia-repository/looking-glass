@@ -1,0 +1,55 @@
+Client
+======
+This package currently only supplies the client part of Looking Glass.
+The client requires some manual changes to the configuration of libvirt to work with your virtual machine.
+
+1. Configuration
+   The package comes with a oneshot service that automatically creates the shared
+   memory for Looking Glass
+    1. Configuring libvirt
+       In case you are using the libvirt-daemon to run your virtual machine you need
+       to add the following block to your virtual machine configuration. To open the
+       configuration you can use `virsh edit <virtualmachine>`. Now add the following
+       block to your `<devices>` section
+       ```xml
+        <shmem name='looking-glass'>
+          <model type='ivshmem-plain'/>
+          <size unit='M'>32</size>
+        </shmem>
+       ```
+       You will need to adjust the memory size to a value that is suitable for your
+       desired maximum resolution using the following formula:
+
+       width x height x 4 x 2 = total bytes
+       total bytes / 1024 / 1024 = total megabytes + 2
+
+       For example, for a resolution of 1920x1080 (1080p)
+
+       1920 x 1080 x 4 x 2 = 16,588,800 bytes
+       16,588,800 / 1024 / 1024 = 15.82 MB + 2 = 17.82
+
+       **You must round this value up to the nearest power of two, which with the above
+       example would be 32MB**
+
+    2. Configuring QEMU
+       Similiar to the libvirt installation above you need to calculate the
+       required memory size for your desired monitor resolution. And edit the value
+       in line below.
+       For your virtual machine start with QEMU you need to add the following lines
+       to the startup.
+       ```bash
+       -device ivshmem-plain,memdev=ivshmem,bus=pcie.0 \
+       -object memory-backend-file,id=ivshmem,share=on,mem-path=/dev/shm/looking-glass,size=32M
+       ```
+Server
+======
+1. Download
+   Currently the Windows server binary can be found on the [Github Releases](https://github.com/gnif/LookingGlass/releases) site of the project.
+   Simply download the matching release binary for this package i.e. a12 for the
+   debian package 0+a12.
+2. Installation
+   Place the binary on Windows where it can be executed and
+   add the binary to the autostart in Windows.
+3. Notes
+   * In case you use a Virtual Reality set in your Windows VM shutdown the
+     looking-glass service to vastly increase performance
