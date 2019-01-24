@@ -4,7 +4,7 @@ Upstream-Contact: Geoffrey McRae <geoff@hostfission.com>
 Source: https://github.com/gnif/LookingGlass/
 
 Files: *
-Copyright: 2017-2018 Geoffrey McRae <geoff@hostfission.com>
+Copyright: 2017-2019 Geoffrey McRae <geoff@hostfission.com>
 License: GPL-2+
 
 Files: debian/*
