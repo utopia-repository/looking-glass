@@ -2,7 +2,8 @@ Source: looking-glass
 Section: net
 Priority: optional
 Maintainer: Lennart Weller <lhw@ring0.de>
-Build-Depends: cmake,
+Build-Depends: binutils-dev,
+               cmake,
                debhelper (>= 11~),
                libconfig-dev,
                libfontconfig-dev,
