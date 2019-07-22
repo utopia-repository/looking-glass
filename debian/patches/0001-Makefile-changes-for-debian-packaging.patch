@@ -1,17 +1,26 @@
 From: Lennart Weller <lhw@ring0.de>
-Date: Mon, 22 Jul 2019 12:54:25 +0200
+Date: Mon, 22 Jul 2019 20:34:23 +0200
 Subject: Makefile changes for debian packaging
 
  - Change build_version to debian package version for easier debugging
  - Include debian package buildflags
 ---
- client/CMakeLists.txt | 13 ++++---------
- 1 file changed, 4 insertions(+), 9 deletions(-)
+ client/CMakeLists.txt | 15 +++++----------
+ 1 file changed, 5 insertions(+), 10 deletions(-)
 
 diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
-index 4c1ba29..ccc4f69 100644
+index 4c1ba29..fa5e255 100644
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
+@@ -7,7 +7,7 @@ include(GNUInstallDirs)
+ include(CheckCCompilerFlag)
+ include(FeatureSummary)
+ 
+-option(OPTIMIZE_FOR_NATIVE "Build with -march=native" ON)
++option(OPTIMIZE_FOR_NATIVE "Build with -march=native" OFF)
+ if(OPTIMIZE_FOR_NATIVE)
+   CHECK_C_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+   if(COMPILER_SUPPORTS_MARCH_NATIVE)
 @@ -34,9 +34,11 @@ add_compile_options(
    "-ffast-math"
    "-fdata-sections"
