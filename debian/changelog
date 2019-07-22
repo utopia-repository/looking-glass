@@ -1,3 +1,9 @@
+looking-glass (0+b1-1) UNRELEASED; urgency=medium
+
+  * New upstream release
+
+ -- Lennart <lhw@ring0.de>  Mon, 22 Jul 2019 12:10:36 +0200
+
 looking-glass (0+a12-2) unstable; urgency=medium
 
   * Remove shared memory file on purge
