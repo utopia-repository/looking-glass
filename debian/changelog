@@ -1,3 +1,9 @@
+looking-glass (0+b1-2) unstable; urgency=medium
+
+  * Fix FTBFS Bug with binutils 2.33 (Closes: #948529)
+
+ -- Lennart Weller <lhw@ring0.de>  Mon, 13 Jan 2020 00:31:47 +0100
+
 looking-glass (0+b1-1) unstable; urgency=medium
 
   * New upstream release
