@@ -4,13 +4,14 @@ Priority: optional
 Maintainer: Lennart Weller <lhw@ring0.de>
 Build-Depends: binutils-dev,
                cmake,
-               debhelper (>= 11~),
+               debhelper (>= 12),
+               debhelper-compat (= 12),
                libconfig-dev,
                libfontconfig-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
                nettle-dev
-Standards-Version: 4.3.0
+Standards-Version: 4.4.1
 Homepage: https://looking-glass.hostfission.com
 Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
 Vcs-Git: https://salsa.debian.org/lhw-guest/looking-glass.git
