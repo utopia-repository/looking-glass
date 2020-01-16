@@ -2,8 +2,7 @@ Source: looking-glass
 Section: net
 Priority: optional
 Maintainer: Lennart Weller <lhw@ring0.de>
-Build-Depends: binutils-dev,
-               cmake,
+Build-Depends: cmake,
                debhelper (>= 12),
                debhelper-compat (= 12),
                libconfig-dev,

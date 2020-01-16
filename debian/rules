@@ -12,5 +12,8 @@ export DEB_VERSION
 %:
 	dh $@ --sourcedirectory=client
 
+override_dh_auto_configure:
+	dh_auto_configure -- -DOPTIMIZE_FOR_NATIVE=OFF -DENABLE_BACKTRACE=OFF
+
 override_dh_install:
 	dh_install --sourcedir=client
