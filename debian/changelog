@@ -1,3 +1,10 @@
+looking-glass (0+b1-3) unstable; urgency=medium
+
+  * Remove backtrace support for now. Solving the binutils issue
+  * Also remove potential bad optimizations
+
+ -- Lennart Weller <lhw@ring0.de>  Thu, 16 Jan 2020 20:19:57 +0100
+
 looking-glass (0+b1-2) unstable; urgency=medium
 
   * Fix FTBFS Bug with binutils 2.33 (Closes: #948529)
