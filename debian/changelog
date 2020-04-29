@@ -1,3 +1,9 @@
+looking-glass (0+b1-4) unstable; urgency=low
+
+  * Re-add upstream version to the version output
+
+ -- Lennart Weller <lhw@ring0.de>  Wed, 29 Apr 2020 22:11:43 +0200
+
 looking-glass (0+b1-3) unstable; urgency=medium
 
   * Remove backtrace support for now. Solving the binutils issue
