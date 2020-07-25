@@ -1,3 +1,11 @@
+looking-glass (0+b1-5) unstable; urgency=low
+
+  * Remove global qemu from enhances (Closes: #966260)
+  * Specifically enhance qemu-system-x86
+  * Make the dh linter happier
+
+ -- Lennart Weller <lhw@ring0.de>  Sat, 25 Jul 2020 21:09:52 +0200
+
 looking-glass (0+b1-4) unstable; urgency=low
 
   * Re-add upstream version to the version output
