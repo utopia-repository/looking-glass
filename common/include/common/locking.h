@@ -18,10 +18,23 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 */
 #pragma once
 
-#if defined(__GCC__) || defined(__GNUC__)
-#define INTERLOCKED_AND8 __sync_fetch_and_and
-#define INTERLOCKED_OR8 __sync_fetch_and_or
-#else
-#define INTERLOCKED_OR8 InterlockedOr8
-#define INTERLOCKED_AND8 InterlockedAnd8
-#endif
+#include "time.h"
+
+#include <stdatomic.h>
+
+#define LG_LOCK_MODE "Atomic"
+typedef atomic_flag LG_Lock;
+#define LG_LOCK_INIT(x) atomic_flag_clear(&(x))
+#define LG_LOCK(x) \
+  while(atomic_flag_test_and_set_explicit(&(x), memory_order_acquire)) { ; }
+#define LG_UNLOCK(x) \
+  atomic_flag_clear_explicit(&(x), memory_order_release);
+#define LG_LOCK_FREE(x)
+
+#define INTERLOCKED_INC(x) atomic_fetch_add((x), 1)
+#define INTERLOCKED_DEC(x) atomic_fetch_sub((x), 1)
+
+#define INTERLOCKED_SECTION(lock, x) \
+  LG_LOCK(lock) \
+  x \
+  LG_UNLOCK(lock)
