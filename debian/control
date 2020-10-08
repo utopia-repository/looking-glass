@@ -5,11 +5,13 @@ Maintainer: Lennart Weller <lhw@ring0.de>
 Build-Depends: cmake,
                debhelper (>= 12),
                debhelper-compat (= 12),
-               libconfig-dev,
-               libfontconfig-dev,
+               libfontconfig1-dev,
+               libsdl2-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
-               nettle-dev
+               libx11-dev,
+               nettle-dev,
+               fonts-freefont-ttf
 Standards-Version: 4.5.0
 Homepage: https://looking-glass.hostfission.com
 Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
@@ -17,7 +19,7 @@ Vcs-Git: https://salsa.debian.org/lhw-guest/looking-glass.git
 
 Package: looking-glass-client
 Architecture: amd64
-Pre-Depends: ${misc:Pre-Depends} 
+Pre-Depends: ${misc:Pre-Depends}
 Depends: ${misc:Depends}, ${shlibs:Depends}
 Enhances: qemu-system-x86, xen-hypervisor
 Description: Low latency KVM FrameRelay implementation for VGA Passthrough

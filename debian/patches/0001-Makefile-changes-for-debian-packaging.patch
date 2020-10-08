@@ -9,7 +9,7 @@ Subject: Makefile changes for debian packaging
  1 file changed, 6 insertions(+), 3 deletions(-)
 
 diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
-index 4c1ba29..181424c 100644
+index ddae7b9..f27b969 100644
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
 @@ -7,7 +7,7 @@ include(GNUInstallDirs)
@@ -34,7 +34,7 @@ index 4c1ba29..181424c 100644
  set(EXE_FLAGS "-Wl,--gc-sections")
  set(CMAKE_C_STANDARD 11)
  
-@@ -55,7 +57,8 @@ execute_process(
+@@ -59,7 +61,8 @@ execute_process(
  
  find_package(GMP)
  

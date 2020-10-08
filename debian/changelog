@@ -1,3 +1,9 @@
+looking-glass (0+b2-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Lennart Weller <lhw@ring0.de>  Thu, 08 Oct 2020 19:54:02 +0200
+
 looking-glass (0+b1-5) unstable; urgency=low
 
   * Remove global qemu from enhances (Closes: #966260)
