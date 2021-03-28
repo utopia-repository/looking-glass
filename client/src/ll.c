@@ -38,12 +38,13 @@ struct ll
   LG_Lock lock;
 };
 
-struct ll * ll_new()
+struct ll * ll_new(void)
 {
   struct ll * list = malloc(sizeof(struct ll));
-  list->head = NULL;
-  list->tail = NULL;
-  list->pos  = NULL;
+  list->head  = NULL;
+  list->tail  = NULL;
+  list->pos   = NULL;
+  list->count = 0;
   LG_LOCK_INIT(list->lock);
   return list;
 }
@@ -64,6 +65,8 @@ void ll_push(struct ll * list, void * data)
   item->next = NULL;
 
   LG_LOCK(list->lock);
+  ++list->count;
+
   if (!list->head)
   {
     list->head = item;
@@ -72,7 +75,6 @@ void ll_push(struct ll * list, void * data)
     return;
   }
 
-  ++list->count;
   list->tail->next = item;
   list->tail       = item;
   LG_UNLOCK(list->lock);
@@ -90,8 +92,10 @@ bool ll_shift(struct ll * list, void ** data)
   --list->count;
   struct ll_item * item = list->head;
   list->head = item->next;
+  list->pos  = NULL;
+  if (list->tail == item)
+    list->tail = NULL;
 
-  list->pos = NULL;
   LG_UNLOCK(list->lock);
 
   if (data)
@@ -111,6 +115,21 @@ bool ll_peek_head(struct ll * list, void ** data)
   }
 
   *data = list->head->data;
+  LG_UNLOCK(list->lock);
+
+  return true;
+}
+
+bool ll_peek_tail(struct ll * list, void ** data)
+{
+  LG_LOCK(list->lock);
+  if (!list->tail)
+  {
+    LG_UNLOCK(list->lock);
+    return false;
+  }
+
+  *data = list->tail->data;
   LG_UNLOCK(list->lock);
 
   return true;

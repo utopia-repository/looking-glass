@@ -2,6 +2,7 @@
 
 #include <obs/obs-module.h>
 #include <obs/util/threading.h>
+#include <obs/graphics/matrix4.h>
 
 #include <common/ivshmem.h>
 #include <common/KVMFR.h>
@@ -10,6 +11,8 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <stdatomic.h>
+#include <GL/gl.h>
 
 typedef enum
 {
@@ -26,17 +29,31 @@ typedef struct
   obs_source_t    * context;
   LGState           state;
   char            * shmFile;
+  uint32_t          formatVer;
   uint32_t          width, height;
   FrameType         type;
+  int               bpp;
   struct IVSHMEM    shmDev;
   PLGMPClient       lgmp;
-  PLGMPClientQueue  frameQueue;
+  PLGMPClientQueue  frameQueue, pointerQueue;
   gs_texture_t    * texture;
   uint8_t         * texData;
   uint32_t          linesize;
 
-  pthread_t         frameThread;
+  pthread_t         frameThread, pointerThread;
   os_sem_t        * frameSem;
+
+  bool                 cursorMono;
+  gs_texture_t       * cursorTex;
+  struct gs_rect       cursorRect;
+
+  bool                 cursorVisible;
+  KVMFRCursor          cursor;
+  os_sem_t           * cursorSem;
+  atomic_uint          cursorVer;
+  unsigned int         cursorCurVer;
+  uint32_t             cursorSize;
+  uint32_t           * cursorData;
 }
 LGPlugin;
 
@@ -51,8 +68,9 @@ static void * lgCreate(obs_data_t * settings, obs_source_t * context)
 {
   LGPlugin * this = bzalloc(sizeof(LGPlugin));
   this->context = context;
-  os_sem_init(&this->frameSem, 0);
-
+  os_sem_init (&this->frameSem , 0);
+  os_sem_init (&this->cursorSem, 1);
+  atomic_store(&this->cursorVer, 0);
   lgUpdate(this, settings);
   return this;
 }
@@ -70,7 +88,8 @@ static void deinit(LGPlugin * this)
     case STATE_RUNNING:
     case STATE_STOPPING:
       this->state = STATE_STOPPING;
-      pthread_join(this->frameThread, NULL);
+      pthread_join(this->frameThread  , NULL);
+      pthread_join(this->pointerThread, NULL);
       this->state = STATE_STOPPED;
       /* fallthrough */
 
@@ -98,6 +117,15 @@ static void deinit(LGPlugin * this)
     this->texture = NULL;
   }
 
+  if (this->cursorTex)
+  {
+    obs_enter_graphics();
+    gs_texture_destroy(this->cursorTex);
+    gs_texture_unmap(this->cursorTex);
+    obs_leave_graphics();
+    this->cursorTex = NULL;
+  }
+
   this->state = STATE_STOPPED;
 }
 
@@ -105,7 +133,8 @@ static void lgDestroy(void * data)
 {
   LGPlugin * this = (LGPlugin *)data;
   deinit(this);
-  os_sem_destroy(this->frameSem);
+  os_sem_destroy(this->frameSem );
+  os_sem_destroy(this->cursorSem);
   bfree(this);
 }
 
@@ -159,6 +188,130 @@ static void * frameThread(void * data)
   return NULL;
 }
 
+inline static void allocCursorData(LGPlugin * this, const unsigned int size)
+{
+  if (this->cursorSize >= size)
+    return;
+
+  bfree(this->cursorData);
+  this->cursorSize = size;
+  this->cursorData = bmalloc(size);
+}
+
+static void * pointerThread(void * data)
+{
+  LGPlugin * this = (LGPlugin *)data;
+
+  if (lgmpClientSubscribe(this->lgmp, LGMP_Q_POINTER, &this->pointerQueue) != LGMP_OK)
+  {
+    this->state = STATE_STOPPING;
+    return NULL;
+  }
+
+  while(this->state == STATE_RUNNING)
+  {
+    LGMP_STATUS status;
+    LGMPMessage msg;
+
+    if ((status = lgmpClientProcess(this->pointerQueue, &msg)) != LGMP_OK)
+    {
+      if (status != LGMP_ERR_QUEUE_EMPTY)
+      {
+        printf("lgmpClientProcess: %s\n", lgmpStatusString(status));
+        break;
+      }
+
+      usleep(1000);
+      continue;
+    }
+
+    const KVMFRCursor * const cursor = (const KVMFRCursor * const)msg.mem;
+    this->cursorVisible =
+      msg.udata & CURSOR_FLAG_VISIBLE;
+
+    if (msg.udata & CURSOR_FLAG_SHAPE)
+    {
+      os_sem_wait(this->cursorSem);
+      const uint8_t * const data = (const uint8_t * const)(cursor + 1);
+      unsigned int dataSize = 0;
+
+      switch(cursor->type)
+      {
+        case CURSOR_TYPE_MASKED_COLOR:
+        {
+          dataSize = cursor->height * cursor->pitch;
+          allocCursorData(this, dataSize);
+
+          const uint32_t * s = (const uint32_t *)data;
+          uint32_t * d       = this->cursorData;
+          for(int i = 0; i < dataSize; ++i, ++s, ++d)
+            *d = (*s & ~0xFF000000) | (*s & 0xFF000000 ? 0x0 : 0xFF000000);
+          break;
+        }
+
+        case CURSOR_TYPE_COLOR:
+        {
+          dataSize = cursor->height * cursor->pitch;
+          allocCursorData(this, dataSize);
+          memcpy(this->cursorData, data, dataSize);
+          break;
+        }
+
+        case CURSOR_TYPE_MONOCHROME:
+        {
+          dataSize = cursor->height * sizeof(uint32_t);
+          allocCursorData(this, dataSize);
+
+          const int hheight = cursor->height / 2;
+          uint32_t * d = this->cursorData;
+          for(int y = 0; y < hheight; ++y)
+            for(int x = 0; x < cursor->width; ++x)
+            {
+              const uint8_t  * srcAnd  = data   + (cursor->pitch * y) + (x / 8);
+              const uint8_t  * srcXor  = srcAnd + cursor->pitch * hheight;
+              const uint8_t    mask    = 0x80 >> (x % 8);
+              const uint32_t   andMask = (*srcAnd & mask) ? 0xFFFFFFFF : 0xFF000000;
+              const uint32_t   xorMask = (*srcXor & mask) ? 0x00FFFFFF : 0x00000000;
+
+              d[y * cursor->width + x                          ] = andMask;
+              d[y * cursor->width + x + cursor->width * hheight] = xorMask;
+            }
+
+          break;
+        }
+
+        default:
+          printf("Invalid cursor type\n");
+          break;
+      }
+
+      this->cursor.type   = cursor->type;
+      this->cursor.width  = cursor->width;
+      this->cursor.height = cursor->height;
+
+      atomic_fetch_add_explicit(&this->cursorVer, 1, memory_order_relaxed);
+      os_sem_post(this->cursorSem);
+    }
+
+    if (msg.udata & CURSOR_FLAG_POSITION)
+    {
+      this->cursor.x = cursor->x;
+      this->cursor.y = cursor->y;
+    }
+
+    lgmpClientMessageDone(this->pointerQueue);
+  }
+
+  lgmpClientUnsubscribe(&this->pointerQueue);
+
+  bfree(this->cursorData);
+  this->cursorData = NULL;
+  this->cursorSize = 0;
+
+  this->state = STATE_STOPPING;
+  return NULL;
+}
+
 static void lgUpdate(void * data, obs_data_t * settings)
 {
   LGPlugin * this = (LGPlugin *)data;
@@ -196,6 +349,8 @@ static void lgUpdate(void * data, obs_data_t * settings)
   this->state = STATE_STARTING;
   pthread_create(&this->frameThread, NULL, frameThread, this);
   pthread_setname_np(this->frameThread, "LGFrameThread");
+  pthread_create(&this->pointerThread, NULL, pointerThread, this);
+  pthread_setname_np(this->pointerThread, "LGPointerThread");
 }
 
 static void lgVideoTick(void * data, float seconds)
@@ -214,6 +369,65 @@ static void lgVideoTick(void * data, float seconds)
     os_sem_post(this->frameSem);
     return;
   }
+
+  this->cursorRect.x = this->cursor.x;
+  this->cursorRect.y = this->cursor.y;
+
+  /* update the cursor texture */
+  unsigned int cursorVer = atomic_load(&this->cursorVer);
+  if (cursorVer != this->cursorCurVer)
+  {
+    os_sem_wait(this->cursorSem);
+    obs_enter_graphics();
+
+    if (this->cursorTex)
+    {
+      gs_texture_destroy(this->cursorTex);
+      this->cursorTex = NULL;
+    }
+
+    switch(this->cursor.type)
+    {
+      case CURSOR_TYPE_MASKED_COLOR:
+        /* fallthrough */
+
+      case CURSOR_TYPE_COLOR:
+        this->cursorMono  = false;
+        this->cursorTex   =
+          gs_texture_create(
+              this->cursor.width,
+              this->cursor.height,
+              GS_BGRA,
+              1,
+              (const uint8_t **)&this->cursorData,
+              GS_DYNAMIC);
+        break;
+
+      case CURSOR_TYPE_MONOCHROME:
+        this->cursorMono = true;
+        this->cursorTex  =
+          gs_texture_create(
+              this->cursor.width,
+              this->cursor.height,
+              GS_RGBA,
+              1,
+              (const uint8_t **)&this->cursorData,
+              GS_DYNAMIC);
+        break;
+
+      default:
+        break;
+    }
+
+    obs_leave_graphics();
+
+    this->cursorCurVer  = cursorVer;
+    this->cursorRect.cx = this->cursor.width;
+    this->cursorRect.cy = this->cursor.height;
+
+    os_sem_post(this->cursorSem);
+  }
+
 
   if ((status = lgmpClientAdvanceToLast(this->frameQueue)) != LGMP_OK)
   {
@@ -239,34 +453,35 @@ static void lgVideoTick(void * data, float seconds)
     return;
   }
 
-  bool updateTexture = false;
   KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
-  if (this->width  != frame->width  ||
-      this->height != frame->height ||
-      this->type   != frame->type)
+  if (!this->texture || this->formatVer != frame->formatVer)
   {
-    updateTexture = true;
-    this->width   = frame->width;
-    this->height  = frame->height;
-    this->type    = frame->type;
-  }
+    this->formatVer = frame->formatVer;
+    this->width     = frame->width;
+    this->height    = frame->height;
+    this->type      = frame->type;
 
-  if (!this->texture || updateTexture)
-  {
     obs_enter_graphics();
     if (this->texture)
     {
       gs_texture_unmap(this->texture);
       gs_texture_destroy(this->texture);
+      this->texture = NULL;
     }
-    this->texture = NULL;
 
     enum gs_color_format format;
+    this->bpp = 4;
     switch(this->type)
     {
-      case FRAME_TYPE_BGRA  : format = GS_BGRA       ; break;
-      case FRAME_TYPE_RGBA  : format = GS_RGBA       ; break;
-      case FRAME_TYPE_RGBA10: format = GS_R10G10B10A2; break;
+      case FRAME_TYPE_BGRA   : format = GS_BGRA       ; break;
+      case FRAME_TYPE_RGBA   : format = GS_RGBA       ; break;
+      case FRAME_TYPE_RGBA10 : format = GS_R10G10B10A2; break;
+
+      case FRAME_TYPE_RGBA16F:
+        this->bpp = 8;
+        format    = GS_RGBA16F;
+        break;
+
       default:
         printf("invalid type %d\n", this->type);
         os_sem_post(this->frameSem);
@@ -289,24 +504,32 @@ static void lgVideoTick(void * data, float seconds)
     obs_leave_graphics();
   }
 
-  FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
-  framebuffer_read(
-      fb,
-      this->texData,    // dst
-      this->linesize,   // dstpitch
-      frame->height,    // height
-      frame->width,     // width
-      4,                // bpp
-      frame->pitch      // linepitch
-  );
+  if (this->texture)
+  {
+    FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
+    framebuffer_read(
+        fb,
+        this->texData,    // dst
+        this->linesize,   // dstpitch
+        frame->height,    // height
+        frame->width,     // width
+        this->bpp,        // bpp
+        frame->pitch      // linepitch
+    );
 
-  lgmpClientMessageDone(this->frameQueue);
-  os_sem_post(this->frameSem);
+    lgmpClientMessageDone(this->frameQueue);
+    os_sem_post(this->frameSem);
 
-  obs_enter_graphics();
-  gs_texture_unmap(this->texture);
-  gs_texture_map(this->texture, &this->texData, &this->linesize);
-  obs_leave_graphics();
+    obs_enter_graphics();
+    gs_texture_unmap(this->texture);
+    gs_texture_map(this->texture, &this->texData, &this->linesize);
+    obs_leave_graphics();
+  }
+  else
+  {
+    lgmpClientMessageDone(this->frameQueue);
+    os_sem_post(this->frameSem);
+  }
 }
 
 static void lgVideoRender(void * data, gs_effect_t * effect)
@@ -319,8 +542,59 @@ static void lgVideoRender(void * data, gs_effect_t * effect)
   effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
   gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
   gs_effect_set_texture(image, this->texture);
-  while (gs_effect_loop(effect, "Draw")) {
+
+  while (gs_effect_loop(effect, "Draw"))
     gs_draw_sprite(this->texture, 0, 0, 0);
+
+  if (this->cursorVisible && this->cursorTex)
+  {
+    struct matrix4 m4;
+    gs_matrix_get(&m4);
+    struct gs_rect r =
+    {
+      .x  = m4.t.x,
+      .y  = m4.t.y,
+      .cx = (double)this->width  * m4.x.x,
+      .cy = (double)this->height * m4.y.y
+    };
+    gs_set_scissor_rect(&r);
+
+    effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    image  = gs_effect_get_param_by_name(effect, "image");
+    gs_effect_set_texture(image, this->cursorTex);
+
+    gs_matrix_push();
+    gs_matrix_translate3f(this->cursorRect.x, this->cursorRect.y, 0.0f);
+
+    if (!this->cursorMono)
+    {
+      while (gs_effect_loop(effect, "Draw"))
+        gs_draw_sprite(this->cursorTex, 0, 0, 0);
+    }
+    else
+    {
+      while (gs_effect_loop(effect, "Draw"))
+      {
+        glEnable(GL_COLOR_LOGIC_OP);
+
+        glLogicOp(GL_AND);
+        gs_draw_sprite_subregion(
+            this->cursorTex    , 0,
+            0                  , 0,
+            this->cursorRect.cx, this->cursorRect.cy / 2 - 1);
+
+        glLogicOp(GL_XOR);
+        gs_draw_sprite_subregion(
+            this->cursorTex    , 0,
+            0                  , this->cursorRect.cy / 2 + 1,
+            this->cursorRect.cx, this->cursorRect.cy / 2);
+
+        glDisable(GL_COLOR_LOGIC_OP);
+      }
+    }
+
+    gs_matrix_pop();
+    gs_set_scissor_rect(NULL);
   }
 }
 

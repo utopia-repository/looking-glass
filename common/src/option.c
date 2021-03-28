@@ -210,7 +210,7 @@ bool option_register(struct Option options[])
   return true;
 };
 
-void option_free()
+void option_free(void)
 {
   for(int i = 0; i < state.oCount; ++i)
   {
@@ -223,6 +223,12 @@ void option_free()
   state.options = NULL;
   state.oCount  = 0;
 
+  for(int g = 0; g < state.gCount; ++g)
+  {
+    struct OptionGroup * group = &state.groups[g];
+    if (group->options)
+      free(group->options);
+  }
   free(state.groups);
   state.groups  = NULL;
   state.gCount  = 0;
@@ -520,7 +526,7 @@ exit:
   return result;
 }
 
-bool option_validate()
+bool option_validate(void)
 {
   if (state.doHelp)
   {
@@ -571,7 +577,7 @@ bool option_validate()
   return ok;
 }
 
-void option_print()
+void option_print(void)
 {
   printf(
     "The following is a complete list of options accepted by this application\n\n"

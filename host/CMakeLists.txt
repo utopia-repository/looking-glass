@@ -6,11 +6,16 @@ set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/")
 include(CheckCCompilerFlag)
 include(FeatureSummary)
 
-option(OPTIMIZE_FOR_NATIVE "Build with -march=native" ON)
+option(OPTIMIZE_FOR_NATIVE "Build with -march=native" OFF)
 if(OPTIMIZE_FOR_NATIVE)
   CHECK_C_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
   if(COMPILER_SUPPORTS_MARCH_NATIVE)
     add_compile_options("-march=native")
+  endif()
+else()
+  CHECK_C_COMPILER_FLAG("-march=nehalem" COMPILER_SUPPORTS_MARCH_NEHALEM)
+  if(COMPILER_SUPPORTS_MARCH_NEHALEM)
+    add_compile_options("-march=nehalem")
   endif()
 endif()
 
@@ -28,15 +33,14 @@ add_compile_options(
 )
 set(CMAKE_C_STANDARD  11)
 
-execute_process(
-	COMMAND			cat ../VERSION
-	WORKING_DIRECTORY	${PROJECT_SOURCE_DIR}
-	OUTPUT_VARIABLE		BUILD_VERSION
-	OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-
-add_definitions(-D BUILD_VERSION='"${BUILD_VERSION}"')
 get_filename_component(PROJECT_TOP "${PROJECT_SOURCE_DIR}/.." ABSOLUTE)
+
+add_custom_command(
+	OUTPUT	${CMAKE_BINARY_DIR}/version.c
+		${CMAKE_BINARY_DIR}/_version.c
+	COMMAND ${CMAKE_COMMAND} -D PROJECT_TOP=${PROJECT_TOP} -P
+		${PROJECT_TOP}/version.cmake
+)
 
 include_directories(
 	${PROJECT_SOURCE_DIR}/include
@@ -49,6 +53,7 @@ include_directories(
 #)
 
 set(SOURCES
+	${CMAKE_BINARY_DIR}/version.c
 	src/app.c
 )
 
@@ -66,7 +71,13 @@ target_link_libraries(looking-glass-host
 	platform
 	lgmp
 )
-set_target_properties(looking-glass-host PROPERTIES LINK_FLAGS "-Wl,--gc-sections")
+
+if(WIN32)
+  set_target_properties(looking-glass-host PROPERTIES LINK_FLAGS "-Wl,--gc-sections -Wl,--nxcompat")
+else()
+  set_target_properties(looking-glass-host PROPERTIES LINK_FLAGS "-Wl,--gc-sections -z noexecstack")
+endif()
+
 install(PROGRAMS ${CMAKE_BINARY_DIR}/looking-glass-host DESTINATION bin/ COMPONENT binary)
 
 feature_summary(WHAT ENABLED_FEATURES DISABLED_FEATURES)

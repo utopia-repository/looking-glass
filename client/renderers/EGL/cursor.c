@@ -20,6 +20,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "cursor.h"
 #include "common/debug.h"
 #include "common/locking.h"
+#include "common/option.h"
 
 #include "texture.h"
 #include "shader.h"
@@ -32,6 +33,15 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "cursor.vert.h"
 #include "cursor_rgb.frag.h"
 #include "cursor_mono.frag.h"
+
+struct CursorTex
+{
+  struct EGL_Texture * texture;
+  struct EGL_Shader  * shader;
+  GLuint uMousePos;
+  GLuint uRotate;
+  GLuint uCBMode;
+};
 
 struct EGL_Cursor
 {
@@ -47,21 +57,64 @@ struct EGL_Cursor
   // cursor state
   bool              visible;
   float             x, y, w, h;
+  LG_RendererRotate rotate;
+  int               cbMode;
 
-  // textures
-  struct EGL_Texture * texture;
-  struct EGL_Texture * textureMono;
+  struct CursorTex norm;
+  struct CursorTex mono;
+  struct EGL_Model * model;
+};
 
-  // shaders
-  struct EGL_Shader  * shader;
-  struct EGL_Shader  * shaderMono;
+static bool egl_cursor_tex_init(struct CursorTex * t,
+    const char * vertex_code  , size_t vertex_size,
+    const char * fragment_code, size_t fragment_size)
+{
+  if (!egl_texture_init(&t->texture, NULL))
+  {
+    DEBUG_ERROR("Failed to initialize the cursor texture");
+    return false;
+  }
 
-  // uniforms
-  GLuint uMousePos;
-  GLuint uMousePosMono;
+  if (!egl_shader_init(&t->shader))
+  {
+    DEBUG_ERROR("Failed to initialize the cursor shader");
+    return false;
+  }
 
-  // model
-  struct EGL_Model   * model;
+  if (!egl_shader_compile(t->shader,
+        vertex_code, vertex_size, fragment_code, fragment_size))
+  {
+    DEBUG_ERROR("Failed to compile the cursor shader");
+    return false;
+  }
+
+  t->uMousePos = egl_shader_get_uniform_location(t->shader, "mouse" );
+  t->uRotate   = egl_shader_get_uniform_location(t->shader, "rotate");
+  t->uCBMode   = egl_shader_get_uniform_location(t->shader, "cbMode");
+
+  return true;
+}
+
+static inline void egl_cursor_tex_uniforms(EGL_Cursor * cursor, struct CursorTex * t, bool mono)
+{
+  if (mono)
+  {
+    glUniform4f(t->uMousePos, cursor->x, cursor->y, cursor->w, cursor->h / 2);
+    glUniform1i(t->uRotate  , cursor->rotate);
+    glUniform1i(t->uCBMode  , cursor->cbMode);
+  }
+  else
+  {
+    glUniform4f(t->uMousePos, cursor->x, cursor->y, cursor->w, cursor->h);
+    glUniform1i(t->uRotate  , cursor->rotate);
+    glUniform1i(t->uCBMode  , cursor->cbMode);
+  }
+}
+
+static void egl_cursor_tex_free(struct CursorTex * t)
+{
+  egl_texture_free(&t->texture);
+  egl_shader_free (&t->shader );
 };
 
 bool egl_cursor_init(EGL_Cursor ** cursor)
@@ -76,50 +129,15 @@ bool egl_cursor_init(EGL_Cursor ** cursor)
   memset(*cursor, 0, sizeof(EGL_Cursor));
   LG_LOCK_INIT((*cursor)->lock);
 
-  if (!egl_texture_init(&(*cursor)->texture))
-  {
-    DEBUG_ERROR("Failed to initialize the cursor texture");
+  if (!egl_cursor_tex_init(&(*cursor)->norm,
+      b_shader_cursor_vert    , b_shader_cursor_vert_size,
+      b_shader_cursor_rgb_frag, b_shader_cursor_rgb_frag_size))
     return false;
-  }
 
-  if (!egl_texture_init(&(*cursor)->textureMono))
-  {
-    DEBUG_ERROR("Failed to initialize the cursor mono texture");
+  if (!egl_cursor_tex_init(&(*cursor)->mono,
+      b_shader_cursor_vert     , b_shader_cursor_vert_size,
+      b_shader_cursor_mono_frag, b_shader_cursor_mono_frag_size))
     return false;
-  }
-
-  if (!egl_shader_init(&(*cursor)->shader))
-  {
-    DEBUG_ERROR("Failed to initialize the cursor shader");
-    return false;
-  }
-
-  if (!egl_shader_init(&(*cursor)->shaderMono))
-  {
-    DEBUG_ERROR("Failed to initialize the cursor mono shader");
-    return false;
-  }
-
-  if (!egl_shader_compile(
-        (*cursor)->shader,
-        b_shader_cursor_vert    , b_shader_cursor_vert_size,
-        b_shader_cursor_rgb_frag, b_shader_cursor_rgb_frag_size))
-  {
-    DEBUG_ERROR("Failed to compile the cursor shader");
-    return false;
-  }
-
-  if (!egl_shader_compile(
-        (*cursor)->shaderMono,
-        b_shader_cursor_vert     , b_shader_cursor_vert_size,
-        b_shader_cursor_mono_frag, b_shader_cursor_mono_frag_size))
-  {
-    DEBUG_ERROR("Failed to compile the cursor mono shader");
-    return false;
-  }
-
-  (*cursor)->uMousePos     = egl_shader_get_uniform_location((*cursor)->shader    , "mouse");
-  (*cursor)->uMousePosMono = egl_shader_get_uniform_location((*cursor)->shaderMono, "mouse");
 
   if (!egl_model_init(&(*cursor)->model))
   {
@@ -128,6 +146,9 @@ bool egl_cursor_init(EGL_Cursor ** cursor)
   }
 
   egl_model_set_default((*cursor)->model);
+
+  (*cursor)->cbMode = option_get_int("egl", "cbMode");
+
   return true;
 }
 
@@ -140,24 +161,23 @@ void egl_cursor_free(EGL_Cursor ** cursor)
   if ((*cursor)->data)
     free((*cursor)->data);
 
-  egl_texture_free(&(*cursor)->texture    );
-  egl_texture_free(&(*cursor)->textureMono);
-  egl_shader_free (&(*cursor)->shader     );
-  egl_shader_free (&(*cursor)->shaderMono );
-  egl_model_free  (&(*cursor)->model      );
+  egl_cursor_tex_free(&(*cursor)->norm);
+  egl_cursor_tex_free(&(*cursor)->mono);
+  egl_model_free(&(*cursor)->model);
 
   free(*cursor);
   *cursor = NULL;
 }
 
-bool egl_cursor_set_shape(EGL_Cursor * cursor, const LG_RendererCursor type, const int width, const int height, const int stride, const uint8_t * data)
+bool egl_cursor_set_shape(EGL_Cursor * cursor, const LG_RendererCursor type,
+    const int width, const int height, const int stride, const uint8_t * data)
 {
   LG_LOCK(cursor->lock);
 
   cursor->type   = type;
   cursor->width  = width;
   cursor->height = (type == LG_CURSOR_MONOCHROME ? height / 2 : height);
-  cursor->stride  = stride;
+  cursor->stride = stride;
 
   const size_t size = height * stride;
   if (size > cursor->dataSize)
@@ -195,7 +215,7 @@ void egl_cursor_set_state(EGL_Cursor * cursor, const bool visible, const float x
   cursor->y       = y;
 }
 
-void egl_cursor_render(EGL_Cursor * cursor)
+void egl_cursor_render(EGL_Cursor * cursor, LG_RendererRotate rotate)
 {
   if (!cursor->visible)
     return;
@@ -214,9 +234,9 @@ void egl_cursor_render(EGL_Cursor * cursor)
 
       case LG_CURSOR_COLOR:
       {
-        egl_texture_setup(cursor->texture, EGL_PF_BGRA, cursor->width, cursor->height, cursor->stride, false);
-        egl_texture_update(cursor->texture, data);
-        egl_model_set_texture(cursor->model, cursor->texture);
+        egl_texture_setup(cursor->norm.texture, EGL_PF_BGRA, cursor->width, cursor->height, cursor->stride, false, false);
+        egl_texture_update(cursor->norm.texture, data);
+        egl_model_set_texture(cursor->model, cursor->norm.texture);
         break;
       }
 
@@ -238,39 +258,41 @@ void egl_cursor_render(EGL_Cursor * cursor)
             xor[y * cursor->width + x] = xorMask;
           }
 
-        egl_texture_setup (cursor->texture    , EGL_PF_BGRA, cursor->width, cursor->height, cursor->width * 4, false);
-        egl_texture_setup (cursor->textureMono, EGL_PF_BGRA, cursor->width, cursor->height, cursor->width * 4, false);
-        egl_texture_update(cursor->texture    , (uint8_t *)and);
-        egl_texture_update(cursor->textureMono, (uint8_t *)xor);
+        egl_texture_setup (cursor->norm.texture, EGL_PF_BGRA, cursor->width, cursor->height, cursor->width * 4, false, false);
+        egl_texture_setup (cursor->mono.texture, EGL_PF_BGRA, cursor->width, cursor->height, cursor->width * 4, false, false);
+        egl_texture_update(cursor->norm.texture, (uint8_t *)and);
+        egl_texture_update(cursor->mono.texture, (uint8_t *)xor);
         break;
       }
     }
     LG_UNLOCK(cursor->lock);
   }
 
+  cursor->rotate = rotate;
+
   glEnable(GL_BLEND);
   switch(cursor->type)
   {
     case LG_CURSOR_MONOCHROME:
     {
-      egl_shader_use(cursor->shader);
-      glUniform4f(cursor->uMousePos, cursor->x, cursor->y, cursor->w, cursor->h / 2);
+      egl_shader_use(cursor->norm.shader);
+      egl_cursor_tex_uniforms(cursor, &cursor->norm, true);;
       glBlendFunc(GL_ZERO, GL_SRC_COLOR);
-      egl_model_set_texture(cursor->model, cursor->texture);
+      egl_model_set_texture(cursor->model, cursor->norm.texture);
       egl_model_render(cursor->model);
 
-      egl_shader_use(cursor->shaderMono);
-      glUniform4f(cursor->uMousePosMono, cursor->x, cursor->y, cursor->w, cursor->h / 2);
+      egl_shader_use(cursor->mono.shader);
+      egl_cursor_tex_uniforms(cursor, &cursor->mono, true);;
       glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ZERO);
-      egl_model_set_texture(cursor->model, cursor->textureMono);
+      egl_model_set_texture(cursor->model, cursor->mono.texture);
       egl_model_render(cursor->model);
       break;
     }
 
     case LG_CURSOR_COLOR:
     {
-      egl_shader_use(cursor->shader);
-      glUniform4f(cursor->uMousePos, cursor->x, cursor->y, cursor->w, cursor->h);
+      egl_shader_use(cursor->norm.shader);
+      egl_cursor_tex_uniforms(cursor, &cursor->norm, false);
       glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
       egl_model_render(cursor->model);
       break;
@@ -278,8 +300,8 @@ void egl_cursor_render(EGL_Cursor * cursor)
 
     case LG_CURSOR_MASKED_COLOR:
     {
-      egl_shader_use(cursor->shaderMono);
-      glUniform4f(cursor->uMousePos, cursor->x, cursor->y, cursor->w, cursor->h);
+      egl_shader_use(cursor->mono.shader);
+      egl_cursor_tex_uniforms(cursor, &cursor->mono, false);
       glBlendFunc(GL_ONE_MINUS_DST_COLOR, GL_ZERO);
       egl_model_render(cursor->model);
       break;

@@ -16,7 +16,6 @@ make_object(
 	EGL_SHADER
 	shader/desktop.vert
 	shader/desktop_rgb.frag
-	shader/desktop_yuv.frag
 	shader/cursor.vert
 	shader/cursor_rgb.frag
 	shader/cursor_mono.frag
@@ -34,7 +33,8 @@ make_object(
 
 add_library(renderer_EGL STATIC
 	egl.c
-	debug.c
+	dynprocs.c
+	egldebug.c
 	shader.c
 	texture.c
 	model.c
