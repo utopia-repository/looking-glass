@@ -5,8 +5,8 @@ If you are looking for help or support please use one of the following methods
 Create a New Topic on the Level1Tech's forum under the Looking Glass category:
 * https://forum.level1techs.com/c/software/lookingGlass/142
 
-Ask for help in #looking-glass in the VFIO discord server
-* https://discord.gg/4ahCn4c
+Ask for help in the Looking Glass discord server
+* https://discord.gg/52SMupxkvt
 
 *Issues that are not bug reports or feature requests will be closed & ignored*
 
@@ -40,12 +40,9 @@ PASTE CLIENT OUTPUT HERE
 ```
 
 The entire (not truncated) log file from the host application (if applicable).
-To obtain this locate the log file on your system, it will be in one of the
-following two locations depending on how you are launching the Looking Glass Host
-application:
+Normally, this is found on the guest system at:
 
-  * C:\Windows\Temp\looking-glass.txt
-  * C:\Users\YOUR_USER\AppData\Local\Temp\looking-glass.txt
+    %ProgramData%\Looking Glass (host)\looking-glass-host.txt
 
 This log may be quite long, please delete the file first and then proceed to
 launch the host and reproduce the issue so that the log only contains the
@@ -56,7 +53,7 @@ pertinent information.
 PASTE HOST LOG FILE CONTENTS HERE
 ```
 
-If the client is unexpetedly exiting without a backtrace, please provide one via
+If the client is unexpectedly exiting without a backtrace, please provide one via
 gdb with the command `thread apply all bt`. If you are unsure how to do this
 please watch the video below on how to perform a Debug build and generate this
 backtrace.

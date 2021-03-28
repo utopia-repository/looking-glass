@@ -1,6 +1,6 @@
 /*
 Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -17,11 +17,9 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#pragma once
+#include <windows.h>
 
-#include <common/debug.h>
+// At 100% scaling, Windows reports 96 DPI.
+#define DPI_100_PERCENT 96
 
-#define EGL_DEBUG_PRINT(type, fmt, ...) do {egl_debug_printf(type " %20s:%-4u | %-30s | " fmt, STRIPPATH(__FILE__), __LINE__, __FUNCTION__, ##__VA_ARGS__);} while (0)
-#define EGL_ERROR(fmt, ...) EGL_DEBUG_PRINT("[E]", fmt, ##__VA_ARGS__)
-
-void egl_debug_printf(char * format, ...);
+UINT monitor_dpi(HMONITOR hMonitor);

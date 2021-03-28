@@ -23,6 +23,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include <windows.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <fcntl.h>
 
 #include "interface/platform.h"
@@ -34,6 +35,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #define ID_MENU_SHOW_LOG 3000
 #define ID_MENU_EXIT     3001
+#define LOG_NAME         "looking-glass-host.txt"
 
 struct AppState
 {
@@ -44,6 +46,7 @@ struct AppState
   char ** argv;
 
   char           executable[MAX_PATH + 1];
+  char           systemLogDir[MAX_PATH];
   HWND           messageWnd;
   NOTIFYICONDATA iconData;
   UINT           trayRestartMsg;
@@ -66,7 +69,7 @@ static ZwSetTimerResolution_t ZwSetTimerResolution = NULL;
 typedef WINBOOL WINAPI (*PChangeWindowMessageFilterEx)(HWND hwnd, UINT message, DWORD action, void * pChangeFilterStruct);
 PChangeWindowMessageFilterEx _ChangeWindowMessageFilterEx = NULL;
 
-static void RegisterTrayIcon()
+static void RegisterTrayIcon(void)
 {
   // register our TrayIcon
   if (!app.iconData.cbSize)
@@ -146,7 +149,6 @@ static int appThread(void * opaque)
   int result = app_main(app.argc, app.argv);
 
   Shell_NotifyIcon(NIM_DELETE, &app.iconData);
-  mouseHook_remove();
   SendMessage(app.messageWnd, WM_DESTROY, 0, 0);
   return result;
 }
@@ -167,6 +169,29 @@ static BOOL WINAPI CtrlHandler(DWORD dwCtrlType)
   return FALSE;
 }
 
+const char *getSystemLogDirectory(void)
+{
+  return app.systemLogDir;
+}
+
+static void populateSystemLogDirectory()
+{
+  char programData[MAX_PATH];
+  if (GetEnvironmentVariableA("ProgramData", programData, sizeof(programData)) &&
+      PathIsDirectoryA(programData))
+  {
+    if (!PathCombineA(app.systemLogDir, programData, "Looking Glass (host)"))
+      goto fail;
+
+    if (!PathIsDirectoryA(app.systemLogDir) && !CreateDirectoryA(app.systemLogDir, NULL))
+      goto fail;
+
+    return;
+  }
+fail:
+  strcpy(app.systemLogDir, "");
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
   // convert the command line to the standard argc and argv
@@ -181,8 +206,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   LocalFree(wargv);
 
   GetModuleFileName(NULL, app.executable, sizeof(app.executable));
+  populateSystemLogDirectory();
+
   if (HandleService(app.argc, app.argv))
-    return 0;
+    return LG_HOST_EXIT_FAILED;
 
   /* this is a bit of a hack but without this --help will produce no output in a windows command prompt */
   if (!IsDebuggerPresent() && AttachConsole(ATTACH_PARENT_PROCESS))
@@ -202,11 +229,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   int result = 0;
   app.hInst = hInstance;
 
-  char tempPath[MAX_PATH+1];
-  GetTempPathA(sizeof(tempPath), tempPath);
-  int len = snprintf(NULL, 0, "%slooking-glass-host.txt", tempPath);
-  char * logFilePath = malloc(len + 1);
-  sprintf(logFilePath, "%slooking-glass-host.txt", tempPath);
+  char logFilePath[MAX_PATH];
+  if (!PathCombineA(logFilePath, app.systemLogDir, LOG_NAME))
+    strcpy(logFilePath, LOG_NAME);
 
   struct Option options[] =
   {
@@ -221,10 +246,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   };
 
   option_register(options);
-  free(logFilePath);
 
   // setup a handler for ctrl+c
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
+  // enable high DPI awareness
+  // this is required for DXGI 1.5 support to function and also capturing desktops with high DPI
+  DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
+  #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2  ((DPI_AWARENESS_CONTEXT)-4)
+  typedef BOOL (*User32_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT value);
+
+  HMODULE user32 = GetModuleHandle("user32.dll");
+  User32_SetProcessDpiAwarenessContext fn;
+  fn = (User32_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+  if (fn)
+    fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
   // create a message window so that our message pump works
   WNDCLASSEX wx    = {};
@@ -240,7 +276,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   if (!(class = RegisterClassEx(&wx)))
   {
     DEBUG_ERROR("Failed to register message window class");
-    result = -1;
+    result = LG_HOST_EXIT_FAILED;
     goto finish;
   }
 
@@ -249,7 +285,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   app.messageWnd = CreateWindowEx(0, MAKEINTATOM(class), NULL, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
   // this is needed so that unprivileged processes can send us this message
-  HMODULE user32 = GetModuleHandle("user32.dll");
   _ChangeWindowMessageFilterEx = (PChangeWindowMessageFilterEx)GetProcAddress(user32, "ChangeWindowMessageFilterEx");
   if (_ChangeWindowMessageFilterEx)
     _ChangeWindowMessageFilterEx(app.messageWnd, app.trayRestartMsg, MSGFLT_ALLOW, NULL);
@@ -267,7 +302,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   if (!lgCreateThread("appThread", appThread, NULL, &thread))
   {
     DEBUG_ERROR("Failed to create the main application thread");
-    result = -1;
+    result = LG_HOST_EXIT_FAILED;
     goto finish;
   }
 
@@ -284,7 +319,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     else if (bRet < 0)
     {
       DEBUG_ERROR("Unknown error from GetMessage");
-      result = -1;
+      result = LG_HOST_EXIT_FAILED;
       goto shutdown;
     }
 
@@ -293,11 +328,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 shutdown:
   DestroyMenu(app.trayMenu);
-  app_quit();
+  app_shutdown();
   if (!lgJoinThread(thread, &result))
   {
     DEBUG_ERROR("Failed to join the main application thread");
-    result = -1;
+    result = LG_HOST_EXIT_FAILED;
   }
 
 finish:
@@ -309,7 +344,7 @@ finish:
   return result;
 }
 
-bool app_init()
+bool app_init(void)
 {
   const char * logFile   = option_get_string("os", "logFile"  );
 
@@ -335,12 +370,12 @@ bool app_init()
   return true;
 }
 
-const char * os_getExecutable()
+const char * os_getExecutable(void)
 {
   return app.executable;
 }
 
-const char * os_getDataPath()
+const char * os_getDataPath(void)
 {
   static char path[MAX_PATH] = { 0 };
   if (!path[0])
@@ -358,7 +393,7 @@ const char * os_getDataPath()
   return path;
 }
 
-HWND os_getMessageWnd()
+HWND os_getMessageWnd(void)
 {
   return app.messageWnd;
 }

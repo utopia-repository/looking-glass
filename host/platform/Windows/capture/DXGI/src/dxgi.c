@@ -24,6 +24,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/option.h"
 #include "common/locking.h"
 #include "common/event.h"
+#include "common/dpi.h"
 
 #include <assert.h>
 #include <stdatomic.h>
@@ -57,6 +58,7 @@ enum TextureState
 
 typedef struct Texture
 {
+  unsigned int               formatVer;
   volatile enum TextureState state;
   ID3D11Texture2D          * tex;
   D3D11_MAPPED_SUBRESOURCE   map;
@@ -91,17 +93,19 @@ struct iface
   CapturePostPointerBuffer   postPointerBufferFn;
   LGEvent                  * frameEvent;
 
-  unsigned int  width;
-  unsigned int  height;
-  unsigned int  pitch;
-  unsigned int  stride;
-  CaptureFormat format;
+  unsigned int    formatVer;
+  unsigned int    width;
+  unsigned int    height;
+  unsigned int    pitch;
+  unsigned int    stride;
+  CaptureFormat   format;
+  CaptureRotation rotation;
+  unsigned int    dpi;
 
   int  lastPointerX, lastPointerY;
   bool lastPointerVisible;
 };
 
-static bool           dpiDone = false;
 static struct iface * this    = NULL;
 
 // forwards
@@ -111,12 +115,12 @@ static CaptureResult dxgi_releaseFrame();
 
 // implementation
 
-static const char * dxgi_getName()
+static const char * dxgi_getName(void)
 {
   return "DXGI";
 }
 
-static void dxgi_initOptions()
+static void dxgi_initOptions(void)
 {
   struct Option options[] =
   {
@@ -183,7 +187,7 @@ static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostP
   return true;
 }
 
-static bool dxgi_init()
+static bool dxgi_init(void)
 {
   assert(this);
 
@@ -208,28 +212,12 @@ static bool dxgi_init()
     DEBUG_INFO("looking-glass-host.exe InstallService");
   }
 
-  // this is required for DXGI 1.5 support to function
-  if (!dpiDone)
-  {
-    DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-    #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2  ((DPI_AWARENESS_CONTEXT)-4)
-    typedef BOOL (*User32_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT value);
-
-    HMODULE user32 = LoadLibraryA("user32.dll");
-    User32_SetProcessDpiAwarenessContext fn;
-    fn = (User32_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-    if (fn)
-      fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    FreeLibrary(user32);
-    dpiDone = true;
-  }
-
   HRESULT          status;
   DXGI_OUTPUT_DESC outputDesc;
 
-  this->stop       = false;
-  this->texRIndex  = 0;
-  this->texWIndex  = 0;
+  this->stop      = false;
+  this->texRIndex = 0;
+  this->texWIndex = 0;
   atomic_store(&this->texReady, 0);
 
   lgResetEvent(this->frameEvent);
@@ -384,8 +372,46 @@ static bool dxgi_init()
 
   DXGI_ADAPTER_DESC1 adapterDesc;
   IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
-  this->width  = outputDesc.DesktopCoordinates.right  - outputDesc.DesktopCoordinates.left;
-  this->height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+
+  switch(outputDesc.Rotation)
+  {
+    case DXGI_MODE_ROTATION_ROTATE90:
+    case DXGI_MODE_ROTATION_ROTATE270:
+      this->width    = outputDesc.DesktopCoordinates.bottom -
+                       outputDesc.DesktopCoordinates.top;
+      this->height   = outputDesc.DesktopCoordinates.right -
+                       outputDesc.DesktopCoordinates.left;
+      break;
+
+    default:
+      this->width    = outputDesc.DesktopCoordinates.right  -
+                       outputDesc.DesktopCoordinates.left;
+      this->height   = outputDesc.DesktopCoordinates.bottom -
+                       outputDesc.DesktopCoordinates.top;
+      break;
+  }
+
+  switch(outputDesc.Rotation)
+  {
+    case DXGI_MODE_ROTATION_ROTATE90:
+      this->rotation = CAPTURE_ROT_270;
+      break;
+
+    case DXGI_MODE_ROTATION_ROTATE180:
+      this->rotation = CAPTURE_ROT_180;
+      break;
+
+    case DXGI_MODE_ROTATION_ROTATE270:
+      this->rotation = CAPTURE_ROT_90;
+      break;
+
+    default:
+      this->rotation = CAPTURE_ROT_0;
+      break;
+  }
+
+  this->dpi = monitor_dpi(outputDesc.Monitor);
+  ++this->formatVer;
 
   DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
   DEBUG_INFO("Device Vendor ID : 0x%x"   , adapterDesc.VendorId);
@@ -482,7 +508,8 @@ static bool dxgi_init()
     {
       DXGI_FORMAT_B8G8R8A8_UNORM,
       DXGI_FORMAT_R8G8B8A8_UNORM,
-      DXGI_FORMAT_R10G10B10A2_UNORM
+      DXGI_FORMAT_R10G10B10A2_UNORM,
+      DXGI_FORMAT_R16G16B16A16_FLOAT
     };
 
     // we try this twice in case we still get an error on re-initialization
@@ -519,11 +546,18 @@ static bool dxgi_init()
   IDXGIOutputDuplication_GetDesc(this->dup, &dupDesc);
   DEBUG_INFO("Source Format    : %s", GetDXGIFormatStr(dupDesc.ModeDesc.Format));
 
+  uint8_t bpp = 4;
   switch(dupDesc.ModeDesc.Format)
   {
-    case DXGI_FORMAT_B8G8R8A8_UNORM   : this->format = CAPTURE_FMT_BGRA  ; break;
-    case DXGI_FORMAT_R8G8B8A8_UNORM   : this->format = CAPTURE_FMT_RGBA  ; break;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: this->format = CAPTURE_FMT_RGBA10; break;
+    case DXGI_FORMAT_B8G8R8A8_UNORM    : this->format = CAPTURE_FMT_BGRA   ; break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM    : this->format = CAPTURE_FMT_RGBA   ; break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM : this->format = CAPTURE_FMT_RGBA10 ; break;
+
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+      this->format = CAPTURE_FMT_RGBA16F;
+      bpp = 8;
+      break;
+
     default:
       DEBUG_ERROR("Unsupported source format");
       goto fail;
@@ -562,7 +596,7 @@ static bool dxgi_init()
     goto fail;
   }
   this->pitch  = mapping.RowPitch;
-  this->stride = mapping.RowPitch / 4;
+  this->stride = mapping.RowPitch / bpp;
   ID3D11DeviceContext_Unmap(this->deviceContext, (ID3D11Resource *)this->texture[0].tex, 0);
 
   QueryPerformanceFrequency(&this->perfFreq) ;
@@ -575,12 +609,12 @@ fail:
   return false;
 }
 
-static void dxgi_stop()
+static void dxgi_stop(void)
 {
   this->stop = true;
 }
 
-static bool dxgi_deinit()
+static bool dxgi_deinit(void)
 {
   assert(this);
 
@@ -656,7 +690,7 @@ static bool dxgi_deinit()
   return true;
 }
 
-static void dxgi_free()
+static void dxgi_free(void)
 {
   assert(this);
 
@@ -669,12 +703,20 @@ static void dxgi_free()
   this = NULL;
 }
 
-static unsigned int dxgi_getMaxFrameSize()
+static unsigned int dxgi_getMaxFrameSize(void)
 {
   assert(this);
   assert(this->initialized);
 
   return this->height * this->pitch;
+}
+
+static unsigned int dxgi_getMouseScale(void)
+{
+  assert(this);
+  assert(this->initialized);
+
+  return this->dpi * 100 / DPI_100_PERCENT;
 }
 
 static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
@@ -696,12 +738,12 @@ static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
   }
 }
 
-static CaptureResult dxgi_capture()
+static CaptureResult dxgi_capture(void)
 {
   assert(this);
   assert(this->initialized);
 
-  Texture                 * tex;
+  Texture                 * tex = NULL;
   CaptureResult             result;
   HRESULT                   status;
   DXGI_OUTDUPL_FRAME_INFO   frameInfo;
@@ -797,7 +839,8 @@ static CaptureResult dxgi_capture()
       ID3D11Texture2D_Release(src);
 
       // set the state, and signal
-      tex->state = TEXTURE_STATE_PENDING_MAP;
+      tex->state     = TEXTURE_STATE_PENDING_MAP;
+      tex->formatVer = this->formatVer;
       if (atomic_fetch_add_explicit(&this->texReady, 1, memory_order_relaxed) == 0)
         lgSignalEvent(this->frameEvent);
 
@@ -829,38 +872,12 @@ static CaptureResult dxgi_capture()
           return CAPTURE_RESULT_ERROR;
       }
 
-      CURSORINFO ci = { .cbSize = sizeof(CURSORINFO) };
-      if (!GetCursorInfo(&ci))
-      {
-        DEBUG_WINERROR("GetCursorInfo failed", GetLastError());
-        return CAPTURE_RESULT_ERROR;
-      }
-
-      if (ci.hCursor)
-      {
-        ICONINFO ii;
-        if (!GetIconInfo(ci.hCursor, &ii))
-        {
-          DEBUG_WINERROR("GetIconInfo failed", GetLastError());
-          return CAPTURE_RESULT_ERROR;
-        }
-
-        DeleteObject(ii.hbmMask);
-        DeleteObject(ii.hbmColor);
-
-        pointer.hx = ii.xHotspot;
-        pointer.hy = ii.yHotspot;
-      }
-      else
-      {
-        pointer.hx = 0;
-        pointer.hy = 0;
-      }
-
       pointer.shapeUpdate = true;
       pointer.width       = shapeInfo.Width;
       pointer.height      = shapeInfo.Height;
       pointer.pitch       = shapeInfo.Pitch;
+      pointer.hx          = shapeInfo.HotSpot.x;
+      pointer.hy          = shapeInfo.HotSpot.y;
       postPointer         = true;
     }
   }
@@ -942,11 +959,13 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
 
   tex->state = TEXTURE_STATE_MAPPED;
 
-  frame->width  = this->width;
-  frame->height = this->height;
-  frame->pitch  = this->pitch;
-  frame->stride = this->stride;
-  frame->format = this->format;
+  frame->formatVer = tex->formatVer;
+  frame->width     = this->width;
+  frame->height    = this->height;
+  frame->pitch     = this->pitch;
+  frame->stride    = this->stride;
+  frame->format    = this->format;
+  frame->rotation  = this->rotation;
 
   atomic_fetch_sub_explicit(&this->texReady, 1, memory_order_release);
   return CAPTURE_RESULT_OK;
@@ -969,7 +988,7 @@ static CaptureResult dxgi_getFrame(FrameBuffer * frame)
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult dxgi_releaseFrame()
+static CaptureResult dxgi_releaseFrame(void)
 {
   assert(this);
   if (!this->needsRelease)
@@ -1012,6 +1031,7 @@ struct CaptureInterface Capture_DXGI =
   .deinit          = dxgi_deinit,
   .free            = dxgi_free,
   .getMaxFrameSize = dxgi_getMaxFrameSize,
+  .getMouseScale   = dxgi_getMouseScale,
   .capture         = dxgi_capture,
   .waitFrame       = dxgi_waitFrame,
   .getFrame        = dxgi_getFrame
