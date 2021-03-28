@@ -21,8 +21,18 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 
 #include <stdbool.h>
 
+// exit code for user opted to exit looking-glass-host
+#define LG_HOST_EXIT_USER    0x10
+// exit code for capture errors that should result in a restart, e.g. UAC
+#define LG_HOST_EXIT_CAPTURE 0x20
+// exit code for terminated
+#define LG_HOST_EXIT_KILLED  0x30
+// exit code for failed to start
+#define LG_HOST_EXIT_FAILED  0x40
+
 int  app_main(int argc, char * argv[]);
 bool app_init();
+void app_shutdown();
 void app_quit();
 
 // these must be implemented for each OS

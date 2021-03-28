@@ -18,7 +18,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
 
-;Include  
+;Include
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
@@ -36,9 +36,15 @@ InstallDir "$PROGRAMFILES64\Looking Glass (host)"
 !define MUI_ICON "icon.ico"
 !define MUI_UNICON "icon.ico"
 !define MUI_LICENSEPAGE_BUTTON "Agree"
-!define /file VERSION "VERSION"
+!define MUI_BGCOLOR "3c046c"
+!define MUI_TEXTCOLOR "ffffff"
+!define MUI_WELCOMEFINISHPAGE_BITMAP "${NSISDIR}\Contrib\Graphics\Wizard\nsis3-grey.bmp"
+!define /file VERSION "../../VERSION"
+
+!define MUI_WELCOMEPAGE_TEXT "You are about to install $(^Name) version ${VERSION}.$\r$\n$\r$\nWhen upgrading, you don't need to close your Looking Glass client, but should install the ${VERSION} client after installation is complete.$\r$\n$\r$\nPress Next to continue."
 
 ;Install and uninstall pages
+!insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "LICENSE.txt"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
@@ -103,13 +109,27 @@ Function .onInit
 
 FunctionEnd
 
+!macro StopLookingGlassService
+  ;Attempt to stop existing LG service only if it exists
+
+  nsExec::Exec 'sc.exe query "Looking Glass (host)"'
+  Pop $0 ; SC.exe error level
+
+  ${If} $0 == 0 ; If error level is 0, service exists
+    DetailPrint "Stop service: Looking Glass (host)"
+    nsExec::ExecToLog 'net.exe STOP "Looking Glass (host)"'
+  ${EndIf}
+
+!macroend
+
 ;Install 
 Section "-Install" Section1
 
-  nsExec::Exec 'net.exe STOP "Looking Glass (host)"'
+  !insertmacro StopLookingGlassService
 
   SetOutPath $INSTDIR
   File ..\..\looking-glass-host.exe
+  File /nonfatal ..\..\looking-glass-host.pdb
   File LICENSE.txt
   WriteUninstaller $INSTDIR\uninstaller.exe
 
@@ -134,15 +154,16 @@ Section "-Install" Section1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Looking Glass (host)" \
   "NoModify" "1"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Looking Glass (host)" \
-    "DisplayVersion" ${VERSION}
+  "DisplayVersion" ${VERSION}
 
 SectionEnd
 
 Section "Looking Glass (host) Service" Section2
 
   ${If} $option_noservice == 0
+    DetailPrint "Install service: Looking Glass (host)"
     nsExec::Exec '"$INSTDIR\looking-glass-host.exe" UninstallService'
-    nsExec::Exec '"$INSTDIR\looking-glass-host.exe" InstallService'
+    nsExec::ExecToLog '"$INSTDIR\looking-glass-host.exe" InstallService'
   ${EndIf}
 
 SectionEnd
@@ -151,7 +172,7 @@ Section /o "Desktop Shortcut" Section3
   StrCpy $option_desktop 1
 SectionEnd
 
-Section /o "Start Menu Shortcut" Section4
+Section "Start Menu Shortcut" Section4
   StrCpy $option_startMenu 1
 SectionEnd
 
@@ -159,7 +180,10 @@ Section "-Hidden Start Menu" Section5
   SetShellVarContext all
   
   ${If} $option_startMenu == 1
-    CreateShortCut "$SMPROGRAMS\Looking Glass (host).lnk" $INSTDIR\looking-glass-host.exe
+    CreateDirectory "$APPDATA\Looking Glass (host)"
+    CreateDirectory "$SMPROGRAMS\Looking Glass (host)"
+    CreateShortCut "$SMPROGRAMS\Looking Glass (host)\Looking Glass (host).lnk" $INSTDIR\looking-glass-host.exe
+    CreateShortCut "$SMPROGRAMS\Looking Glass (host)\Looking Glass Logs.lnk" "$APPDATA\Looking Glass (host)"
   ${EndIf}
 
   ${If} $option_desktop == 1
@@ -171,8 +195,10 @@ SectionEnd
 Section "Uninstall" Section6
   SetShellVarContext all
 
-  nsExec::Exec 'net.exe STOP "Looking Glass (host)"'
-  nsExec::Exec '"$INSTDIR\looking-glass-host.exe" UninstallService'
+  !insertmacro StopLookingGlassService
+
+  DetailPrint "Uninstall service: Looking Glass (host)"
+  nsExec::ExecToLog '"$INSTDIR\looking-glass-host.exe" UninstallService'
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\Looking Glass (host)"
   Delete "$SMPROGRAMS\Looking Glass (host).lnk"

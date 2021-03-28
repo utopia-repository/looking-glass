@@ -35,10 +35,10 @@ CaptureResult;
 typedef enum CaptureFormat
 {
   // frame formats
-  CAPTURE_FMT_BGRA  ,
-  CAPTURE_FMT_RGBA  ,
-  CAPTURE_FMT_RGBA10,
-  CAPTURE_FMT_YUV420,
+  CAPTURE_FMT_BGRA   ,
+  CAPTURE_FMT_RGBA   ,
+  CAPTURE_FMT_RGBA10 ,
+  CAPTURE_FMT_RGBA16F,
 
   // pointer formats
   CAPTURE_FMT_COLOR ,
@@ -49,13 +49,24 @@ typedef enum CaptureFormat
 }
 CaptureFormat;
 
+typedef enum CaptureRotation
+{
+  CAPTURE_ROT_0,
+  CAPTURE_ROT_90,
+  CAPTURE_ROT_180,
+  CAPTURE_ROT_270
+}
+CaptureRotation;
+
 typedef struct CaptureFrame
 {
-  unsigned int   width;
-  unsigned int   height;
-  unsigned int   pitch;
-  unsigned int   stride;
-  CaptureFormat  format;
+  unsigned int    formatVer;
+  unsigned int    width;
+  unsigned int    height;
+  unsigned int    pitch;
+  unsigned int    stride;
+  CaptureFormat   format;
+  CaptureRotation rotation;
 }
 CaptureFrame;
 
@@ -91,6 +102,7 @@ typedef struct CaptureInterface
   bool          (*deinit         )();
   void          (*free           )();
   unsigned int  (*getMaxFrameSize)();
+  unsigned int  (*getMouseScale  )();
 
   CaptureResult (*capture   )();
   CaptureResult (*waitFrame )(CaptureFrame * frame);

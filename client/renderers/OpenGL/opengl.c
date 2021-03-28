@@ -27,7 +27,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <SDL2/SDL_ttf.h>
 
 #include <GL/gl.h>
-#include <GL/glu.h>
 #include <GL/glx.h>
 
 #include "common/debug.h"
@@ -62,7 +61,7 @@ static struct Option opengl_options[] =
     .name         = "vsync",
     .description  = "Enable vsync",
     .type         = OPTION_TYPE_BOOL,
-    .value.x_bool = true
+    .value.x_bool = false,
   },
   {
     .module       = "opengl",
@@ -184,12 +183,12 @@ static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
 static void render_wait(struct Inst * this);
 
-const char * opengl_get_name()
+const char * opengl_get_name(void)
 {
   return "OpenGL";
 }
 
-static void opengl_setup()
+static void opengl_setup(void)
 {
   option_register(opengl_options);
 }
@@ -249,6 +248,9 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+  SDL_GL_SetAttribute(SDL_GL_RED_SIZE          , 8);
+  SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE        , 8);
+  SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE         , 8);
   return true;
 }
 
@@ -301,7 +303,8 @@ void opengl_on_restart(void * opaque)
   this->waiting = true;
 }
 
-void opengl_on_resize(void * opaque, const int width, const int height, const LG_RendererRect destRect)
+void opengl_on_resize(void * opaque, const int width, const int height,
+    const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
@@ -315,7 +318,7 @@ void opengl_on_resize(void * opaque, const int width, const int height, const LG
   glViewport(0, 0, this->window.x, this->window.y);
   glMatrixMode(GL_PROJECTION);
   glLoadIdentity();
-  gluOrtho2D(0, this->window.x, this->window.y, 0);
+  glOrtho(0, this->window.x, this->window.y, 0, -1, 1);
 
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
@@ -331,7 +334,8 @@ void opengl_on_resize(void * opaque, const int width, const int height, const LG
   }
 }
 
-bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data)
+bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
+    const int width, const int height, const int pitch, const uint8_t * data)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -375,36 +379,20 @@ bool opengl_on_mouse_event(void * opaque, const bool visible, const int x, const
   return false;
 }
 
-bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const FrameBuffer * frame)
+bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format, bool useDMA)
 {
   struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-  {
-    DEBUG_ERROR("Invalid opaque pointer");
-    return false;
-  }
 
   LG_LOCK(this->formatLock);
-  if (this->reconfigure)
-  {
-    LG_UNLOCK(this->formatLock);
-    return true;
-  }
-
-  if (!this->configured ||
-    this->format.type   != format.type   ||
-    this->format.width  != format.width  ||
-    this->format.height != format.height ||
-    this->format.stride != format.stride ||
-    this->format.bpp    != format.bpp
-  )
-  {
-    memcpy(&this->format, &format, sizeof(LG_RendererFormat));
-    this->reconfigure = true;
-    LG_UNLOCK(this->formatLock);
-    return true;
-  }
+  memcpy(&this->format, &format, sizeof(LG_RendererFormat));
+  this->reconfigure = true;
   LG_UNLOCK(this->formatLock);
+  return true;
+}
+
+bool opengl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
+{
+  struct Inst * this = (struct Inst *)opaque;
 
   LG_LOCK(this->syncLock);
   this->frame       = frame;
@@ -413,8 +401,14 @@ bool opengl_on_frame_event(void * opaque, const LG_RendererFormat format, const 
 
   if (this->waiting)
   {
-    this->waiting      = false;
-    this->waitFadeTime = microtime() + FADE_TIME;
+    this->waiting = false;
+    if (!this->params.quickSplash)
+      this->waitFadeTime = microtime() + FADE_TIME;
+    else
+    {
+      glDisable(GL_MULTISAMPLE);
+      this->waitDone = true;
+    }
   }
 
   return true;
@@ -557,7 +551,7 @@ bool opengl_render_startup(void * opaque, SDL_Window * window)
   return true;
 }
 
-bool opengl_render(void * opaque, SDL_Window * window)
+bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -823,21 +817,22 @@ static void render_wait(struct Inst * this)
 
 const LG_Renderer LGR_OpenGL =
 {
-  .get_name       = opengl_get_name,
-  .setup          = opengl_setup,
+  .get_name        = opengl_get_name,
+  .setup           = opengl_setup,
 
-  .create         = opengl_create,
-  .initialize     = opengl_initialize,
-  .deinitialize   = opengl_deinitialize,
-  .on_restart     = opengl_on_restart,
-  .on_resize      = opengl_on_resize,
-  .on_mouse_shape = opengl_on_mouse_shape,
-  .on_mouse_event = opengl_on_mouse_event,
-  .on_frame_event = opengl_on_frame_event,
-  .on_alert       = opengl_on_alert,
-  .render_startup = opengl_render_startup,
-  .render         = opengl_render,
-  .update_fps     = opengl_update_fps
+  .create          = opengl_create,
+  .initialize      = opengl_initialize,
+  .deinitialize    = opengl_deinitialize,
+  .on_restart      = opengl_on_restart,
+  .on_resize       = opengl_on_resize,
+  .on_mouse_shape  = opengl_on_mouse_shape,
+  .on_mouse_event  = opengl_on_mouse_event,
+  .on_frame_format = opengl_on_frame_format,
+  .on_frame        = opengl_on_frame,
+  .on_alert        = opengl_on_alert,
+  .render_startup  = opengl_render_startup,
+  .render          = opengl_render,
+  .update_fps      = opengl_update_fps
 };
 
 static bool _check_gl_error(unsigned int line, const char * name)
@@ -846,7 +841,40 @@ static bool _check_gl_error(unsigned int line, const char * name)
   if (error == GL_NO_ERROR)
     return false;
 
-  const GLubyte * errStr = gluErrorString(error);
+  const char * errStr;
+  switch (error)
+  {
+    case GL_INVALID_ENUM:
+      errStr = "GL_INVALID_ENUM";
+      break;
+
+    case GL_INVALID_VALUE:
+      errStr = "GL_INVALID_VALUE";
+      break;
+
+    case GL_INVALID_OPERATION:
+      errStr = "GL_INVALID_OPERATION";
+      break;
+
+    case GL_STACK_OVERFLOW:
+      errStr = "GL_STACK_OVERFLOW";
+      break;
+
+    case GL_STACK_UNDERFLOW:
+      errStr = "GL_STACK_UNDERFLOW";
+      break;
+
+    case GL_OUT_OF_MEMORY:
+      errStr = "GL_OUT_OF_MEMORY";
+      break;
+
+    case GL_TABLE_TOO_LARGE:
+      errStr = "GL_TABLE_TOO_LARGE";
+      break;
+
+    default:
+      errStr = "unknown error";
+  }
   DEBUG_ERROR("%d: %s = %d (%s)", line, name, error, errStr);
   return true;
 }
@@ -881,6 +909,12 @@ static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
       this->intFormat  = GL_RGB10_A2;
       this->vboFormat  = GL_RGBA;
       this->dataFormat = GL_UNSIGNED_INT_2_10_10_10_REV;
+      break;
+
+    case FRAME_TYPE_RGBA16F:
+      this->intFormat  = GL_RGB16F;
+      this->vboFormat  = GL_RGBA;
+      this->dataFormat = GL_HALF_FLOAT;
       break;
 
     default:
@@ -1097,7 +1131,6 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
   switch(cursor)
   {
     case LG_CURSOR_MASKED_COLOR:
-    {
       for(int i = 0; i < width * height; ++i)
       {
         const uint32_t c = ((uint32_t *)data)[i];
@@ -1108,7 +1141,6 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
       //
       // technically we should also create an XOR texture from the data but this
       // usage seems very rare in modern software.
-    }
 
     case LG_CURSOR_COLOR:
     {
@@ -1270,7 +1302,7 @@ static bool draw_frame(struct Inst * this)
         break;
 
       case GL_WAIT_FAILED:
-        DEBUG_ERROR("Wait failed %s", gluErrorString(glGetError()));
+        DEBUG_ERROR("Wait failed %d", glGetError());
         break;
     }
 

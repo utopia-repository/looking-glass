@@ -1,6 +1,6 @@
 /*
-UIO KVMFR Driver
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
+KVMFR IVSHMEM DMA Buffer Driver
+Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
 https://looking-glass.hostfission.com
 
 This program is free software; you can redistribute it and/or modify it under
@@ -24,7 +24,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
-#include <linux/uio_driver.h>
 #include <linux/fs.h>
 #include <linux/dma-buf.h>
 #include <linux/highmem.h>
@@ -38,7 +37,7 @@ DEFINE_MUTEX(minor_lock);
 DEFINE_IDR(kvmfr_idr);
 
 #define KVMFR_UIO_NAME    "KVMFR"
-#define KVMFR_UIO_VER     "0.0.2"
+#define KVMFR_UIO_VER     "0.0.5"
 #define KVMFR_DEV_NAME    "kvmfr"
 #define KVMFR_MAX_DEVICES 10
 
@@ -53,7 +52,6 @@ static struct kvmfr_info *kvmfr;
 struct kvmfr_dev
 {
   unsigned long        size;
-  struct uio_info      uio;
   int                  minor;
   dev_t                devNo;
   struct device      * pDev;
@@ -173,7 +171,7 @@ static long kvmfr_dmabuf_create(struct kvmfr_dev * kdev, struct file * filp, uns
     return -EINVAL;
   }
 
-  if (create.offset + create.size > kdev->size)
+  if ((create.offset + create.size > kdev->size) || (create.offset + create.size < create.offset))
     return -EINVAL;
 
   kbuf = kzalloc(sizeof(struct kvmfrbuf), GFP_KERNEL);
@@ -263,37 +261,14 @@ static int kvmfr_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
   if (pci_request_regions(dev, KVMFR_DEV_NAME))
     goto out_disable;
 
-  kdev->uio.mem[0].addr = pci_resource_start(dev, 2);
-  if (!kdev->uio.mem[0].addr)
-    goto out_release;
-
-  kdev->uio.mem[0].internal_addr = ioremap_wt(
-    pci_resource_start(dev, 2),
-    pci_resource_len  (dev, 2)
-  );
-
-  if (!kdev->uio.mem[0].internal_addr)
-    goto out_release;
-
   kdev->size = pci_resource_len(dev, 2);
-
-  kdev->uio.mem[0].size    = pci_resource_len(dev, 2);
-  kdev->uio.mem[0].memtype = UIO_MEM_PHYS;
-  kdev->uio.name           = KVMFR_UIO_NAME;
-  kdev->uio.version        = KVMFR_UIO_VER;
-  kdev->uio.irq            = 0;
-  kdev->uio.irq_flags      = 0;
-  kdev->uio.handler        = NULL;
-
-  if (uio_register_device(&dev->dev, &kdev->uio))
-    goto out_unmap;
 
   mutex_lock(&minor_lock);
   kdev->minor = idr_alloc(&kvmfr_idr, kdev, 0, KVMFR_MAX_DEVICES, GFP_KERNEL);
   if (kdev->minor < 0)
   {
     mutex_unlock(&minor_lock);
-    goto out_unreg;
+    goto out_release;
   }
   mutex_unlock(&minor_lock);
 
@@ -302,10 +277,21 @@ static int kvmfr_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
   if (IS_ERR(kdev->pDev))
     goto out_unminor;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
   kdev->pgmap.res.start = pci_resource_start(dev, 2);
   kdev->pgmap.res.end   = pci_resource_end  (dev, 2);
   kdev->pgmap.res.flags = pci_resource_flags(dev, 2);
-  kdev->pgmap.type      = MEMORY_DEVICE_DEVDAX;
+#else
+  kdev->pgmap.range.start = pci_resource_start(dev, 2);
+  kdev->pgmap.range.end   = pci_resource_end  (dev, 2);
+  kdev->pgmap.nr_range    = 1;
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+  kdev->pgmap.type = MEMORY_DEVICE_DEVDAX;
+#else
+  kdev->pgmap.type = MEMORY_DEVICE_GENERIC;
+#endif
 
   kdev->addr = devm_memremap_pages(&dev->dev, &kdev->pgmap);
   if (IS_ERR(kdev->addr))
@@ -320,10 +306,6 @@ out_unminor:
   mutex_lock(&minor_lock);
   idr_remove(&kvmfr_idr, kdev->minor);
   mutex_unlock(&minor_lock);
-out_unreg:
-  uio_unregister_device(&kdev->uio);
-out_unmap:
-  iounmap(kdev->uio.mem[0].internal_addr);
 out_release:
   pci_release_regions(dev);
 out_disable:
@@ -344,10 +326,8 @@ static void kvmfr_pci_remove(struct pci_dev *dev)
   idr_remove(&kvmfr_idr, kdev->minor);
   mutex_unlock(&minor_lock);
 
-  uio_unregister_device(&kdev->uio);
   pci_release_regions(dev);
   pci_disable_device(dev);
-  iounmap(kdev->uio.mem[0].internal_addr);
 
   kfree(kdev);
 }
@@ -418,4 +398,4 @@ module_exit(kvmfr_module_exit);
 
 MODULE_DEVICE_TABLE(pci, kvmfr_pci_ids);
 MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Geoffrey McRae");
+MODULE_AUTHOR("Geoffrey McRae <geoff@hostfission.com>");

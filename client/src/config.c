@@ -27,6 +27,10 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <pwd.h>
 #include <unistd.h>
 
+//FIXME: this should really not be included here and is an ugly hack to retain
+//backwards compatibility with the escape key scancode
+extern uint32_t sdl_to_xfree86[];
+
 // forwards
 static bool       optRendererParse   (struct Option * opt, const char * str);
 static StringList optRendererValues  (struct Option * opt);
@@ -38,6 +42,7 @@ static bool       optSizeParse       (struct Option * opt, const char * str);
 static StringList optSizeValues      (struct Option * opt);
 static char *     optSizeToString    (struct Option * opt);
 static char *     optScancodeToString(struct Option * opt);
+static bool       optRotateValidate  (struct Option * opt, const char ** error);
 
 static void doLicense();
 
@@ -83,6 +88,13 @@ static struct Option options[] =
     .description   = "How often to check for a frame update in microseconds",
     .type          = OPTION_TYPE_INT,
     .value.x_int   = 1000
+  },
+  {
+    .module        = "app",
+    .name          = "allowDMA",
+    .description   = "Allow direct DMA transfers if possible (VM-VM only for now)",
+    .type          = OPTION_TYPE_BOOL,
+    .value.x_bool  = true
   },
 
   // window options
@@ -141,6 +153,13 @@ static struct Option options[] =
     .description    = "Force the window to maintain the aspect ratio",
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true,
+  },
+  {
+    .module         = "win",
+    .name           = "dontUpscale",
+    .description    = "Never try to upscale the window",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false,
   },
   {
     .module         = "win",
@@ -213,6 +232,21 @@ static struct Option options[] =
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true,
   },
+  {
+    .module         = "win",
+    .name           = "quickSplash",
+    .description    = "Skip fading out the splash screen when a connection is established",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false,
+  },
+  {
+    .module         = "win",
+    .name           = "rotate",
+    .description    = "Rotate the displayed image (0, 90, 180, 270)",
+    .type           = OPTION_TYPE_INT,
+    .validator      = optRotateValidate,
+    .value.x_int    = 0,
+  },
 
   // input options
   {
@@ -225,12 +259,26 @@ static struct Option options[] =
   },
   {
     .module         = "input",
+    .name           = "grabKeyboardOnFocus",
+    .description    = "Grab the keyboard when focused",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true,
+  },
+  {
+    .module         = "input",
     .name           = "escapeKey",
     .description    = "Specify the escape key, see https://wiki.libsdl.org/SDLScancodeLookup for valid values",
     .shortopt       = 'm',
     .type           = OPTION_TYPE_INT,
     .value.x_int    = SDL_SCANCODE_SCROLLLOCK,
     .toString       = optScancodeToString
+  },
+  {
+    .module         = "input",
+    .name           = "ignoreWindowsKeys",
+    .description    = "Do not pass events for the windows keys to the guest",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false
   },
   {
     .module         = "input",
@@ -249,10 +297,38 @@ static struct Option options[] =
   },
   {
     .module         = "input",
+    .name           = "mouseSmoothing",
+    .description    = "Apply simple mouse smoothing when rawMouse is not in use (helps reduce aliasing)",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true,
+  },
+  {
+    .module         = "input",
+    .name           = "rawMouse",
+    .description    = "Use RAW mouse input when in capture mode (good for gaming)",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false,
+  },
+  {
+    .module         = "input",
     .name           = "mouseRedraw",
     .description    = "Mouse movements trigger redraws (ignores FPS minimum)",
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true,
+  },
+  {
+    .module         = "input",
+    .name           = "autoCapture",
+    .description    = "Try to keep the mouse captured when needed",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false
+  },
+  {
+    .module         = "input",
+    .name           = "captureOnly",
+    .description    = "Only enable input via SPICE if in capture mode",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false
   },
 
   // spice options
@@ -323,10 +399,17 @@ static struct Option options[] =
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = false
   },
+  {
+    .module         = "spice",
+    .name           = "alwaysShowCursor",
+    .description    = "Always show host cursor",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false
+  },
   {0}
 };
 
-void config_init()
+void config_init(void)
 {
   params.center = true;
   params.w      = 1024;
@@ -387,12 +470,14 @@ bool config_load(int argc, char * argv[])
   // setup the application params for the basic types
   params.cursorPollInterval = option_get_int   ("app", "cursorPollInterval");
   params.framePollInterval  = option_get_int   ("app", "framePollInterval" );
+  params.allowDMA           = option_get_bool  ("app", "allowDMA"          );
 
   params.windowTitle   = option_get_string("win", "title"        );
   params.autoResize    = option_get_bool  ("win", "autoResize"   );
   params.allowResize   = option_get_bool  ("win", "allowResize"  );
   params.keepAspect    = option_get_bool  ("win", "keepAspect"   );
   params.forceAspect   = option_get_bool  ("win", "forceAspect"  );
+  params.dontUpscale   = option_get_bool  ("win", "dontUpscale"  );
   params.borderless    = option_get_bool  ("win", "borderless"   );
   params.fullscreen    = option_get_bool  ("win", "fullScreen"   );
   params.maximize      = option_get_bool  ("win", "maximize"     );
@@ -401,12 +486,27 @@ bool config_load(int argc, char * argv[])
   params.ignoreQuit    = option_get_bool  ("win", "ignoreQuit"   );
   params.noScreensaver = option_get_bool  ("win", "noScreensaver");
   params.showAlerts    = option_get_bool  ("win", "alerts"       );
+  params.quickSplash   = option_get_bool  ("win", "quickSplash"  );
 
-  params.grabKeyboard  = option_get_bool  ("input", "grabKeyboard");
-  params.escapeKey     = option_get_int   ("input", "escapeKey"   );
-  params.hideMouse     = option_get_bool  ("input", "hideCursor"  );
-  params.mouseSens     = option_get_int   ("input", "mouseSens"   );
-  params.mouseRedraw   = option_get_bool  ("input", "mouseRedraw" );
+  switch(option_get_int("win", "rotate"))
+  {
+    case 0  : params.winRotate = LG_ROTATE_0  ; break;
+    case 90 : params.winRotate = LG_ROTATE_90 ; break;
+    case 180: params.winRotate = LG_ROTATE_180; break;
+    case 270: params.winRotate = LG_ROTATE_270; break;
+  }
+
+  params.grabKeyboard        = option_get_bool("input", "grabKeyboard"       );
+  params.grabKeyboardOnFocus = option_get_bool("input", "grabKeyboardOnFocus");
+  params.escapeKey           = option_get_int ("input", "escapeKey"          );
+  params.ignoreWindowsKeys   = option_get_bool("input", "ignoreWindowsKeys"  );
+  params.hideMouse           = option_get_bool("input", "hideCursor"         );
+  params.mouseSens           = option_get_int ("input", "mouseSens"          );
+  params.mouseSmoothing      = option_get_bool("input", "mouseSmoothing"     );
+  params.rawMouse            = option_get_bool("input", "rawMouse"           );
+  params.mouseRedraw         = option_get_bool("input", "mouseRedraw"        );
+  params.autoCapture         = option_get_bool("input", "autoCapture"        );
+  params.captureInputOnly    = option_get_bool("input", "captureOnly"        );
 
   params.minimizeOnFocusLoss = option_get_bool("win", "minimizeOnFocusLoss");
 
@@ -429,17 +529,21 @@ bool config_load(int argc, char * argv[])
 
     params.scaleMouseInput = option_get_bool("spice", "scaleCursor");
     params.captureOnStart  = option_get_bool("spice", "captureOnStart");
+    params.alwaysShowCursor  = option_get_bool("spice", "alwaysShowCursor");
   }
+
+  //FIXME, this should be using linux keycodes
+  params.escapeKey = sdl_to_xfree86[params.escapeKey];
 
   return true;
 }
 
-void config_free()
+void config_free(void)
 {
   option_free();
 }
 
-static void doLicense()
+static void doLicense(void)
 {
   fprintf(stderr,
     "\n"
@@ -581,6 +685,22 @@ static char * optSizeToString(struct Option * opt)
 static char * optScancodeToString(struct Option * opt)
 {
   char * str;
-  alloc_sprintf(&str, "%d = %s", opt->value.x_int, SDL_GetScancodeName(opt->value.x_int));
+  alloc_sprintf(&str, "%d = %s", opt->value.x_int,
+      SDL_GetScancodeName(opt->value.x_int));
   return str;
+}
+
+static bool optRotateValidate(struct Option * opt, const char ** error)
+{
+  switch(opt->value.x_int)
+  {
+    case   0:
+    case  90:
+    case 180:
+    case 270:
+      return true;
+  }
+
+  *error = "Rotation angle must be one of 0, 90, 180 or 270";
+  return false;
 }
