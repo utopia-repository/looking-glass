@@ -47,8 +47,8 @@ The client requires some manual changes to the configuration of libvirt to work 
 
 1. Download
    Currently the Windows server binary can be found on the [Github Releases](https://github.com/gnif/LookingGlass/releases) site of the project.
-   Simply download the matching release binary for this package i.e. b1 for the
-   debian package 0+b1.
+   Simply download the matching release binary for this package i.e. b3 for the
+   debian package 0+b3.
 2. Installation
    Place the binary on Windows where it can be executed and
    add the binary to the autostart in Windows.
