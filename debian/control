@@ -5,13 +5,14 @@ Maintainer: Lennart Weller <lhw@ring0.de>
 Build-Depends: cmake,
                debhelper (>= 12),
                debhelper-compat (= 12),
+               fonts-freefont-ttf,
                libfontconfig1-dev,
                libsdl2-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
                libx11-dev,
                nettle-dev,
-               fonts-freefont-ttf
+               wayland-protocols
 Standards-Version: 4.5.0
 Homepage: https://looking-glass.hostfission.com
 Vcs-Browser: https://salsa.debian.org/lhw-guest/looking-glass
