@@ -1,24 +1,34 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR)
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
+#ifndef _H_LG_COMMON_KVMFR_
+#define _H_LG_COMMON_KVMFR_
 
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
+#include "types.h"
+
+#define KVMFR_MAGIC   "KVMFR---"
+#define KVMFR_VERSION 10
 
 #define LGMP_Q_POINTER     1
 #define LGMP_Q_FRAME       2
@@ -26,46 +36,14 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #define LGMP_Q_FRAME_LEN   2
 #define LGMP_Q_POINTER_LEN 20
 
-typedef enum FrameType
-{
-  FRAME_TYPE_INVALID   ,
-  FRAME_TYPE_BGRA      , // BGRA interleaved: B,G,R,A 32bpp
-  FRAME_TYPE_RGBA      , // RGBA interleaved: R,G,B,A 32bpp
-  FRAME_TYPE_RGBA10    , // RGBA interleaved: R,G,B,A 10,10,10,2 bpp
-  FRAME_TYPE_RGBA16F   , // RGBA interleaved: R,G,B,A 16,16,16,16 bpp float
-  FRAME_TYPE_MAX       , // sentinel value
-}
-FrameType;
-
-typedef enum FrameRotation
-{
-  FRAME_ROT_0,
-  FRAME_ROT_90,
-  FRAME_ROT_180,
-  FRAME_ROT_270
-}
-FrameRotation;
-
-extern const char * FrameTypeStr[FRAME_TYPE_MAX];
-
 enum
 {
   CURSOR_FLAG_POSITION = 0x1,
   CURSOR_FLAG_VISIBLE  = 0x2,
   CURSOR_FLAG_SHAPE    = 0x4
 };
+
 typedef uint32_t KVMFRCursorFlags;
-
-typedef enum CursorType
-{
-  CURSOR_TYPE_COLOR       ,
-  CURSOR_TYPE_MONOCHROME  ,
-  CURSOR_TYPE_MASKED_COLOR
-}
-CursorType;
-
-#define KVMFR_MAGIC   "KVMFR---"
-#define KVMFR_VERSION 8
 
 typedef struct KVMFR
 {
@@ -90,12 +68,16 @@ typedef struct KVMFRFrame
 {
   uint32_t      formatVer;         // the frame format version number
   FrameType     type;              // the frame data type
-  uint32_t      width;             // the width
-  uint32_t      height;            // the height
+  uint32_t      width;             // the frame width
+  uint32_t      height;            // the frame height
+  uint32_t      realHeight;        // the real height if the frame was truncated due to low mem
   FrameRotation rotation;          // the frame rotation
   uint32_t      stride;            // the row stride (zero if compressed data)
   uint32_t      pitch;             // the row pitch  (stride in bytes or the compressed frame size)
   uint32_t      offset;            // offset from the start of this header to the FrameBuffer header
   uint32_t      mouseScalePercent; // movement scale factor of the mouse (relates to DPI of display, 100 = no scale)
+  bool          blockScreensaver;  // whether the guest has requested to block screensavers
 }
 KVMFRFrame;
+
+#endif

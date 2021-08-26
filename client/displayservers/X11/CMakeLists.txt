@@ -7,11 +7,16 @@ pkg_check_modules(DISPLAYSERVER_X11_PKGCONFIG REQUIRED
 	xi
 	xfixes
 	xscrnsaver
+	xinerama
 )
 
 add_library(displayserver_X11 STATIC
 	x11.c
+	atoms.c
+	clipboard.c
 )
+
+add_definitions(-D GLX_GLXEXT_PROTOTYPES)
 
 target_link_libraries(displayserver_X11
 	${DISPLAYSERVER_X11_PKGCONFIG_LIBRARIES}

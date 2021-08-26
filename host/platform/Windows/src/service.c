@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/platform.h"
 #include "common/ivshmem.h"
@@ -41,23 +42,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #define SVC_ERROR ((DWORD)0xC0020001L)
 #define LOG_NAME  "looking-glass-host-service.txt"
 
-/*
- * Windows 10 provides this API via kernel32.dll as well as advapi32.dll and
- * mingw opts for linking against the kernel32.dll version which is fine
- * provided you don't intend to run this on earlier versions of windows. As such
- * we need to lookup this method at runtime. */
-typedef WINBOOL WINAPI (*CreateProcessAsUserA_t)(HANDLE hToken,
-    LPCSTR lpApplicationName,
-    LPSTR lpCommandLine,
-    LPSECURITY_ATTRIBUTES lpProcessAttributes,
-    LPSECURITY_ATTRIBUTES lpThreadAttributes,
-    WINBOOL bInheritHandles,
-    DWORD dwCreationFlags,
-    LPVOID lpEnvironment,
-    LPCSTR lpCurrentDirectory,
-    LPSTARTUPINFOA lpStartupInfo,
-    LPPROCESS_INFORMATION lpProcessInformation);
-static CreateProcessAsUserA_t f_CreateProcessAsUserA = NULL;
+#define FAIL_MAX_RETRIES         5
+#define FAIL_RETRY_INIT_INTERVAL 1000
 
 struct Service
 {
@@ -87,32 +73,6 @@ void doLogReal(const char * fmt, ...)
 
 #define doLog(fmt, ...) doLogReal("[%s] " fmt, currentTime(), ##__VA_ARGS__)
 
-static bool setupAPI(void)
-{
-  /* first look in kernel32.dll */
-  HMODULE mod;
-
-  mod = GetModuleHandleA("kernel32.dll");
-  if (mod)
-  {
-    f_CreateProcessAsUserA = (CreateProcessAsUserA_t)
-      GetProcAddress(mod, "CreateProcessAsUserA");
-    if (f_CreateProcessAsUserA)
-      return true;
-  }
-
-  mod = GetModuleHandleA("advapi32.dll");
-  if (mod)
-  {
-    f_CreateProcessAsUserA = (CreateProcessAsUserA_t)
-      GetProcAddress(mod, "CreateProcessAsUserA");
-    if (f_CreateProcessAsUserA)
-      return true;
-  }
-
-  return false;
-}
-
 static void setupLogging(void)
 {
   char logFilePath[MAX_PATH];
@@ -138,7 +98,7 @@ void winerr(void)
   doLog("0x%08lx - %s", GetLastError(), buf);
 }
 
-bool enablePriv(const char * name)
+bool adjustPriv(const char * name, DWORD attributes)
 {
   HANDLE           hToken;
   LUID             luid;
@@ -161,7 +121,7 @@ bool enablePriv(const char * name)
 
   tp.PrivilegeCount           = 1;
   tp.Privileges[0].Luid       = luid;
-  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  tp.Privileges[0].Attributes = attributes;
 
   if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL,
         NULL))
@@ -186,6 +146,16 @@ fail:
   return false;
 }
 
+bool enablePriv(const char * name)
+{
+  return adjustPriv(name, SE_PRIVILEGE_ENABLED);
+}
+
+bool disablePriv(const char * name)
+{
+  return adjustPriv(name, 0);
+}
+
 HANDLE dupeSystemProcessToken(void)
 {
   DWORD count = 0;
@@ -201,6 +171,16 @@ HANDLE dupeSystemProcessToken(void)
   DWORD pids[count];
   EnumProcesses(pids, count * sizeof(DWORD), &returned);
   returned /= sizeof(DWORD);
+
+  char systemSidBuf[SECURITY_MAX_SID_SIZE];
+  PSID systemSid = (PSID) systemSidBuf;
+  DWORD cbSystemSid = sizeof systemSidBuf;
+
+  if (!CreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &cbSystemSid))
+  {
+    doLog("failed to create local system SID");
+    return NULL;
+  }
 
   for(DWORD i = 0; i < returned; ++i)
   {
@@ -220,13 +200,8 @@ HANDLE dupeSystemProcessToken(void)
     if (!GetTokenInformation(hToken, TokenUser, user, sizeof(userBuf), &tmp))
       goto err_token;
 
-    CHAR * sid = NULL;
-    if (!ConvertSidToStringSidA(user->User.Sid, &sid))
-      goto err_token;
-
-    if (strcmp(sid, "S-1-5-18") == 0)
+    if (EqualSid(user->User.Sid, systemSid))
     {
-      LocalFree(sid);
       CloseHandle(hProcess);
 
       // duplicate the token so we can use it
@@ -239,7 +214,6 @@ HANDLE dupeSystemProcessToken(void)
       return hDupe;
     }
 
-    LocalFree(sid);
 err_token:
     CloseHandle(hToken);
 err_proc:
@@ -257,14 +231,17 @@ void Launch(void)
     service.process = NULL;
   }
 
-  if (!setupAPI())
+  if (!windowsSetupAPI())
   {
-    doLog("setupAPI failed\n");
+    doLog("windowsSetupAPI failed\n");
     return;
   }
 
   if (!enablePriv(SE_DEBUG_NAME))
+  {
+    doLog("failed to enable " SE_DEBUG_NAME);
     return;
+  }
 
   HANDLE hToken = dupeSystemProcessToken();
   if (!hToken)
@@ -273,12 +250,18 @@ void Launch(void)
     return;
   }
 
+  if (!disablePriv(SE_DEBUG_NAME))
+    doLog("failed to disable " SE_DEBUG_NAME);
+
   DWORD origSessionID, targetSessionID, returnedLen;
   GetTokenInformation(hToken, TokenSessionId, &origSessionID,
       sizeof(origSessionID), &returnedLen);
 
   if (!enablePriv(SE_TCB_NAME))
+  {
+    doLog("failed to enable " SE_TCB_NAME);
     goto fail_token;
+  }
 
   targetSessionID = WTSGetActiveConsoleSessionId();
   if (origSessionID != targetSessionID)
@@ -292,6 +275,9 @@ void Launch(void)
     }
   }
 
+  if (!disablePriv(SE_TCB_NAME))
+    doLog("failed to disable " SE_TCB_NAME);
+
   LPVOID pEnvironment = NULL;
   if (!CreateEnvironmentBlock(&pEnvironment, hToken, TRUE))
   {
@@ -301,10 +287,16 @@ void Launch(void)
   }
 
   if (!enablePriv(SE_ASSIGNPRIMARYTOKEN_NAME))
+  {
+    doLog("failed to enable " SE_ASSIGNPRIMARYTOKEN_NAME);
     goto fail_token;
+  }
 
   if (!enablePriv(SE_INCREASE_QUOTA_NAME))
+  {
+    doLog("failed to enable " SE_INCREASE_QUOTA_NAME);
     goto fail_token;
+  }
 
   DWORD flags = CREATE_NEW_CONSOLE | HIGH_PRIORITY_CLASS;
   if (!pEnvironment)
@@ -325,7 +317,7 @@ void Launch(void)
       NULL,
       NULL,
       NULL,
-      TRUE,
+      FALSE,
       flags,
       NULL,
       os_getDataPath(),
@@ -338,6 +330,12 @@ void Launch(void)
     winerr();
     goto fail_token;
   }
+
+  if (!disablePriv(SE_INCREASE_QUOTA_NAME))
+    doLog("failed to disable " SE_INCREASE_QUOTA_NAME);
+
+  if (!disablePriv(SE_ASSIGNPRIMARYTOKEN_NAME))
+    doLog("failed to disable " SE_ASSIGNPRIMARYTOKEN_NAME);
 
   CloseHandle(pi.hThread);
   service.process = pi.hProcess;
@@ -644,6 +642,8 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
   ivshmemFree(&shmDev);
 
   ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
+
+  int failCount = 0;
   while(1)
   {
     ULONGLONG launchTime = 0ULL;
@@ -689,14 +689,31 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
 
             case LG_HOST_EXIT_CAPTURE:
               doLog("Host application exited due to capture error; restarting\n");
+              failCount = 0;
               break;
 
             case LG_HOST_EXIT_KILLED:
               doLog("Host application was killed; restarting\n");
+              failCount = 0;
               break;
 
             case LG_HOST_EXIT_FAILED:
-              doLog("Host application failed to start; will not restart\n");
+            {
+              ++failCount;
+              if (failCount > FAIL_MAX_RETRIES)
+              {
+                doLog("Host application failed to start %d times; will not restart\n", FAIL_MAX_RETRIES);
+                goto stopped;
+              }
+
+              DWORD backoff = FAIL_RETRY_INIT_INTERVAL << (failCount - 1);
+              doLog("Host application failed to start %d times, waiting %u ms...\n", failCount, backoff);
+              Sleep(backoff);
+              break;
+            }
+
+            case LG_HOST_EXIT_FATAL:
+              doLog("Host application failed to start with fatal error; will not restart\n");
               goto stopped;
 
             default:

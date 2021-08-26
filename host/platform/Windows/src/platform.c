@@ -1,30 +1,36 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "platform.h"
 #include "service.h"
+#include "windows/delay.h"
 #include "windows/mousehook.h"
 
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <fcntl.h>
+#include <powrprof.h>
+#include <ntstatus.h>
+#include <wtsapi32.h>
+#include <userenv.h>
 
 #include "interface/platform.h"
 #include "common/debug.h"
@@ -56,10 +62,6 @@ struct AppState
 static struct AppState app = {0};
 HWND MessageHWND;
 
-// undocumented API to adjust the system timer resolution (yes, its a nasty hack)
-typedef NTSTATUS (__stdcall *ZwSetTimerResolution_t)(ULONG RequestedResolution, BOOLEAN Set, PULONG ActualResolution);
-static ZwSetTimerResolution_t ZwSetTimerResolution = NULL;
-
 // linux mingw64 is missing this
 #ifndef MSGFLT_RESET
   #define MSGFLT_RESET (0)
@@ -68,6 +70,34 @@ static ZwSetTimerResolution_t ZwSetTimerResolution = NULL;
 #endif
 typedef WINBOOL WINAPI (*PChangeWindowMessageFilterEx)(HWND hwnd, UINT message, DWORD action, void * pChangeFilterStruct);
 PChangeWindowMessageFilterEx _ChangeWindowMessageFilterEx = NULL;
+
+CreateProcessAsUserA_t f_CreateProcessAsUserA = NULL;
+
+bool windowsSetupAPI(void)
+{
+  /* first look in kernel32.dll */
+  HMODULE mod;
+
+  mod = GetModuleHandleA("kernel32.dll");
+  if (mod)
+  {
+    f_CreateProcessAsUserA = (CreateProcessAsUserA_t)
+      GetProcAddress(mod, "CreateProcessAsUserA");
+    if (f_CreateProcessAsUserA)
+      return true;
+  }
+
+  mod = GetModuleHandleA("advapi32.dll");
+  if (mod)
+  {
+    f_CreateProcessAsUserA = (CreateProcessAsUserA_t)
+      GetProcAddress(mod, "CreateProcessAsUserA");
+    if (f_CreateProcessAsUserA)
+      return true;
+  }
+
+  return false;
+}
 
 static void RegisterTrayIcon(void)
 {
@@ -82,6 +112,99 @@ static void RegisterTrayIcon(void)
     app.iconData.hIcon            = LoadIcon(app.hInst, IDI_APPLICATION);
   }
   Shell_NotifyIcon(NIM_ADD, &app.iconData);
+}
+
+// This function executes notepad as the logged in user, and therefore is secure to use.
+static bool OpenLogFile(const char * logFile)
+{
+  bool result = false;
+
+  DWORD console = WTSGetActiveConsoleSessionId();
+  if (console == 0xFFFFFFFF)
+  {
+    DEBUG_WINERROR("Failed to get active console session ID", GetLastError());
+    return false;
+  }
+
+  WTS_CONNECTSTATE_CLASS * state;
+  DWORD size;
+  if (!WTSQuerySessionInformationA(WTS_CURRENT_SERVER_HANDLE, console, WTSConnectState,
+      (LPSTR *) &state, &size))
+  {
+    DEBUG_WINERROR("Failed to get session information", GetLastError());
+    return false;
+  }
+
+  if (*state != WTSActive)
+  {
+    DEBUG_WINERROR("Will not open log file because user is not logged in", GetLastError());
+    WTSFreeMemory(state);
+    return false;
+  }
+  WTSFreeMemory(state);
+
+  char system32[MAX_PATH];
+  if (!GetSystemDirectoryA(system32, MAX_PATH))
+  {
+    DEBUG_WINERROR("Failed to get system directory", GetLastError());
+    return false;
+  }
+
+  if (!f_CreateProcessAsUserA && !windowsSetupAPI())
+  {
+    DEBUG_WINERROR("Failed to get CreateProcessAsUserA", GetLastError());
+    return false;
+  }
+
+  HANDLE hToken;
+  if (!WTSQueryUserToken(console, &hToken))
+  {
+    DEBUG_WINERROR("Failed to get active console session user token", GetLastError());
+    return false;
+  }
+
+  LPVOID env;
+  if (!CreateEnvironmentBlock(&env, hToken, FALSE))
+  {
+    DEBUG_WINERROR("Failed to create environment", GetLastError());
+    goto fail_token;
+  }
+
+  char notepad[MAX_PATH];
+  PathCombineA(notepad, system32, "notepad.exe");
+
+  char cmdline[MAX_PATH + 10];
+  snprintf(cmdline, sizeof(cmdline), "notepad \"%s\"", logFile);
+
+  STARTUPINFO si = { .cb = sizeof(STARTUPINFO) };
+  PROCESS_INFORMATION pi = {0};
+  if (!f_CreateProcessAsUserA(
+      hToken,
+      notepad,
+      cmdline,
+      NULL,
+      NULL,
+      FALSE,
+      CREATE_UNICODE_ENVIRONMENT,
+      env,
+      os_getDataPath(),
+      &si,
+      &pi
+    ))
+  {
+    DEBUG_WINERROR("Failed to open log file", GetLastError());
+    goto fail_env;
+  }
+
+  result = true;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+
+fail_env:
+  DestroyEnvironmentBlock(env);
+fail_token:
+  CloseHandle(hToken);
+  return result;
 }
 
 LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -121,14 +244,8 @@ LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
           const char * logFile = option_get_string("os", "logFile");
           if (strcmp(logFile, "stderr") == 0)
             DEBUG_INFO("Ignoring request to open the logFile, logging to stderr");
-          else
-          {
-            /* If LG is running as SYSTEM, ShellExecute would launch a process
-             * as the SYSTEM user also, for security we will just show the file
-             * location instead */
-            //ShellExecute(NULL, NULL, logFile, NULL, NULL, SW_SHOWNORMAL);
+          else if (!OpenLogFile(logFile))
             MessageBoxA(hwnd, logFile, "Log File Location", MB_OK | MB_ICONINFORMATION);
-          }
         }
       }
       break;
@@ -194,6 +311,9 @@ fail:
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
+  // initialize for DEBUG_* macros
+  debug_init();
+
   // convert the command line to the standard argc and argv
   LPWSTR * wargv = CommandLineToArgvW(GetCommandLineW(), &app.argc);
   app.argv = malloc(sizeof(char *) * app.argc);
@@ -293,9 +413,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   MessageHWND = app.messageWnd;
 
   app.trayMenu = CreatePopupMenu();
-  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_SHOW_LOG, "Log File Location");
-  AppendMenu(app.trayMenu, MF_SEPARATOR, 0               , NULL               );
-  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_EXIT    , "Exit"             );
+  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_SHOW_LOG, "Open Log File");
+  AppendMenu(app.trayMenu, MF_SEPARATOR, 0               , NULL           );
+  AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_EXIT    , "Exit"         );
 
   // create the application thread
   LGThread * thread;
@@ -344,9 +464,44 @@ finish:
   return result;
 }
 
+void boostPriority(void)
+{
+  typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
+  {
+    D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
+    D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
+  }
+  D3DKMT_SCHEDULINGPRIORITYCLASS;
+  typedef NTSTATUS WINAPI (*PD3DKMTSetProcessSchedulingPriorityClass)
+    (HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
+
+  HMODULE gdi32 = GetModuleHandleA("GDI32");
+  if (!gdi32)
+    return;
+
+  PD3DKMTSetProcessSchedulingPriorityClass fn =
+    (PD3DKMTSetProcessSchedulingPriorityClass)
+    GetProcAddress(gdi32, "D3DKMTSetProcessSchedulingPriorityClass");
+
+  if (!fn)
+    return;
+
+  if (FAILED(fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME)))
+  {
+    DEBUG_WARN("Failed to set realtime GPU priority.");
+    DEBUG_INFO("This is not a failure, please do not report this as an issue.");
+    DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
+    DEBUG_INFO("looking-glass-host.exe InstallService");
+  }
+}
+
 bool app_init(void)
 {
-  const char * logFile   = option_get_string("os", "logFile"  );
+  const char * logFile = option_get_string("os", "logFile");
 
   // redirect stderr to a file
   if (logFile && strcmp(logFile, "stderr") != 0)
@@ -355,17 +510,13 @@ bool app_init(void)
   // always flush stderr
   setbuf(stderr, NULL);
 
-  // Increase the timer resolution
-  ZwSetTimerResolution = (ZwSetTimerResolution_t)GetProcAddress(GetModuleHandle("ntdll.dll"), "ZwSetTimerResolution");
-  if (ZwSetTimerResolution)
-  {
-    ULONG actualResolution;
-    ZwSetTimerResolution(1, true, &actualResolution);
-    DEBUG_INFO("System timer resolution: %.2f ns", (float)actualResolution / 100.0f);
-  }
+  delayInit();
 
   // get the performance frequency for spinlocks
   QueryPerformanceFrequency(&app.perfFreq);
+
+  // try to boost the scheduler priority
+  boostPriority();
 
   return true;
 }
@@ -396,4 +547,30 @@ const char * os_getDataPath(void)
 HWND os_getMessageWnd(void)
 {
   return app.messageWnd;
+}
+
+bool os_blockScreensaver()
+{
+  static bool      lastResult = false;
+  static ULONGLONG lastCheck  = 0;
+
+  ULONGLONG now = GetTickCount64();
+  if (now - lastCheck >= 1000)
+  {
+    ULONG executionState;
+    NTSTATUS status = CallNtPowerInformation(SystemExecutionState, NULL, 0,
+      &executionState, sizeof executionState);
+
+    if (status == STATUS_SUCCESS)
+      lastResult = executionState & ES_DISPLAY_REQUIRED;
+    else
+      DEBUG_ERROR("Failed to call CallNtPowerInformation(SystemExecutionState): %ld", status);
+    lastCheck = now;
+  }
+  return lastResult;
+}
+
+void os_showMessage(const char * caption, const char * msg)
+{
+  MessageBoxA(NULL, msg, caption, MB_OK | MB_ICONINFORMATION);
 }

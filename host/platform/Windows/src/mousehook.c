@@ -1,23 +1,25 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "windows/mousehook.h"
+#include "windows/delay.h"
 #include "common/windebug.h"
 #include "platform.h"
 
@@ -30,8 +32,8 @@ struct mouseHook
   HHOOK       hook;
   MouseHookFn callback;
   int         x, y;
-  HANDLE      event;
-  HANDLE      thread;
+  HANDLE      event , updateEvent;
+  HANDLE      thread, updateThread;
 };
 
 static struct mouseHook mouseHook = { 0 };
@@ -81,6 +83,31 @@ static VOID WINAPI winEventProc(HWINEVENTHOOK hWinEventHook, DWORD event,
       UnhookWindowsHookEx(mouseHook.hook);
       switchDesktopAndHook();
       break;
+  }
+}
+
+static DWORD WINAPI updateThreadProc(LPVOID lParam)
+{
+  HANDLE events[2] = {
+    mouseHook.event,
+    mouseHook.updateEvent
+  };
+
+  while(true)
+  {
+    switch(WaitForMultipleObjects(2, events, FALSE, INFINITE))
+    {
+      case WAIT_OBJECT_0:
+        DEBUG_INFO("Mouse hook update thread received quit request");
+        return 0;
+
+      case WAIT_OBJECT_0 + 1:
+        mouseHook.callback(mouseHook.x, mouseHook.y);
+
+        // limit this to 1000Hz, who has a mouse that updates faster anyway?
+        delayExecution(1.0f);
+        break;
+    }
   }
 }
 
@@ -142,11 +169,28 @@ void mouseHook_install(MouseHookFn callback)
     mouseHook.event = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (!mouseHook.event)
     {
-      DEBUG_WINERROR("Failed to create mouse hook uninstall event", GetLastError());
+      DEBUG_WINERROR("Failed to create mouse hook uninstall event",
+          GetLastError());
       return;
     }
   }
-  mouseHook.thread = CreateThread(NULL, 0, threadProc, callback, 0, NULL);
+
+  if (!mouseHook.updateEvent)
+  {
+    mouseHook.updateEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!mouseHook.event)
+    {
+      DEBUG_WINERROR("Failed to create mouse hook update event",
+          GetLastError());
+      return;
+    }
+  }
+
+  mouseHook.thread =
+    CreateThread(NULL, 0, threadProc, callback, 0, NULL);
+
+  mouseHook.updateThread =
+    CreateThread(NULL, 0, updateThreadProc, 0, 0, NULL);
 }
 
 void mouseHook_remove(void)
@@ -155,8 +199,10 @@ void mouseHook_remove(void)
     return;
 
   SetEvent(mouseHook.event);
-  WaitForSingleObject(mouseHook.thread, INFINITE);
+  WaitForSingleObject(mouseHook.thread      , INFINITE);
+  WaitForSingleObject(mouseHook.updateThread, INFINITE);
   CloseHandle(mouseHook.thread);
+  CloseHandle(mouseHook.updateThread);
 }
 
 static LRESULT WINAPI mouseHook_hook(int nCode, WPARAM wParam, LPARAM lParam)
@@ -168,7 +214,7 @@ static LRESULT WINAPI mouseHook_hook(int nCode, WPARAM wParam, LPARAM lParam)
     {
       mouseHook.x = msg->pt.x;
       mouseHook.y = msg->pt.y;
-      mouseHook.callback(msg->pt.x, msg->pt.y);
+      SetEvent(mouseHook.updateEvent);
     }
   }
   return CallNextHookEx(mouseHook.hook, nCode, wParam, lParam);

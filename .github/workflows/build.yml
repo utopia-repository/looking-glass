@@ -6,6 +6,9 @@ jobs:
     strategy:
       matrix:
         cc: [gcc, clang]
+        build_type:
+          - Release
+          - Debug
     steps:
     - uses: actions/checkout@v1
       with:
@@ -22,10 +25,12 @@ jobs:
           libx11-dev libxss-dev libxi-dev \
           wayland-protocols
     - name: Configure client
+      env:
+        CC: /usr/bin/${{ matrix.cc }}
       run: |
         mkdir client/build
         cd client/build
-        CC=/usr/bin/${{ matrix.cc }} cmake ..
+        cmake -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DENABLE_SDL=ON ..
     - name: Build client
       run: |
         cd client/build
@@ -53,7 +58,7 @@ jobs:
         sudo apt-get update
     - name: Install Linux host dependencies
       run: |
-        sudo apt-get install binutils-dev libgl1-mesa-dev
+        sudo apt-get install binutils-dev libgl1-mesa-dev libxcb-xfixes0-dev
     - name: Configure Linux host
       run: |
         mkdir host/build

@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #pragma once
 
@@ -63,6 +64,7 @@ typedef struct CaptureFrame
   unsigned int    formatVer;
   unsigned int    width;
   unsigned int    height;
+  unsigned int    realHeight;
   unsigned int    pitch;
   unsigned int    stride;
   CaptureFormat   format;
@@ -89,23 +91,24 @@ typedef void (*CapturePostPointerBuffer)(CapturePointer pointer);
 
 typedef struct CaptureInterface
 {
-  const char *  (*getName        )();
-  void          (*initOptions    )();
+  const char * shortName;
+  const bool   asyncCapture;
+  const char * (*getName        )();
+  void         (*initOptions    )();
 
   bool(*create)(
     CaptureGetPointerBuffer  getPointerBufferFn,
     CapturePostPointerBuffer postPointerBufferFn
   );
 
-  bool          (*init           )();
-  void          (*stop           )();
-  bool          (*deinit         )();
-  void          (*free           )();
-  unsigned int  (*getMaxFrameSize)();
-  unsigned int  (*getMouseScale  )();
+  bool          (*init         )();
+  void          (*stop         )();
+  bool          (*deinit       )();
+  void          (*free         )();
+  unsigned int  (*getMouseScale)();
 
   CaptureResult (*capture   )();
-  CaptureResult (*waitFrame )(CaptureFrame * frame);
-  CaptureResult (*getFrame  )(FrameBuffer  * frame);
+  CaptureResult (*waitFrame )(CaptureFrame * frame, const size_t maxFrameSize);
+  CaptureResult (*getFrame  )(FrameBuffer  * frame, const unsigned int height);
 }
 CaptureInterface;

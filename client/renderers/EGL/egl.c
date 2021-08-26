@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/renderer.h"
 
@@ -24,20 +25,17 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/sysinfo.h"
 #include "common/time.h"
 #include "common/locking.h"
-#include "utils.h"
+#include "util.h"
 #include "dynamic/fonts.h"
 
-#include <SDL2/SDL_syswm.h>
-#include <SDL2/SDL_egl.h>
-
-#if defined(SDL_VIDEO_DRIVER_WAYLAND)
-#include <wayland-egl.h>
-#endif
+#include <EGL/egl.h>
 
 #include <assert.h>
+#include <math.h>
+#include <string.h>
 
 #include "app.h"
-#include "dynprocs.h"
+#include "egl_dynprocs.h"
 #include "model.h"
 #include "shader.h"
 #include "desktop.h"
@@ -45,6 +43,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "fps.h"
 #include "splash.h"
 #include "alert.h"
+#include "help.h"
 
 #define SPLASH_FADE_TIME 1000000
 #define ALERT_TIMEOUT    2000000
@@ -72,6 +71,7 @@ struct Inst
   EGL_FPS         * fps;     // the fps display
   EGL_Splash      * splash;  // the splash screen
   EGL_Alert       * alert;   // the alert display
+  EGL_Help        * help;    // the help display
 
   LG_RendererFormat    format;
   bool                 formatValid;
@@ -85,6 +85,7 @@ struct Inst
   bool     closeFlag;
 
   int               width, height;
+  float             uiScale;
   LG_RendererRect   destRect;
   LG_RendererRotate rotate; //client side rotation
 
@@ -92,7 +93,9 @@ struct Inst
   float scaleX      , scaleY;
   float splashRatio;
   float screenScaleX, screenScaleY;
-  bool  useNearest;
+
+  int viewportWidth, viewportHeight;
+  enum EGL_DesktopScaleType scaleType;
 
   bool         cursorVisible;
   int          cursorX    , cursorY;
@@ -101,6 +104,12 @@ struct Inst
 
   const LG_Font     * font;
   LG_FontObj        fontObj;
+  unsigned          fontSize;
+  LG_FontObj        helpFontObj;
+  unsigned          helpFontSize;
+
+  bool               cursorLastValid;
+  struct CursorState cursorLast;
 };
 
 static struct Option egl_options[] =
@@ -147,6 +156,14 @@ static struct Option egl_options[] =
     .type         = OPTION_TYPE_INT,
     .value.x_int  = 0
   },
+  {
+    .module       = "egl",
+    .name         = "scale",
+    .description  = "Set the scale algorithm (0 = auto, 1 = nearest, 2 = linear)",
+    .type         = OPTION_TYPE_INT,
+    .validator    = egl_desktop_scale_validate,
+    .value.x_int  = 0
+  },
   {0}
 };
 
@@ -162,27 +179,68 @@ void egl_setup(void)
   option_register(egl_options);
 }
 
-bool egl_create(void ** opaque, const LG_RendererParams params)
+static bool egl_update_font(struct Inst * this)
 {
-  // Fail if running on Wayland so that OpenGL is used instead. Wayland-EGL
-  // is broken (https://github.com/gnif/LookingGlass/issues/306) and isn't
-  // fixable until SDL is dropped entirely. Until then, the OpenGL renderer
-  // "mostly works".
-  if (getenv("WAYLAND_DISPLAY"))
-    return false;
+  unsigned size = round(16.0f * this->uiScale);
+  if (size == this->fontSize)
+    return true;
 
+  LG_FontObj fontObj;
+  if (!this->font->create(&fontObj, NULL, size))
+  {
+    DEBUG_ERROR("Failed to create a font instance");
+    return false;
+  }
+
+  if (this->alert)
+    egl_alert_set_font(this->alert, fontObj);
+
+  if (this->fps)
+    egl_fps_set_font(this->fps, fontObj);
+
+  if (this->fontObj)
+    this->font->destroy(this->fontObj);
+  this->fontObj = fontObj;
+
+  return true;
+}
+
+static bool egl_update_help_font(struct Inst * this)
+{
+  unsigned size = round(14.0f * this->uiScale);
+  if (size == this->helpFontSize)
+    return true;
+
+  LG_FontObj fontObj;
+  if (!this->font->create(&fontObj, NULL, size))
+  {
+    DEBUG_ERROR("Failed to create a font instance");
+    return false;
+  }
+
+  if (this->help)
+    egl_help_set_font(this->help, fontObj);
+
+  if (this->helpFontObj)
+    this->font->destroy(this->helpFontObj);
+  this->helpFontObj = fontObj;
+
+  return true;
+}
+
+bool egl_create(void ** opaque, const LG_RendererParams params, bool * needsOpenGL)
+{
   // check if EGL is even available
   if (!eglQueryString(EGL_NO_DISPLAY, EGL_VERSION))
     return false;
 
   // create our local storage
-  *opaque = malloc(sizeof(struct Inst));
+  *opaque = calloc(1, sizeof(struct Inst));
   if (!*opaque)
   {
     DEBUG_INFO("Failed to allocate %lu bytes", sizeof(struct Inst));
     return false;
   }
-  memset(*opaque, 0, sizeof(struct Inst));
 
   // safe off parameteres and init our default option values
   struct Inst * this = (struct Inst *)*opaque;
@@ -197,18 +255,20 @@ bool egl_create(void ** opaque, const LG_RendererParams params)
   this->scaleY       = 1.0f;
   this->screenScaleX = 1.0f;
   this->screenScaleY = 1.0f;
+  this->uiScale      = 1.0;
 
   this->font = LG_Fonts[0];
-  if (!this->font->create(&this->fontObj, NULL, 16))
-  {
-    DEBUG_ERROR("Failed to create a font instance");
+  if (!egl_update_font(this))
     return false;
-  }
 
+  if (!egl_update_help_font(this))
+    return false;
+
+  *needsOpenGL = false;
   return true;
 }
 
-bool egl_initialize(void * opaque, Uint32 * sdlFlags)
+bool egl_initialize(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
   DEBUG_INFO("Double buffering is %s", this->opt.doubleBuffer ? "on" : "off");
@@ -219,14 +279,22 @@ void egl_deinitialize(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  if (this->font && this->fontObj)
-    this->font->destroy(this->fontObj);
+  if (this->font)
+  {
+    if (this->fontObj)
+      this->font->destroy(this->fontObj);
+
+    if (this->helpFontObj)
+      this->font->destroy(this->helpFontObj);
+  }
+
 
   egl_desktop_free(&this->desktop);
   egl_cursor_free (&this->cursor);
   egl_fps_free    (&this->fps   );
   egl_splash_free (&this->splash);
   egl_alert_free  (&this->alert );
+  egl_help_free   (&this->help);
 
   LG_LOCK_FREE(this->lock);
 
@@ -271,7 +339,8 @@ static void egl_calc_mouse_size(struct Inst * this)
   if (!this->formatValid)
     return;
 
-  int w, h;
+  int w  = 0, h = 0;
+
   switch(this->format.rotate)
   {
     case LG_ROTATE_0:
@@ -343,34 +412,72 @@ static void egl_calc_mouse_state(struct Inst * this)
   }
 }
 
-void egl_on_resize(void * opaque, const int width, const int height,
+static void egl_update_scale_type(struct Inst * this)
+{
+  int width = 0, height = 0;
+
+  switch (this->rotate)
+  {
+    case LG_ROTATE_0:
+    case LG_ROTATE_180:
+      width  = this->format.width;
+      height = this->format.height;
+      break;
+
+    case LG_ROTATE_90:
+    case LG_ROTATE_270:
+      width  = this->format.height;
+      height = this->format.width;
+      break;
+  }
+
+  if (width == this->viewportWidth || height == this->viewportHeight)
+    this->scaleType = EGL_DESKTOP_NOSCALE;
+  else if (width > this->viewportWidth || height > this->viewportHeight)
+    this->scaleType = EGL_DESKTOP_DOWNSCALE;
+  else
+    this->scaleType = EGL_DESKTOP_UPSCALE;
+}
+
+void egl_on_resize(void * opaque, const int width, const int height, const double scale,
     const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  this->width  = width;
-  this->height = height;
-  this->rotate = rotate;
+  this->width   = width * scale;
+  this->height  = height * scale;
+  this->uiScale = (float) scale;
+  this->rotate  = rotate;
 
-  memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
+  this->destRect.x = destRect.x * scale;
+  this->destRect.y = destRect.y * scale;
+  this->destRect.w = destRect.w * scale;
+  this->destRect.h = destRect.h * scale;
 
-  glViewport(0, 0, width, height);
+  glViewport(0, 0, this->width, this->height);
 
   if (destRect.valid)
   {
-    this->translateX = 1.0f - (((destRect.w / 2) + destRect.x) * 2) / (float)width;
-    this->translateY = 1.0f - (((destRect.h / 2) + destRect.y) * 2) / (float)height;
-    this->scaleX     = (float)destRect.w / (float)width;
-    this->scaleY     = (float)destRect.h / (float)height;
+    this->translateX     = 1.0f - (((this->destRect.w / 2) + this->destRect.x) * 2) / (float)this->width;
+    this->translateY     = 1.0f - (((this->destRect.h / 2) + this->destRect.y) * 2) / (float)this->height;
+    this->scaleX         = (float)this->destRect.w / (float)this->width;
+    this->scaleY         = (float)this->destRect.h / (float)this->height;
+    this->viewportWidth  = this->destRect.w;
+    this->viewportHeight = this->destRect.h;
   }
 
+  egl_update_scale_type(this);
   egl_calc_mouse_size(this);
 
   this->splashRatio  = (float)width / (float)height;
-  this->screenScaleX = 1.0f / width;
-  this->screenScaleY = 1.0f / height;
+  this->screenScaleX = 1.0f / this->width;
+  this->screenScaleY = 1.0f / this->height;
 
   egl_calc_mouse_state(this);
+  egl_update_font(this);
+  egl_update_help_font(this);
+
+  this->cursorLastValid = false;
 }
 
 bool egl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
@@ -429,7 +536,7 @@ bool egl_on_frame_format(void * opaque, const LG_RendererFormat format, bool use
     }
   }
 
-  this->useNearest = this->width < format.width || this->height < format.height;
+  egl_update_scale_type(this);
   return egl_desktop_setup(this->desktop, format, useDMA);
 }
 
@@ -444,6 +551,7 @@ bool egl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
   }
 
   this->start = true;
+  this->cursorLastValid = false;
   return true;
 }
 
@@ -480,75 +588,33 @@ void egl_on_alert(void * opaque, const LG_MsgAlert alert, const char * message, 
   }
 
   this->showAlert = true;
+  this->cursorLastValid = false;
 }
 
-bool egl_render_startup(void * opaque, SDL_Window * window)
+void egl_on_help(void * opaque, const char * message)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  egl_help_set_text(this->help, message);
+  this->cursorLastValid = false;
+}
+
+void egl_on_show_fps(void * opaque, bool showFPS)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  egl_fps_set_display(this->fps, showFPS);
+}
+
+bool egl_render_startup(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  SDL_SysWMinfo wminfo;
-  SDL_VERSION(&wminfo.version);
-  if (!SDL_GetWindowWMInfo(window, &wminfo))
-  {
-    DEBUG_ERROR("SDL_GetWindowWMInfo failed");
+  this->nativeWind = app_getEGLNativeWindow();
+  if (!this->nativeWind)
     return false;
-  }
 
-  egl_dynProcsInit();
-
-  EGLNativeDisplayType native;
-  EGLenum platform;
-
-  switch(wminfo.subsystem)
-  {
-    case SDL_SYSWM_X11:
-      native           = (EGLNativeDisplayType)wminfo.info.x11.display;
-      platform         = EGL_PLATFORM_X11_KHR;
-      this->nativeWind = (EGLNativeWindowType)wminfo.info.x11.window;
-      break;
-
-#if defined(SDL_VIDEO_DRIVER_WAYLAND)
-    case SDL_SYSWM_WAYLAND:
-    {
-      int width, height;
-      SDL_GetWindowSize(window, &width, &height);
-      native           = (EGLNativeDisplayType)wminfo.info.wl.display;
-      platform         = EGL_PLATFORM_WAYLAND_KHR;
-      this->nativeWind = (EGLNativeWindowType)wl_egl_window_create(
-          wminfo.info.wl.surface, width, height);
-      break;
-    }
-#endif
-
-    default:
-      DEBUG_ERROR("Unsupported subsystem");
-      return false;
-  }
-
-  const char *early_exts = eglQueryString(NULL, EGL_EXTENSIONS);
-  if (strstr(early_exts, "EGL_KHR_platform_base") != NULL &&
-      g_dynprocs.eglGetPlatformDisplay)
-  {
-    DEBUG_INFO("Using eglGetPlatformDisplay");
-    this->display = g_dynprocs.eglGetPlatformDisplay(platform, native, NULL);
-  }
-  else if (strstr(early_exts, "EGL_EXT_platform_base") != NULL &&
-      g_dynprocs.eglGetPlatformDisplayEXT)
-  {
-    DEBUG_INFO("Using eglGetPlatformDisplayEXT");
-    this->display = g_dynprocs.eglGetPlatformDisplayEXT(platform, native, NULL);
-  }
-  else
-  {
-    DEBUG_INFO("Using eglGetDisplay");
-    this->display = eglGetDisplay(native);
-  }
-
+  this->display = app_getEGLDisplay();
   if (this->display == EGL_NO_DISPLAY)
-  {
-    DEBUG_ERROR("eglGetDisplay failed");
     return false;
-  }
 
   int maj, min;
   if (!eglInitialize(this->display, &maj, &min))
@@ -571,7 +637,7 @@ bool egl_render_startup(void * opaque, SDL_Window * window)
 
   EGLint attr[] =
   {
-    EGL_BUFFER_SIZE    , 32,
+    EGL_BUFFER_SIZE    , 24,
     EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
     EGL_SAMPLE_BUFFERS , maxSamples > 0 ? 1 : 0,
     EGL_SAMPLES        , maxSamples,
@@ -639,9 +705,9 @@ bool egl_render_startup(void * opaque, SDL_Window * window)
   DEBUG_INFO("EGL APIs  : %s", eglQueryString(this->display, EGL_CLIENT_APIS));
   DEBUG_INFO("Extensions: %s", client_exts);
 
-  if (g_dynprocs.glEGLImageTargetTexture2DOES)
+  if (g_egl_dynProcs.glEGLImageTargetTexture2DOES)
   {
-    if (strstr(client_exts, "EGL_EXT_image_dma_buf_import") != NULL)
+    if (util_hasGLExt(client_exts, "EGL_EXT_image_dma_buf_import"))
     {
       /*
        * As of version 455.45.01 NVidia started advertising support for this
@@ -694,21 +760,30 @@ bool egl_render_startup(void * opaque, SDL_Window * window)
     return false;
   }
 
+  if (!egl_help_init(&this->help, this->font, this->helpFontObj))
+  {
+    DEBUG_ERROR("Failed to initialize the alert display");
+    return false;
+  }
+
   return true;
 }
 
-bool egl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
+bool egl_render(void * opaque, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
 
+  bool hasLastCursor = this->cursorLastValid;
+  bool cursorRendered = false;
+  struct CursorState cursorState;
+
   if (this->start && egl_desktop_render(this->desktop,
         this->translateX, this->translateY,
         this->scaleX    , this->scaleY    ,
-        this->useNearest,
-        rotate))
+        this->scaleType , rotate))
   {
     if (!this->waitFadeTime)
     {
@@ -718,6 +793,8 @@ bool egl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
         this->waitDone = true;
     }
 
+    cursorRendered = true;
+    cursorState = egl_cursor_get_state(this->cursor, this->width, this->height);
     egl_cursor_render(this->cursor,
         (this->format.rotate + rotate) % LG_ROTATE_MAX);
   }
@@ -757,23 +834,47 @@ bool egl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
       close = true;
 
     if (close)
+    {
       this->showAlert = false;
+      this->cursorLastValid = false;
+    }
     else
       egl_alert_render(this->alert, this->screenScaleX, this->screenScaleY);
   }
 
+  struct Rect damage[2];
+  int damageIdx = 0;
+
+  if (this->waitDone)
+  {
+    if (cursorRendered && hasLastCursor)
+    {
+      if (this->cursorLast.visible)
+        damage[damageIdx++] = this->cursorLast.rect;
+
+      if (cursorState.visible)
+        damage[damageIdx++] = cursorState.rect;
+
+      this->cursorLast = cursorState;
+    }
+    else if (cursorRendered)
+    {
+      this->cursorLast = cursorState;
+      this->cursorLastValid = true;
+    }
+  }
+
   egl_fps_render(this->fps, this->screenScaleX, this->screenScaleY);
-  eglSwapBuffers(this->display, this->surface);
+  egl_help_render(this->help, this->screenScaleX, this->screenScaleY);
+  app_eglSwapBuffers(this->display, this->surface, damage, damageIdx);
   return true;
 }
 
 void egl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
 {
   struct Inst * this = (struct Inst *)opaque;
-  if (!this->params.showFPS)
-    return;
-
   egl_fps_update(this->fps, avgUPS, avgFPS);
+  this->cursorLastValid = false;
 }
 
 struct LG_Renderer LGR_EGL =
@@ -791,6 +892,8 @@ struct LG_Renderer LGR_EGL =
   .on_frame_format = egl_on_frame_format,
   .on_frame        = egl_on_frame,
   .on_alert        = egl_on_alert,
+  .on_help         = egl_on_help,
+  .on_show_fps     = egl_on_show_fps,
   .render_startup  = egl_render_startup,
   .render          = egl_render,
   .update_fps      = egl_update_fps

@@ -10,6 +10,7 @@ add_library(platform_Windows STATIC
 	src/service.c
 	src/mousehook.c
 	src/force_compose.c
+	src/delay.c
 )
 
 # allow use of functions for Windows Vista or later
@@ -33,6 +34,7 @@ target_link_libraries(platform_Windows
 	wtsapi32
 	psapi
 	shlwapi
+	powrprof
 )
 
 target_include_directories(platform_Windows

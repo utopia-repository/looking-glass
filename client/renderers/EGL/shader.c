@@ -1,31 +1,30 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "shader.h"
 #include "common/debug.h"
-#include "utils.h"
+#include "util.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-
-#include <SDL2/SDL_egl.h>
 
 struct EGL_Shader
 {
@@ -63,7 +62,7 @@ bool egl_shader_load(EGL_Shader * this, const char * vertex_file, const char * f
   char   * vertex_code, * fragment_code;
   size_t   vertex_size,   fragment_size;
 
-  if (!file_get_contents(vertex_file, &vertex_code, &vertex_size))
+  if (!util_fileGetContents(vertex_file, &vertex_code, &vertex_size))
   {
     DEBUG_ERROR("Failed to read vertex shader");
     return false;
@@ -71,7 +70,7 @@ bool egl_shader_load(EGL_Shader * this, const char * vertex_file, const char * f
 
   DEBUG_INFO("Loaded vertex shader: %s", vertex_file);
 
-  if (!file_get_contents(fragment_file, &fragment_code, &fragment_size))
+  if (!util_fileGetContents(fragment_file, &fragment_code, &fragment_size))
   {
     DEBUG_ERROR("Failed to read fragment shader");
     free(vertex_code);
