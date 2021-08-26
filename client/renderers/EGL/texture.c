@@ -1,27 +1,27 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "texture.h"
 #include "common/debug.h"
 #include "common/framebuffer.h"
-#include "dynprocs.h"
-#include "utils.h"
+#include "egl_dynprocs.h"
 #include "egldebug.h"
 
 #include <stdlib.h>
@@ -39,8 +39,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #define DRM_FORMAT_ABGR8888      fourcc_code('A', 'B', '2', '4')
 #define DRM_FORMAT_BGRA1010102   fourcc_code('B', 'A', '3', '0')
 #define DRM_FORMAT_ABGR16161616F fourcc_code('A', 'B', '4', 'H')
-
-#include <SDL2/SDL_egl.h>
 
 /* this must be a multiple of 2 */
 #define BUFFER_COUNT 4
@@ -78,8 +76,20 @@ struct EGL_Texture
 
   struct BufferState state;
   int             bufferCount;
-  GLuint          tex;
+  GLuint          tex[BUFFER_COUNT];
   struct Buffer   buf[BUFFER_COUNT];
+
+  size_t dmaImageCount;
+  size_t dmaImageUsed;
+  struct
+  {
+    int fd;
+    EGLImage image;
+  }
+  * dmaImages;
+
+  GLuint dmaFBO;
+  GLuint dmaTex;
 };
 
 bool egl_texture_init(EGL_Texture ** texture, EGLDisplay * display)
@@ -120,7 +130,11 @@ void egl_texture_free(EGL_Texture ** texture)
     }
   }
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-  glDeleteTextures(1, &(*texture)->tex);
+  glDeleteTextures((*texture)->bufferCount, (*texture)->tex);
+
+  for (size_t i = 0; i < (*texture)->dmaImageUsed; ++i)
+    eglDestroyImage((*texture)->display, (*texture)->dmaImages[i].image);
+  free((*texture)->dmaImages);
 
   free(*texture);
   *texture = NULL;
@@ -136,18 +150,19 @@ static bool egl_texture_map(EGL_Texture * texture, uint8_t i)
     GL_MAP_WRITE_BIT             |
     GL_MAP_UNSYNCHRONIZED_BIT    |
     GL_MAP_INVALIDATE_BUFFER_BIT |
-    GL_MAP_PERSISTENT_BIT
+    GL_MAP_PERSISTENT_BIT        |
+    GL_MAP_COHERENT_BIT
   );
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   if (!texture->buf[i].map)
   {
     DEBUG_EGL_ERROR("glMapBufferRange failed for %d of %lu bytes", i,
         texture->pboBufferSize);
-    return false;
   }
 
-  return true;
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+  return texture->buf[i].map;
 }
 
 static void egl_texture_unmap(EGL_Texture * texture, uint8_t i)
@@ -235,9 +250,9 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
 
   texture->pitch = stride / texture->bpp;
 
-  if (texture->tex)
-    glDeleteTextures(1, &texture->tex);
-  glGenTextures(1, &texture->tex);
+  if (texture->tex[0])
+    glDeleteTextures(texture->bufferCount, texture->tex);
+  glGenTextures(texture->bufferCount, texture->tex);
 
   if (!texture->sampler)
   {
@@ -249,11 +264,26 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
   }
 
   if (useDMA)
-    return true;
+  {
+    if (texture->dmaFBO)
+      glDeleteFramebuffers(1, &texture->dmaFBO);
+    if (texture->dmaTex)
+      glDeleteTextures(1, &texture->dmaTex);
+    glGenFramebuffers(1, &texture->dmaFBO);
+    glGenTextures(1, &texture->dmaTex);
 
-  glBindTexture(GL_TEXTURE_2D, texture->tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, texture->intFormat, texture->width,
-    texture->height, 0, texture->format, texture->dataType, NULL);
+    for (size_t i = 0; i < texture->dmaImageUsed; ++i)
+      eglDestroyImage(texture->display, texture->dmaImages[i].image);
+    texture->dmaImageUsed = 0;
+    return true;
+  }
+
+  for(int i = 0; i < texture->bufferCount; ++i)
+  {
+    glBindTexture(GL_TEXTURE_2D, texture->tex[i]);
+    glTexImage2D(GL_TEXTURE_2D, 0, texture->intFormat, texture->width,
+      texture->height, 0, texture->format, texture->dataType, NULL);
+  }
   glBindTexture(GL_TEXTURE_2D, 0);
 
   if (!streaming)
@@ -269,8 +299,9 @@ bool egl_texture_setup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt, size_
       GL_PIXEL_UNPACK_BUFFER,
       texture->pboBufferSize,
       NULL,
-      GL_MAP_WRITE_BIT |
-      GL_MAP_PERSISTENT_BIT
+      GL_MAP_WRITE_BIT      |
+      GL_MAP_PERSISTENT_BIT |
+      GL_MAP_COHERENT_BIT
     );
 
     if (!egl_texture_map(texture, i))
@@ -312,7 +343,7 @@ bool egl_texture_update(EGL_Texture * texture, const uint8_t * buffer)
   }
   else
   {
-    glBindTexture(GL_TEXTURE_2D, texture->tex);
+    glBindTexture(GL_TEXTURE_2D, texture->tex[0]);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->pitch);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texture->width, texture->height,
         texture->format, texture->dataType, buffer);
@@ -366,42 +397,95 @@ bool egl_texture_update_from_dma(EGL_Texture * texture, const FrameBuffer * fram
     return true;
   }
 
-  EGLAttrib const attribs[] =
-  {
-    EGL_WIDTH                    , texture->width,
-    EGL_HEIGHT                   , texture->height,
-    EGL_LINUX_DRM_FOURCC_EXT     , texture->fourcc,
-    EGL_DMA_BUF_PLANE0_FD_EXT    , dmaFd,
-    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-    EGL_DMA_BUF_PLANE0_PITCH_EXT , texture->stride,
-    EGL_NONE                     , EGL_NONE
-  };
+  EGLImage image = EGL_NO_IMAGE;
 
-  /* create the image backed by the dma buffer */
-  EGLImage image = eglCreateImage(
-    texture->display,
-    EGL_NO_CONTEXT,
-    EGL_LINUX_DMA_BUF_EXT,
-    (EGLClientBuffer)NULL,
-    attribs
-  );
+  for (int i = 0; i < texture->dmaImageUsed; ++i)
+  {
+    if (texture->dmaImages[i].fd == dmaFd)
+    {
+      image = texture->dmaImages[i].image;
+      break;
+    }
+  }
 
   if (image == EGL_NO_IMAGE)
   {
-    DEBUG_EGL_ERROR("Failed to create ELGImage for DMA transfer");
-    return false;
-  }
+    EGLAttrib const attribs[] =
+    {
+      EGL_WIDTH                    , texture->width,
+      EGL_HEIGHT                   , texture->height,
+      EGL_LINUX_DRM_FOURCC_EXT     , texture->fourcc,
+      EGL_DMA_BUF_PLANE0_FD_EXT    , dmaFd,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT , texture->stride,
+      EGL_NONE                     , EGL_NONE
+    };
 
-  /* bind the texture and initiate the transfer */
-  glBindTexture(GL_TEXTURE_2D, texture->tex);
-  g_dynprocs.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    /* create the image backed by the dma buffer */
+    image = eglCreateImage(
+      texture->display,
+      EGL_NO_CONTEXT,
+      EGL_LINUX_DMA_BUF_EXT,
+      (EGLClientBuffer)NULL,
+      attribs
+    );
+
+    if (image == EGL_NO_IMAGE)
+    {
+      DEBUG_EGL_ERROR("Failed to create ELGImage for DMA transfer");
+      return false;
+    }
+
+    if (texture->dmaImageUsed == texture->dmaImageCount)
+    {
+      size_t newCount = texture->dmaImageCount * 2 + 2;
+      void * new = realloc(texture->dmaImages, newCount * sizeof *texture->dmaImages);
+      if (!new)
+      {
+        DEBUG_EGL_ERROR("Failed to allocate memory");
+        eglDestroyImage(texture->display, image);
+        return false;
+      }
+      texture->dmaImageCount = newCount;
+      texture->dmaImages     = new;
+    }
+
+    const size_t index = texture->dmaImageUsed++;
+    texture->dmaImages[index].fd    = dmaFd;
+    texture->dmaImages[index].image = image;
+  }
 
   /* wait for completion */
   framebuffer_wait(frame, texture->height * texture->stride);
 
-  /* destroy the image to prevent future writes corrupting the display image */
-  eglDestroyImage(texture->display, image);
+  glBindTexture(GL_TEXTURE_2D, texture->dmaTex);
+  g_egl_dynProcs.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
 
+  glBindFramebuffer(GL_FRAMEBUFFER, texture->dmaFBO);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture->dmaTex, 0);
+
+  glBindTexture(GL_TEXTURE_2D, texture->tex[0]);
+  glCopyTexImage2D(GL_TEXTURE_2D, 0, texture->intFormat, 0, 0, texture->width, texture->height, 0);
+
+  GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  glFlush();
+
+  switch (glClientWaitSync(fence, 0, 10000000)) // 10ms
+  {
+    case GL_ALREADY_SIGNALED:
+    case GL_CONDITION_SATISFIED:
+      break;
+
+    case GL_TIMEOUT_EXPIRED:
+      egl_warn_slow();
+      break;
+
+    case GL_WAIT_FAILED:
+    case GL_INVALID_VALUE:
+      DEBUG_EGL_ERROR("glClientWaitSync failed");
+  }
+
+  glDeleteSync(fence);
   atomic_fetch_add_explicit(&texture->state.w, 1, memory_order_release);
   return true;
 }
@@ -427,7 +511,7 @@ enum EGL_TexStatus egl_texture_process(EGL_Texture * texture)
   if (!texture->dma)
   {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, texture->buf[b].pbo);
-    glBindTexture(GL_TEXTURE_2D, texture->tex);
+    glBindTexture(GL_TEXTURE_2D, texture->tex[b]);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->pitch);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texture->width, texture->height,
         texture->format, texture->dataType, (const void *)0);
@@ -450,6 +534,7 @@ enum EGL_TexStatus egl_texture_bind(EGL_Texture * texture)
 {
   uint8_t ss = atomic_load_explicit(&texture->state.s, memory_order_acquire);
   uint8_t sd = atomic_load_explicit(&texture->state.d, memory_order_acquire);
+  GLuint tex = texture->tex[0];
 
   if (texture->streaming)
   {
@@ -490,10 +575,13 @@ enum EGL_TexStatus egl_texture_bind(EGL_Texture * texture)
     if (ss != sd && ss != (uint8_t)(sd + 1))
       sd = atomic_fetch_add_explicit(&texture->state.d, 1,
           memory_order_release) + 1;
+
+    if (!texture->dma)
+      tex = texture->tex[sd % BUFFER_COUNT];
   }
 
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, texture->tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
   glBindSampler(0, texture->sampler);
 
   return EGL_TEX_STATUS_OK;

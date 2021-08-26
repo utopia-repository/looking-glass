@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/capture.h"
 #include "interface/platform.h"
@@ -56,8 +57,7 @@ struct iface
 
   NvFBCFrameGrabInfo grabInfo;
 
-  LGEvent * frameEvent;
-  LGEvent * cursorEvents[2];
+  LGEvent * cursorEvent;
 
   int mouseX, mouseY, mouseHotX, mouseHotY;
   bool mouseVisible, hasMousePosition;
@@ -91,7 +91,16 @@ static void on_mouseMove(int x, int y)
   this->hasMousePosition = true;
   this->mouseX           = x;
   this->mouseY           = y;
-  lgSignalEvent(this->cursorEvents[0]);
+
+  const CapturePointer pointer =
+  {
+    .positionUpdate = true,
+    .visible        = this->mouseVisible,
+    .x              = x - this->mouseHotX,
+    .y              = y - this->mouseHotY
+  };
+
+  this->postPointerBufferFn(pointer);
 }
 
 static const char * nvfbc_getName(void)
@@ -124,13 +133,6 @@ static bool nvfbc_create(
     return false;
 
   this = (struct iface *)calloc(sizeof(struct iface), 1);
-  this->frameEvent = lgCreateEvent(true, 17);
-  if (!this->frameEvent)
-  {
-    DEBUG_ERROR("failed to create the frame event");
-    nvfbc_free();
-    return false;
-  }
 
   this->seperateCursor      = option_get_bool("nvfbc", "decoupleCursor");
   this->getPointerBufferFn  = getPointerBufferFn;
@@ -155,7 +157,7 @@ static bool nvfbc_init(void)
     privDataLen = (bufferLen - 1) / 2;
     privData    = (uint8_t *)malloc(privDataLen);
     char hex[3] = {0};
-    for(int i = 0; i < privDataLen; ++i)
+    for (int i = 0; i < privDataLen; ++i)
     {
       memcpy(hex, &buffer[i*2], 2);
       privData[i] = (uint8_t)strtoul(hex, NULL, 16);
@@ -164,6 +166,10 @@ static bool nvfbc_init(void)
     free(buffer);
   }
 
+  // NOTE: Calling this on hardware that doesn't support NvFBC such as GeForce
+  // causes a substantial performance pentalty even if it fails! As such we only
+  // attempt NvFBC as a last resort, or if configured via the app:capture
+  // option.
   if (!NvFBCToSysCreate(privData, privDataLen, &this->nvfbc, &this->maxWidth, &this->maxHeight))
   {
     free(privData);
@@ -172,7 +178,6 @@ static bool nvfbc_init(void)
   free(privData);
 
   getDesktopSize(&this->width, &this->height, &this->dpi);
-  lgResetEvent(this->frameEvent);
 
   HANDLE event;
   if (!NvFBCToSysSetup(
@@ -190,10 +195,8 @@ static bool nvfbc_init(void)
     return false;
   }
 
-  this->cursorEvents[0] = lgCreateEvent(true, 10);
-
   if (this->seperateCursor)
-    this->cursorEvents[1] = lgWrapEvent(event);
+    this->cursorEvent = lgWrapEvent(event);
 
   if (!this->mouseHookCreated)
   {
@@ -226,8 +229,7 @@ static void nvfbc_stop(void)
 {
   this->stop = true;
 
-  lgSignalEvent(this->cursorEvents[0]);
-  lgSignalEvent(this->frameEvent);
+  lgSignalEvent(this->cursorEvent);
 
   if (this->pointerThread)
   {
@@ -238,12 +240,7 @@ static void nvfbc_stop(void)
 
 static bool nvfbc_deinit(void)
 {
-  if (this->cursorEvents[0])
-  {
-    lgFreeEvent(this->cursorEvents[0]);
-    this->cursorEvents[0] = NULL;
-  }
-
+  this->cursorEvent = NULL;
   if (this->nvfbc)
   {
     NvFBCToSysRelease(&this->nvfbc);
@@ -255,9 +252,6 @@ static bool nvfbc_deinit(void)
 
 static void nvfbc_free(void)
 {
-  if (this->frameEvent)
-    lgFreeEvent(this->frameEvent);
-
   if (this->mouseHookCreated)
     mouseHook_remove();
 
@@ -267,11 +261,6 @@ static void nvfbc_free(void)
   free(this);
   this = NULL;
   NvFBCFree();
-}
-
-static unsigned int nvfbc_getMaxFrameSize(void)
-{
-  return this->maxWidth * this->maxHeight * 4;
 }
 
 static unsigned int nvfbc_getMouseScale(void)
@@ -298,27 +287,25 @@ static CaptureResult nvfbc_capture(void)
   bool changed = false;
   const unsigned int h = (this->height + 127) / 128;
   const unsigned int w = (this->width  + 127) / 128;
-  for(unsigned int y = 0; y < h; ++y)
-    for(unsigned int x = 0; x < w; ++x)
+  for (unsigned int y = 0; y < h; ++y)
+    for (unsigned int x = 0; x < w; ++x)
       if (this->diffMap[(y*w)+x])
       {
         changed = true;
-        break;
+        goto done;
       }
 
+done:
   if (!changed)
     return CAPTURE_RESULT_TIMEOUT;
 
   memcpy(&this->grabInfo, &grabInfo, sizeof(grabInfo));
-  lgSignalEvent(this->frameEvent);
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult nvfbc_waitFrame(CaptureFrame * frame)
+static CaptureResult nvfbc_waitFrame(CaptureFrame * frame,
+    const size_t maxFrameSize)
 {
-  if (!lgWaitEvent(this->frameEvent, 1000))
-    return CAPTURE_RESULT_TIMEOUT;
-
   if (this->stop)
     return CAPTURE_RESULT_REINIT;
 
@@ -333,12 +320,15 @@ static CaptureResult nvfbc_waitFrame(CaptureFrame * frame)
     ++this->formatVer;
   }
 
-  frame->formatVer = this->formatVer;
-  frame->width     = this->grabWidth;
-  frame->height    = this->grabHeight;
-  frame->pitch     = this->grabStride * 4;
-  frame->stride    = this->grabStride;
-  frame->rotation  = CAPTURE_ROT_0;
+  const unsigned int maxHeight = maxFrameSize / (this->grabStride * 4);
+
+  frame->formatVer  = this->formatVer;
+  frame->width      = this->grabWidth;
+  frame->height     = maxHeight > this->grabHeight ? this->grabHeight : maxHeight;
+  frame->realHeight = this->grabHeight;
+  frame->pitch      = this->grabStride * 4;
+  frame->stride     = this->grabStride;
+  frame->rotation   = CAPTURE_ROT_0;
 
 #if 0
   //NvFBC never sets bIsHDR so instead we check for any data in the alpha channel
@@ -360,25 +350,22 @@ static CaptureResult nvfbc_waitFrame(CaptureFrame * frame)
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult nvfbc_getFrame(FrameBuffer * frame)
+static CaptureResult nvfbc_getFrame(FrameBuffer * frame,
+    const unsigned int height)
 {
   framebuffer_write(
     frame,
     this->frameBuffer,
-    this->grabInfo.dwHeight * this->grabInfo.dwBufferWidth * 4
+    height * this->grabInfo.dwBufferWidth * 4
   );
   return CAPTURE_RESULT_OK;
 }
 
 static int pointerThread(void * unused)
 {
-  lgSignalEvent(this->cursorEvents[1]);
-
   while(!this->stop)
   {
-    LGEvent * events[2];
-    memcpy(&events, &this->cursorEvents, sizeof(LGEvent *) * 2);
-    if (!lgWaitEvents(events, this->seperateCursor ? 2 : 1, false, 1000))
+    if (!lgWaitEvent(this->cursorEvent, 1000))
       continue;
 
     if (this->stop)
@@ -386,38 +373,30 @@ static int pointerThread(void * unused)
 
     CaptureResult  result;
     CapturePointer pointer = { 0 };
-    bool           hotspotUpdated = false;
 
-    if (this->seperateCursor && events[1])
+    void * data;
+    uint32_t size;
+    if (!this->getPointerBufferFn(&data, &size))
     {
-      void * data;
-      uint32_t size;
-      if (!this->getPointerBufferFn(&data, &size))
-      {
-        DEBUG_WARN("failed to get a pointer buffer");
-        continue;
-      }
-
-      result = NvFBCToSysGetCursor(this->nvfbc, &pointer, data, size);
-      if (result != CAPTURE_RESULT_OK)
-      {
-        DEBUG_WARN("NvFBCToSysGetCursor failed");
-        continue;
-      }
-
-      this->mouseVisible = pointer.visible;
-      this->mouseHotX    = pointer.hx;
-      this->mouseHotY    = pointer.hy;
-      hotspotUpdated     = true;
+      DEBUG_WARN("failed to get a pointer buffer");
+      continue;
     }
 
-    if (events[0] || (hotspotUpdated && this->hasMousePosition))
+    result = NvFBCToSysGetCursor(this->nvfbc, &pointer, data, size);
+    if (result != CAPTURE_RESULT_OK)
     {
-      pointer.positionUpdate = true;
-      pointer.visible        = this->mouseVisible;
-      pointer.x              = this->mouseX - this->mouseHotX;
-      pointer.y              = this->mouseY - this->mouseHotY;
+      DEBUG_WARN("NvFBCToSysGetCursor failed");
+      continue;
     }
+
+    this->mouseVisible = pointer.visible;
+    this->mouseHotX    = pointer.hx;
+    this->mouseHotY    = pointer.hy;
+
+    pointer.positionUpdate = true;
+    pointer.visible        = this->mouseVisible;
+    pointer.x              = this->mouseX - pointer.hx;
+    pointer.y              = this->mouseY - pointer.hy;
 
     this->postPointerBufferFn(pointer);
   }
@@ -427,6 +406,8 @@ static int pointerThread(void * unused)
 
 struct CaptureInterface Capture_NVFBC =
 {
+  .shortName       = "NvFBC",
+  .asyncCapture    = false,
   .getName         = nvfbc_getName,
   .initOptions     = nvfbc_initOptions,
 
@@ -435,7 +416,6 @@ struct CaptureInterface Capture_NVFBC =
   .stop            = nvfbc_stop,
   .deinit          = nvfbc_deinit,
   .free            = nvfbc_free,
-  .getMaxFrameSize = nvfbc_getMaxFrameSize,
   .getMouseScale   = nvfbc_getMouseScale,
   .capture         = nvfbc_capture,
   .waitFrame       = nvfbc_waitFrame,

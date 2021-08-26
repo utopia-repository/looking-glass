@@ -1,3 +1,23 @@
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
 #define _GNU_SOURCE //needed for pthread_setname_np
 
 #include <obs/obs-module.h>
@@ -244,7 +264,7 @@ static void * pointerThread(void * data)
 
           const uint32_t * s = (const uint32_t *)data;
           uint32_t * d       = this->cursorData;
-          for(int i = 0; i < dataSize; ++i, ++s, ++d)
+          for(int i = 0; i < dataSize / sizeof(uint32_t); ++i, ++s, ++d)
             *d = (*s & ~0xFF000000) | (*s & 0xFF000000 ? 0x0 : 0xFF000000);
           break;
         }
@@ -259,7 +279,7 @@ static void * pointerThread(void * data)
 
         case CURSOR_TYPE_MONOCHROME:
         {
-          dataSize = cursor->height * sizeof(uint32_t);
+          dataSize = cursor->height * cursor->width * sizeof(uint32_t);
           allocCursorData(this, dataSize);
 
           const int hheight = cursor->height / 2;
@@ -409,7 +429,7 @@ static void lgVideoTick(void * data, float seconds)
           gs_texture_create(
               this->cursor.width,
               this->cursor.height,
-              GS_RGBA,
+              GS_BGRA,
               1,
               (const uint8_t **)&this->cursorData,
               GS_DYNAMIC);
@@ -568,8 +588,10 @@ static void lgVideoRender(void * data, gs_effect_t * effect)
 
     if (!this->cursorMono)
     {
+      gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
       while (gs_effect_loop(effect, "Draw"))
         gs_draw_sprite(this->cursorTex, 0, 0, 0);
+      gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
     }
     else
     {
@@ -581,12 +603,12 @@ static void lgVideoRender(void * data, gs_effect_t * effect)
         gs_draw_sprite_subregion(
             this->cursorTex    , 0,
             0                  , 0,
-            this->cursorRect.cx, this->cursorRect.cy / 2 - 1);
+            this->cursorRect.cx, this->cursorRect.cy / 2);
 
         glLogicOp(GL_XOR);
         gs_draw_sprite_subregion(
             this->cursorTex    , 0,
-            0                  , this->cursorRect.cy / 2 + 1,
+            0                  , this->cursorRect.cy / 2,
             this->cursorRect.cx, this->cursorRect.cy / 2);
 
         glDisable(GL_COLOR_LOGIC_OP);

@@ -1,11 +1,16 @@
 #version 300 es
 
+#define EGL_SCALE_AUTO    0
+#define EGL_SCALE_NEAREST 1
+#define EGL_SCALE_LINEAR  2
+#define EGL_SCALE_MAX     3
+
 in  highp vec2 uv;
 out highp vec4 color;
 
 uniform sampler2D sampler1;
 
-uniform       int   nearest;
+uniform       int   scaleAlgo;
 uniform highp vec2  size;
 uniform       int   rotate;
 
@@ -36,10 +41,16 @@ void main()
     ruv.y =  uv.x;
   }
 
-  if(nearest == 1)
-    color = texture(sampler1, ruv);
-  else
-    color = texelFetch(sampler1, ivec2(ruv * size), 0);
+  switch (scaleAlgo)
+  {
+    case EGL_SCALE_NEAREST:
+      color = texelFetch(sampler1, ivec2(ruv * size), 0);
+      break;
+
+    case EGL_SCALE_LINEAR:
+      color = texture(sampler1, ruv);
+      break;
+  }
 
   if (cbMode > 0)
   {
@@ -84,4 +95,6 @@ void main()
     color *= 1.0 + lumi;
     color *= nvGain;
   }
+
+  color.a = 1.0;
 }

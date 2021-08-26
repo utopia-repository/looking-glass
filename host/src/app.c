@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2020 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/platform.h"
 #include "interface/capture.h"
@@ -30,6 +31,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/ivshmem.h"
 #include "common/sysinfo.h"
 #include "common/time.h"
+#include "common/stringutils.h"
 
 #include <lgmp/host.h>
 
@@ -38,6 +40,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define CONFIG_FILE "looking-glass-host.ini"
 #define POINTER_SHAPE_BUFFERS 3
@@ -76,17 +79,21 @@ struct app
   PLGMPHost lgmp;
 
   PLGMPHostQueue pointerQueue;
-  PLGMPMemory    pointerMemory[POINTER_SHAPE_BUFFERS];
+  PLGMPMemory    pointerMemory[LGMP_Q_POINTER_LEN];
+  PLGMPMemory    pointerShapeMemory[POINTER_SHAPE_BUFFERS];
   LG_Lock        pointerLock;
   CapturePointer pointerInfo;
   PLGMPMemory    pointerShape;
   bool           pointerShapeValid;
   unsigned int   pointerIndex;
+  unsigned int   pointerShapeIndex;
 
+  long           pageSize;
   size_t         maxFrameSize;
   PLGMPHostQueue frameQueue;
   PLGMPMemory    frameMemory[LGMP_Q_FRAME_LEN];
   unsigned int   frameIndex;
+  bool           frameValid;
 
   CaptureInterface * iface;
 
@@ -96,6 +103,31 @@ struct app
 };
 
 static struct app app;
+
+static bool validateCaptureBackend(struct Option * opt, const char ** error)
+{
+  if (!*opt->value.x_string)
+    return true;
+
+  for (int i = 0; CaptureInterfaces[i]; ++i)
+    if (!strcasecmp(opt->value.x_string, CaptureInterfaces[i]->shortName))
+      return true;
+
+  return false;
+}
+
+static struct Option options[] =
+{
+  {
+    .module         = "app",
+    .name           = "capture",
+    .description    = "Select the capture backend",
+    .type           = OPTION_TYPE_STRING,
+    .value.x_string = "",
+    .validator      = validateCaptureBackend,
+  },
+  {0}
+};
 
 static bool lgmpTimer(void * opaque)
 {
@@ -110,116 +142,127 @@ static bool lgmpTimer(void * opaque)
   return true;
 }
 
+static bool sendFrame(void)
+{
+  CaptureFrame frame = { 0 };
+  bool repeatFrame = false;
+
+  //wait until there is room in the queue
+  while(app.state == APP_STATE_RUNNING &&
+      lgmpHostQueuePending(app.frameQueue) == LGMP_Q_FRAME_LEN)
+  {
+    usleep(1);
+    continue;
+  }
+
+  if (app.state != APP_STATE_RUNNING)
+    return false;
+
+  switch(app.iface->waitFrame(&frame, app.maxFrameSize))
+  {
+    case CAPTURE_RESULT_OK:
+      break;
+
+    case CAPTURE_RESULT_REINIT:
+    {
+      app.state = APP_STATE_RESTART;
+      DEBUG_INFO("Frame thread reinit");
+      return false;
+    }
+
+    case CAPTURE_RESULT_ERROR:
+    {
+      DEBUG_ERROR("Failed to get the frame");
+      return false;
+    }
+
+    case CAPTURE_RESULT_TIMEOUT:
+    {
+      if (app.frameValid && lgmpHostQueueNewSubs(app.frameQueue) > 0)
+      {
+        // resend the last frame
+        repeatFrame = true;
+        break;
+      }
+
+      return true;
+    }
+  }
+
+  LGMP_STATUS status;
+
+  // if we are repeating a frame just send the last frame again
+  if (repeatFrame)
+  {
+    if ((status = lgmpHostQueuePost(app.frameQueue, 0, app.frameMemory[app.frameIndex])) != LGMP_OK)
+      DEBUG_ERROR("%s", lgmpStatusString(status));
+    return true;
+  }
+
+  // we increment the index first so that if we need to repeat a frame
+  // the index still points to the latest valid frame
+  if (++app.frameIndex == LGMP_Q_FRAME_LEN)
+    app.frameIndex = 0;
+
+  KVMFRFrame * fi = lgmpHostMemPtr(app.frameMemory[app.frameIndex]);
+  switch(frame.format)
+  {
+    case CAPTURE_FMT_BGRA   : fi->type = FRAME_TYPE_BGRA   ; break;
+    case CAPTURE_FMT_RGBA   : fi->type = FRAME_TYPE_RGBA   ; break;
+    case CAPTURE_FMT_RGBA10 : fi->type = FRAME_TYPE_RGBA10 ; break;
+    case CAPTURE_FMT_RGBA16F: fi->type = FRAME_TYPE_RGBA16F; break;
+    default:
+      DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
+      return true;
+  }
+
+  switch(frame.rotation)
+  {
+    case CAPTURE_ROT_0  : fi->rotation = FRAME_ROT_0  ; break;
+    case CAPTURE_ROT_90 : fi->rotation = FRAME_ROT_90 ; break;
+    case CAPTURE_ROT_180: fi->rotation = FRAME_ROT_180; break;
+    case CAPTURE_ROT_270: fi->rotation = FRAME_ROT_270; break;
+    default:
+      DEBUG_WARN("Unsupported frame rotation %d", frame.rotation);
+      fi->rotation = FRAME_ROT_0;
+      break;
+  }
+
+  fi->formatVer         = frame.formatVer;
+  fi->width             = frame.width;
+  fi->height            = frame.height;
+  fi->realHeight        = frame.realHeight;
+  fi->stride            = frame.stride;
+  fi->pitch             = frame.pitch;
+  fi->offset            = app.pageSize - FrameBufferStructSize;
+  fi->mouseScalePercent = app.iface->getMouseScale();
+  fi->blockScreensaver  = os_blockScreensaver();
+  app.frameValid        = true;
+
+  // put the framebuffer on the border of the next page
+  // this is to allow for aligned DMA transfers by the receiver
+  FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)fi) + fi->offset);
+  framebuffer_prepare(fb);
+
+  /* we post and then get the frame, this is intentional! */
+  if ((status = lgmpHostQueuePost(app.frameQueue, 0, app.frameMemory[app.frameIndex])) != LGMP_OK)
+  {
+    DEBUG_ERROR("%s", lgmpStatusString(status));
+    return true;
+  }
+
+  app.iface->getFrame(fb, frame.height);
+  return true;
+}
+
 static int frameThread(void * opaque)
 {
   DEBUG_INFO("Frame thread started");
 
-  bool         frameValid     = false;
-  bool         repeatFrame    = false;
-  CaptureFrame frame          = { 0 };
-  const long   pageSize       = sysinfo_getPageSize();
-
   while(app.state == APP_STATE_RUNNING)
   {
-    //wait until there is room in the queue
-    if(lgmpHostQueuePending(app.frameQueue) == LGMP_Q_FRAME_LEN)
-    {
-      usleep(1);
-      continue;
-    }
-
-    switch(app.iface->waitFrame(&frame))
-    {
-      case CAPTURE_RESULT_OK:
-        repeatFrame = false;
-        break;
-
-      case CAPTURE_RESULT_REINIT:
-      {
-        app.state = APP_STATE_RESTART;
-        DEBUG_INFO("Frame thread reinit");
-        return 0;
-      }
-
-      case CAPTURE_RESULT_ERROR:
-      {
-        DEBUG_ERROR("Failed to get the frame");
-        return 0;
-      }
-
-      case CAPTURE_RESULT_TIMEOUT:
-      {
-        if (frameValid && lgmpHostQueueNewSubs(app.frameQueue) > 0)
-        {
-          // resend the last frame
-          repeatFrame = true;
-          break;
-        }
-
-        continue;
-      }
-    }
-
-    LGMP_STATUS status;
-
-    // if we are repeating a frame just send the last frame again
-    if (repeatFrame)
-    {
-      if ((status = lgmpHostQueuePost(app.frameQueue, 0, app.frameMemory[app.frameIndex])) != LGMP_OK)
-        DEBUG_ERROR("%s", lgmpStatusString(status));
-      continue;
-    }
-
-    // we increment the index first so that if we need to repeat a frame
-    // the index still points to the latest valid frame
-    if (++app.frameIndex == LGMP_Q_FRAME_LEN)
-      app.frameIndex = 0;
-
-    KVMFRFrame * fi = lgmpHostMemPtr(app.frameMemory[app.frameIndex]);
-    switch(frame.format)
-    {
-      case CAPTURE_FMT_BGRA   : fi->type = FRAME_TYPE_BGRA   ; break;
-      case CAPTURE_FMT_RGBA   : fi->type = FRAME_TYPE_RGBA   ; break;
-      case CAPTURE_FMT_RGBA10 : fi->type = FRAME_TYPE_RGBA10 ; break;
-      case CAPTURE_FMT_RGBA16F: fi->type = FRAME_TYPE_RGBA16F; break;
-      default:
-        DEBUG_ERROR("Unsupported frame format %d, skipping frame", frame.format);
-        continue;
-    }
-
-    switch(frame.rotation)
-    {
-      case CAPTURE_ROT_0  : fi->rotation = FRAME_ROT_0  ; break;
-      case CAPTURE_ROT_90 : fi->rotation = FRAME_ROT_90 ; break;
-      case CAPTURE_ROT_180: fi->rotation = FRAME_ROT_180; break;
-      case CAPTURE_ROT_270: fi->rotation = FRAME_ROT_270; break;
-      default:
-        DEBUG_WARN("Unsupported frame rotation %d", frame.rotation);
-        fi->rotation = FRAME_ROT_0;
-        break;
-    }
-
-    fi->formatVer         = frame.formatVer;
-    fi->width             = frame.width;
-    fi->height            = frame.height;
-    fi->stride            = frame.stride;
-    fi->pitch             = frame.pitch;
-    fi->offset            = pageSize - FrameBufferStructSize;
-    fi->mouseScalePercent = app.iface->getMouseScale();
-    frameValid            = true;
-
-    // put the framebuffer on the border of the next page
-    // this is to allow for aligned DMA transfers by the receiver
-    FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)fi) + fi->offset);
-    framebuffer_prepare(fb);
-
-    /* we post and then get the frame, this is intentional! */
-    if ((status = lgmpHostQueuePost(app.frameQueue, 0, app.frameMemory[app.frameIndex])) != LGMP_OK)
-    {
-      DEBUG_ERROR("%s", lgmpStatusString(status));
-      continue;
-    }
-    app.iface->getFrame(fb);
+    if (!sendFrame())
+      break;
   }
   DEBUG_INFO("Frame thread stopped");
   return 0;
@@ -228,6 +271,9 @@ static int frameThread(void * opaque)
 bool startThreads(void)
 {
   app.state = APP_STATE_RUNNING;
+  if (!app.iface->asyncCapture)
+    return true;
+
   if (!lgCreateThread("FrameThread", frameThread, NULL, &app.frameThread))
   {
     DEBUG_ERROR("Failed to create the frame thread");
@@ -239,20 +285,25 @@ bool startThreads(void)
 
 bool stopThreads(void)
 {
-  bool ok = true;
-
   app.iface->stop();
   if (app.state != APP_STATE_SHUTDOWN)
     app.state = APP_STATE_IDLE;
 
-  if (app.frameThread && !lgJoinThread(app.frameThread, NULL))
-  {
-    DEBUG_WARN("Failed to join the frame thread");
-    ok = false;
-  }
-  app.frameThread = NULL;
+  if (!app.iface->asyncCapture)
+    return true;
 
-  return ok;
+  if (app.frameThread)
+  {
+    if (!lgJoinThread(app.frameThread, NULL))
+    {
+      DEBUG_WARN("Failed to join the frame thread");
+      app.frameThread = NULL;
+      return false;
+    }
+    app.frameThread = NULL;
+  }
+
+  return true;
 }
 
 static bool captureStart(void)
@@ -266,15 +317,7 @@ static bool captureStart(void)
     }
   }
 
-  const unsigned int maxFrameSize = app.iface->getMaxFrameSize();
-  if (maxFrameSize > app.maxFrameSize)
-  {
-    DEBUG_ERROR("Maximum frame size of %d bytes excceds maximum space available", maxFrameSize);
-    return false;
-  }
-  DEBUG_INFO("Capture Size     : %u MiB (%u)", maxFrameSize / 1048576, maxFrameSize);
-
-  DEBUG_INFO("==== [ Capture  Start ] ====");
+  DEBUG_INFO("==== [ Capture Start ] ====");
   return true;
 }
 
@@ -293,35 +336,70 @@ static bool captureStop(void)
 
 bool captureGetPointerBuffer(void ** data, uint32_t * size)
 {
-  PLGMPMemory mem = app.pointerMemory[app.pointerIndex];
-  *data = ((uint8_t*)lgmpHostMemPtr(mem)) + sizeof(KVMFRCursor);
+  PLGMPMemory mem = app.pointerShapeMemory[app.pointerShapeIndex];
+  *data = (uint8_t*)lgmpHostMemPtr(mem) + sizeof(KVMFRCursor);
   *size = MAX_POINTER_SIZE - sizeof(KVMFRCursor);
   return true;
 }
 
-static void sendPointer(bool newClient)
+static void postPointer(uint32_t flags, PLGMPMemory mem)
 {
-  PLGMPMemory mem;
-  if (app.pointerInfo.shapeUpdate || newClient)
+  LGMP_STATUS status;
+  while ((status = lgmpHostQueuePost(app.pointerQueue, flags, mem)) != LGMP_OK)
   {
-    if (!newClient)
+    if (status == LGMP_ERR_QUEUE_FULL)
     {
-      // swap the latest shape buffer out of rotation
-      PLGMPMemory tmp  = app.pointerShape;
-      app.pointerShape = app.pointerMemory[app.pointerIndex];
-      app.pointerMemory[app.pointerIndex] = tmp;
+      usleep(1);
+      continue;
     }
 
-    // use the last known shape buffer
-    mem = app.pointerShape;
+    DEBUG_ERROR("lgmpHostQueuePost Failed (Pointer): %s", lgmpStatusString(status));
+    break;
   }
-  else
-    mem = app.pointerMemory[app.pointerIndex];
+}
 
-  if (++app.pointerIndex == POINTER_SHAPE_BUFFERS)
-    app.pointerIndex = 0;
+static void sendPointer(bool newClient)
+{
+  // new clients need the last known shape and current position
+  if (newClient)
+  {
+    PLGMPMemory mem;
+    if (app.pointerShapeValid)
+      mem = app.pointerShape;
+    else
+    {
+      mem = app.pointerMemory[app.pointerIndex];
+      if (++app.pointerIndex == LGMP_Q_POINTER_LEN)
+        app.pointerIndex = 0;
+    }
+
+    // update the saved details with the current cursor position
+    KVMFRCursor *cursor = lgmpHostMemPtr(mem);
+    cursor->x = app.pointerInfo.x;
+    cursor->y = app.pointerInfo.y;
+
+    const uint32_t flags = CURSOR_FLAG_POSITION |
+      (app.pointerShapeValid   ? CURSOR_FLAG_SHAPE   : 0) |
+      (app.pointerInfo.visible ? CURSOR_FLAG_VISIBLE : 0);
+
+    postPointer(flags, mem);
+    return;
+  }
 
   uint32_t flags = 0;
+  PLGMPMemory mem;
+  if (app.pointerInfo.shapeUpdate)
+  {
+    mem = app.pointerShapeMemory[app.pointerShapeIndex];
+    if (++app.pointerShapeIndex == POINTER_SHAPE_BUFFERS)
+      app.pointerShapeIndex = 0;
+  }
+  else
+  {
+    mem = app.pointerMemory[app.pointerIndex];
+    if (++app.pointerIndex == LGMP_Q_POINTER_LEN)
+      app.pointerIndex = 0;
+  }
   KVMFRCursor *cursor = lgmpHostMemPtr(mem);
 
   if (app.pointerInfo.positionUpdate || newClient)
@@ -353,23 +431,12 @@ static void sendPointer(bool newClient)
     }
 
     app.pointerShapeValid = true;
-  }
-
-  if ((app.pointerInfo.shapeUpdate || newClient) && app.pointerShapeValid)
     flags |= CURSOR_FLAG_SHAPE;
 
-  LGMP_STATUS status;
-  while ((status = lgmpHostQueuePost(app.pointerQueue, flags, mem)) != LGMP_OK)
-  {
-    if (status == LGMP_ERR_QUEUE_FULL)
-    {
-      usleep(1);
-      continue;
-    }
-
-    DEBUG_ERROR("lgmpHostQueuePost Failed (Pointer): %s", lgmpStatusString(status));
-    break;
+    app.pointerShape = mem;
   }
+
+  postPointer(flags, mem);
 }
 
 void capturePostPointerBuffer(CapturePointer pointer)
@@ -406,13 +473,15 @@ int app_main(int argc, char * argv[])
     if (CaptureInterfaces[i]->initOptions)
       CaptureInterfaces[i]->initOptions();
 
+  option_register(options);
+
   // try load values from a config file
   const char * dataPath = os_getDataPath();
   if (!dataPath)
   {
     option_free();
     DEBUG_ERROR("Failed to get the application's data path");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   const size_t len = strlen(dataPath) + sizeof(CONFIG_FILE) + 1;
@@ -429,18 +498,18 @@ int app_main(int argc, char * argv[])
   {
     option_free();
     DEBUG_ERROR("Failure to parse the command line");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   if (!option_validate())
   {
     option_free();
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   // perform platform specific initialization
   if (!app_init())
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
 
   DEBUG_INFO("Looking Glass Host (%s)", BUILD_VERSION);
 
@@ -448,13 +517,13 @@ int app_main(int argc, char * argv[])
   if (!ivshmemInit(&shmDev))
   {
     DEBUG_ERROR("Failed to find the IVSHMEM device");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   if (!ivshmemOpen(&shmDev))
   {
     DEBUG_ERROR("Failed to open the IVSHMEM device");
-    return LG_HOST_EXIT_FAILED;
+    return LG_HOST_EXIT_FATAL;
   }
 
   int exitcode  = 0;
@@ -474,63 +543,74 @@ int app_main(int argc, char * argv[])
           sizeof(udata), (uint8_t *)&udata)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostInit Failed: %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_ivshmem;
   }
 
   if ((status = lgmpHostQueueNew(app.lgmp, FRAME_QUEUE_CONFIG, &app.frameQueue)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostQueueCreate Failed (Frame): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_lgmp;
   }
 
   if ((status = lgmpHostQueueNew(app.lgmp, POINTER_QUEUE_CONFIG, &app.pointerQueue)) != LGMP_OK)
   {
     DEBUG_ERROR("lgmpHostQueueNew Failed (Pointer): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
+    exitcode = LG_HOST_EXIT_FATAL;
     goto fail_lgmp;
+  }
+
+  for(int i = 0; i < LGMP_Q_POINTER_LEN; ++i)
+  {
+    if ((status = lgmpHostMemAlloc(app.lgmp, sizeof(KVMFRCursor), &app.pointerMemory[i])) != LGMP_OK)
+    {
+      DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer): %s", lgmpStatusString(status));
+      exitcode = LG_HOST_EXIT_FATAL;
+      goto fail_lgmp;
+    }
+    memset(lgmpHostMemPtr(app.pointerMemory[i]), 0, sizeof(KVMFRCursor));
   }
 
   for(int i = 0; i < POINTER_SHAPE_BUFFERS; ++i)
   {
-    if ((status = lgmpHostMemAlloc(app.lgmp, MAX_POINTER_SIZE, &app.pointerMemory[i])) != LGMP_OK)
+    if ((status = lgmpHostMemAlloc(app.lgmp, MAX_POINTER_SIZE, &app.pointerShapeMemory[i])) != LGMP_OK)
     {
-      DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer): %s", lgmpStatusString(status));
-      exitcode = LG_HOST_EXIT_FAILED;
+      DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer Shapes): %s", lgmpStatusString(status));
+      exitcode = LG_HOST_EXIT_FATAL;
       goto fail_lgmp;
     }
-    memset(lgmpHostMemPtr(app.pointerMemory[i]), 0, MAX_POINTER_SIZE);
+    memset(lgmpHostMemPtr(app.pointerShapeMemory[i]), 0, MAX_POINTER_SIZE);
   }
 
+  app.pageSize          = sysinfo_getPageSize();
+  app.frameValid        = false;
   app.pointerShapeValid = false;
-  if ((status = lgmpHostMemAlloc(app.lgmp, MAX_POINTER_SIZE, &app.pointerShape)) != LGMP_OK)
-  {
-    DEBUG_ERROR("lgmpHostMemAlloc Failed (Pointer Shape): %s", lgmpStatusString(status));
-    exitcode = LG_HOST_EXIT_FAILED;
-    goto fail_lgmp;
-  }
 
-  const long sz = sysinfo_getPageSize();
   app.maxFrameSize = lgmpHostMemAvail(app.lgmp);
-  app.maxFrameSize = (app.maxFrameSize - (sz - 1)) & ~(sz - 1);
+  app.maxFrameSize = (app.maxFrameSize - (app.pageSize - 1)) & ~(app.pageSize - 1);
   app.maxFrameSize /= LGMP_Q_FRAME_LEN;
   DEBUG_INFO("Max Frame Size   : %u MiB", (unsigned int)(app.maxFrameSize / 1048576LL));
 
   for(int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
   {
-    if ((status = lgmpHostMemAllocAligned(app.lgmp, app.maxFrameSize, sz, &app.frameMemory[i])) != LGMP_OK)
+    if ((status = lgmpHostMemAllocAligned(app.lgmp, app.maxFrameSize,
+            app.pageSize, &app.frameMemory[i])) != LGMP_OK)
     {
       DEBUG_ERROR("lgmpHostMemAlloc Failed (Frame): %s", lgmpStatusString(status));
-      exitcode = LG_HOST_EXIT_FAILED;
+      exitcode = LG_HOST_EXIT_FATAL;
       goto fail_lgmp;
     }
   }
 
+  const char * ifaceName = option_get_string("app", "capture");
   CaptureInterface * iface = NULL;
   for(int i = 0; CaptureInterfaces[i]; ++i)
   {
     iface = CaptureInterfaces[i];
+    if (*ifaceName && strcasecmp(ifaceName, iface->shortName))
+      continue;
+
     DEBUG_INFO("Trying           : %s", iface->getName());
 
     if (!iface->create(captureGetPointerBuffer, capturePostPointerBuffer))
@@ -548,12 +628,17 @@ int app_main(int argc, char * argv[])
 
   if (!iface)
   {
-    DEBUG_ERROR("Failed to find a supported capture interface");
+    if (*ifaceName)
+      DEBUG_ERROR("Specified capture interface not supported");
+    else
+      DEBUG_ERROR("Failed to find a supported capture interface");
     exitcode = LG_HOST_EXIT_FAILED;
     goto fail_lgmp;
   }
 
   DEBUG_INFO("Using            : %s", iface->getName());
+  DEBUG_INFO("Capture Method   : %s", iface->asyncCapture ?
+      "Asynchronous" : "Synchronous");
 
   app.state = APP_STATE_RUNNING;
   app.iface = iface;
@@ -565,8 +650,6 @@ int app_main(int argc, char * argv[])
     DEBUG_ERROR("Failed to create the LGMP timer");
 
     iface->deinit();
-    iface->free();
-
     goto fail_timer;
   }
 
@@ -650,6 +733,9 @@ int app_main(int argc, char * argv[])
           exitcode = LG_HOST_EXIT_FAILED;
           goto fail_capture;
       }
+
+      if (!iface->asyncCapture)
+        sendFrame();
     }
 
     if (app.state != APP_STATE_SHUTDOWN)
@@ -684,14 +770,16 @@ fail_capture:
   lgTimerDestroy(app.lgmpTimer);
 
 fail_timer:
+  iface->free();
   LG_LOCK_FREE(app.pointerLock);
 
 fail_lgmp:
   for(int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
     lgmpHostMemFree(&app.frameMemory[i]);
-  for(int i = 0; i < POINTER_SHAPE_BUFFERS; ++i)
+  for(int i = 0; i < LGMP_Q_POINTER_LEN; ++i)
     lgmpHostMemFree(&app.pointerMemory[i]);
-  lgmpHostMemFree(&app.pointerShape);
+  for(int i = 0; i < POINTER_SHAPE_BUFFERS; ++i)
+    lgmpHostMemFree(&app.pointerShapeMemory[i]);
   lgmpHostFree(&app.lgmp);
 
 fail_ivshmem:

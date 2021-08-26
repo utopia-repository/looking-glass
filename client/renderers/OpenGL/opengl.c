@@ -1,30 +1,30 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/renderer.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <unistd.h>
 #include <malloc.h>
 #include <math.h>
-
-#include <SDL2/SDL_ttf.h>
 
 #include <GL/gl.h>
 #include <GL/glx.h>
@@ -80,6 +80,20 @@ static struct Option opengl_options[] =
   {0}
 };
 
+struct IntPoint
+{
+  int x;
+  int y;
+};
+
+struct IntRect
+{
+  int x;
+  int y;
+  int w;
+  int h;
+};
+
 struct OpenGL_Options
 {
   bool mipmap;
@@ -108,10 +122,11 @@ struct Inst
   bool              renderStarted;
   bool              configured;
   bool              reconfigure;
-  SDL_GLContext     glContext;
+  LG_DSGLContext    glContext;
 
-  SDL_Point         window;
-  bool              frameUpdate;
+  struct IntPoint   window;
+  float             uiScale;
+  _Atomic(bool)     frameUpdate;
 
   const LG_Font   * font;
   LG_FontObj        fontObj, alertFontObj;
@@ -129,9 +144,9 @@ struct Inst
   bool              hasBuffers;
   GLuint            vboID[BUFFER_COUNT];
   uint8_t         * texPixels[BUFFER_COUNT];
-  LG_Lock           syncLock;
+  LG_Lock           frameLock;
   bool              texReady;
-  int               texIndex;
+  int               texWIndex, texRIndex;
   int               texList;
   int               fpsList;
   int               mouseList;
@@ -148,8 +163,9 @@ struct Inst
   uint64_t          waitFadeTime;
   bool              waitDone;
 
+  bool              showFPS;
   bool              fpsTexture;
-  SDL_Rect          fpsRect;
+  struct IntRect    fpsRect;
 
   LG_Lock           mouseLock;
   LG_RendererCursor mouseCursor;
@@ -163,7 +179,7 @@ struct Inst
   bool              newShape;
   LG_RendererCursor mouseType;
   bool              mouseVisible;
-  SDL_Rect          mousePos;
+  struct IntRect    mousePos;
 };
 
 static bool _check_gl_error(unsigned int line, const char * name);
@@ -177,7 +193,7 @@ enum ConfigStatus
 };
 
 static void deconfigure(struct Inst * this);
-static enum ConfigStatus configure(struct Inst * this, SDL_Window *window);
+static enum ConfigStatus configure(struct Inst * this);
 static void update_mouse_shape(struct Inst * this, bool * newShape);
 static bool draw_frame(struct Inst * this);
 static void draw_mouse(struct Inst * this);
@@ -193,7 +209,8 @@ static void opengl_setup(void)
   option_register(opengl_options);
 }
 
-bool opengl_create(void ** opaque, const LG_RendererParams params)
+bool opengl_create(void ** opaque, const LG_RendererParams params,
+    bool * needsOpenGL)
 {
   // create our local storage
   *opaque = malloc(sizeof(struct Inst));
@@ -214,7 +231,7 @@ bool opengl_create(void ** opaque, const LG_RendererParams params)
 
 
   LG_LOCK_INIT(this->formatLock);
-  LG_LOCK_INIT(this->syncLock  );
+  LG_LOCK_INIT(this->frameLock );
   LG_LOCK_INIT(this->mouseLock );
 
   this->font = LG_Fonts[0];
@@ -232,10 +249,11 @@ bool opengl_create(void ** opaque, const LG_RendererParams params)
 
   this->alerts = ll_new();
 
+  *needsOpenGL = true;
   return true;
 }
 
-bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
+bool opengl_initialize(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
@@ -243,14 +261,6 @@ bool opengl_initialize(void * opaque, Uint32 * sdlFlags)
 
   this->waiting  = true;
   this->waitDone = false;
-
-  *sdlFlags = SDL_WINDOW_OPENGL;
-  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER      , 1);
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
-  SDL_GL_SetAttribute(SDL_GL_RED_SIZE          , 8);
-  SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE        , 8);
-  SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE         , 8);
   return true;
 }
 
@@ -269,17 +279,24 @@ void opengl_deinitialize(void * opaque)
   }
 
   deconfigure(this);
+
+  if (this->hasTextures)
+  {
+    glDeleteTextures(TEXTURE_COUNT, this->textures);
+    this->hasTextures = false;
+  }
+
   if (this->mouseData)
     free(this->mouseData);
 
   if (this->glContext)
   {
-    SDL_GL_DeleteContext(this->glContext);
+    app_glDeleteContext(this->glContext);
     this->glContext = NULL;
   }
 
   LG_LOCK_FREE(this->formatLock);
-  LG_LOCK_FREE(this->syncLock  );
+  LG_LOCK_FREE(this->frameLock );
   LG_LOCK_FREE(this->mouseLock );
 
   struct Alert * alert;
@@ -303,16 +320,23 @@ void opengl_on_restart(void * opaque)
   this->waiting = true;
 }
 
-void opengl_on_resize(void * opaque, const int width, const int height,
+void opengl_on_resize(void * opaque, const int width, const int height, const double scale,
     const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  this->window.x = width;
-  this->window.y = height;
+  this->window.x = width * scale;
+  this->window.y = height * scale;
+  this->uiScale  = (float) scale;
 
   if (destRect.valid)
-    memcpy(&this->destRect, &destRect, sizeof(LG_RendererRect));
+  {
+    this->destRect.valid = true;
+    this->destRect.x = destRect.x * scale;
+    this->destRect.y = destRect.y * scale;
+    this->destRect.w = destRect.w * scale;
+    this->destRect.h = destRect.h * scale;
+  }
 
   // setup the projection matrix
   glViewport(0, 0, this->window.x, this->window.y);
@@ -394,10 +418,10 @@ bool opengl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  LG_LOCK(this->syncLock);
-  this->frame       = frame;
-  this->frameUpdate = true;
-  LG_UNLOCK(this->syncLock);
+  LG_LOCK(this->frameLock);
+  this->frame = frame;
+  atomic_store_explicit(&this->frameUpdate, true, memory_order_release);
+  LG_UNLOCK(this->frameLock);
 
   if (this->waiting)
   {
@@ -453,7 +477,7 @@ void opengl_on_alert(void * opaque, const LG_MsgAlert alert, const char * messag
 
   if (!(a->text = this->font->render(this->alertFontObj, 0xffffff00, message)))
   {
-    DEBUG_ERROR("Failed to render alert text: %s", TTF_GetError());
+    DEBUG_ERROR("Failed to render alert text");
     free(a);
     return;
   }
@@ -465,6 +489,17 @@ void opengl_on_alert(void * opaque, const LG_MsgAlert alert, const char * messag
   }
 
   ll_push(this->alerts, a);
+}
+
+void opengl_on_help(void * opaque, const char * message)
+{
+  // TODO: Implement this.
+}
+
+void opengl_on_show_fps(void * opaque, bool showFPS)
+{
+  struct Inst * this = (struct Inst *)opaque;
+  this->showFPS = showFPS;
 }
 
 void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
@@ -492,16 +527,15 @@ void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
   glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-bool opengl_render_startup(void * opaque, SDL_Window * window)
+bool opengl_render_startup(void * opaque)
 {
   struct Inst * this = (struct Inst *)opaque;
 
-  this->glContext = SDL_GL_CreateContext(window);
+  this->glContext = app_glCreateContext();
   if (!this->glContext)
-  {
-    DEBUG_ERROR("Failed to create the OpenGL context");
     return false;
-  }
+
+  app_glMakeCurrent(this->glContext);
 
   DEBUG_INFO("Vendor  : %s", glGetString(GL_VENDOR  ));
   DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
@@ -546,18 +580,18 @@ bool opengl_render_startup(void * opaque, SDL_Window * window)
   }
   this->hasTextures = true;
 
-  SDL_GL_SetSwapInterval(this->opt.vsync ? 1 : 0);
+  app_glSetSwapInterval(this->opt.vsync ? 1 : 0);
   this->renderStarted = true;
   return true;
 }
 
-bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
+bool opengl_render(void * opaque, LG_RendererRotate rotate)
 {
   struct Inst * this = (struct Inst *)opaque;
   if (!this)
     return false;
 
-  switch(configure(this, window))
+  switch(configure(this))
   {
     case CONFIG_STATUS_ERROR:
       DEBUG_ERROR("configure failed");
@@ -565,8 +599,8 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 
     case CONFIG_STATUS_NOOP :
     case CONFIG_STATUS_OK   :
-     if (!draw_frame(this))
-       return false;
+      if (!draw_frame(this))
+        return false;
   }
 
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -578,14 +612,14 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
   {
     bool newShape;
     update_mouse_shape(this, &newShape);
-    glCallList(this->texList + this->texIndex);
+    glCallList(this->texList + this->texRIndex);
     draw_mouse(this);
 
     if (!this->waitDone)
       render_wait(this);
   }
 
-  if (this->fpsTexture)
+  if (this->showFPS && this->fpsTexture)
     glCallList(this->fpsList);
 
   struct Alert * alert;
@@ -650,6 +684,7 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
     glPushMatrix();
       glLoadIdentity();
       glTranslatef(this->window.x / 2, this->window.y / 2, 0.0f);
+      glScalef(this->uiScale, this->uiScale, 1.0f);
       glCallList(this->alertList);
     glPopMatrix();
     break;
@@ -657,11 +692,11 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 
   if (this->opt.preventBuffer)
   {
-    SDL_GL_SwapWindow(window);
+    app_glSwapBuffers();
     glFinish();
   }
   else
-    SDL_GL_SwapWindow(window);
+    app_glSwapBuffers();
 
   this->mouseUpdate = false;
   return true;
@@ -670,7 +705,7 @@ bool opengl_render(void * opaque, SDL_Window * window, LG_RendererRotate rotate)
 void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
 {
   struct Inst * this = (struct Inst *)opaque;
-  if (!this->params.showFPS)
+  if (!this->showFPS)
     return;
 
   char str[128];
@@ -692,9 +727,6 @@ void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
   this->fpsTexture  = true;
 
   glNewList(this->fpsList, GL_COMPILE);
-    glPushMatrix();
-    glLoadIdentity();
-
     glEnable(GL_BLEND);
     glDisable(GL_TEXTURE_2D);
     glColor4f(0.0f, 0.0f, 1.0f, 0.5f);
@@ -716,8 +748,6 @@ void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
     glEnd();
     glBindTexture(GL_TEXTURE_2D, 0);
     glDisable(GL_BLEND);
-
-    glPopMatrix();
   glEndList();
 }
 
@@ -830,6 +860,8 @@ const LG_Renderer LGR_OpenGL =
   .on_frame_format = opengl_on_frame_format,
   .on_frame        = opengl_on_frame,
   .on_alert        = opengl_on_alert,
+  .on_help         = opengl_on_help,
+  .on_show_fps     = opengl_on_show_fps,
   .render_startup  = opengl_render_startup,
   .render          = opengl_render,
   .update_fps      = opengl_update_fps
@@ -879,7 +911,7 @@ static bool _check_gl_error(unsigned int line, const char * name)
   return true;
 }
 
-static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
+static enum ConfigStatus configure(struct Inst * this)
 {
   LG_LOCK(this->formatLock);
   if (!this->reconfigure)
@@ -888,8 +920,7 @@ static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
     return CONFIG_STATUS_NOOP;
   }
 
-  if (this->configured)
-    deconfigure(this);
+  deconfigure(this);
 
   switch(this->format.type)
   {
@@ -1048,8 +1079,8 @@ static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
         glTexCoord2f(1.0f, 0.0f); glVertex2i(this->format.width, 0                  );
         glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , this->format.height);
         glTexCoord2f(1.0f, 1.0f); glVertex2i(this->format.width, this->format.height);
-     glEnd();
-     glBindTexture(GL_TEXTURE_2D, 0);
+      glEnd();
+      glBindTexture(GL_TEXTURE_2D, 0);
     glEndList();
   }
 
@@ -1066,15 +1097,6 @@ static enum ConfigStatus configure(struct Inst * this, SDL_Window *window)
 
 static void deconfigure(struct Inst * this)
 {
-  if (!this->configured)
-    return;
-
-  if (this->hasTextures)
-  {
-    glDeleteTextures(TEXTURE_COUNT, this->textures);
-    this->hasTextures = false;
-  }
-
   if (this->hasFrames)
   {
     glDeleteTextures(BUFFER_COUNT, this->frames);
@@ -1272,23 +1294,9 @@ static bool opengl_buffer_fn(void * opaque, const void * data, size_t size)
 
 static bool draw_frame(struct Inst * this)
 {
-  LG_LOCK(this->syncLock);
-  if (!this->frameUpdate)
+  if (glIsSync(this->fences[this->texWIndex]))
   {
-    LG_UNLOCK(this->syncLock);
-    return true;
-  }
-
-  if (++this->texIndex == BUFFER_COUNT)
-    this->texIndex = 0;
-
-  this->frameUpdate = false;
-  LG_UNLOCK(this->syncLock);
-
-  LG_LOCK(this->formatLock);
-  if (glIsSync(this->fences[this->texIndex]))
-  {
-    switch(glClientWaitSync(this->fences[this->texIndex], 0, GL_TIMEOUT_IGNORED))
+    switch(glClientWaitSync(this->fences[this->texWIndex], 0, GL_TIMEOUT_IGNORED))
     {
       case GL_ALREADY_SIGNALED:
         break;
@@ -1306,12 +1314,24 @@ static bool draw_frame(struct Inst * this)
         break;
     }
 
-    glDeleteSync(this->fences[this->texIndex]);
-    this->fences[this->texIndex] = NULL;
+    glDeleteSync(this->fences[this->texWIndex]);
+    this->fences[this->texWIndex] = NULL;
+
+    this->texRIndex = this->texWIndex;
+    if (++this->texWIndex == BUFFER_COUNT)
+      this->texWIndex = 0;
   }
 
-  glBindTexture(GL_TEXTURE_2D, this->frames[this->texIndex]);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[this->texIndex]);
+  LG_LOCK(this->frameLock);
+  if (!atomic_exchange_explicit(&this->frameUpdate, false, memory_order_acquire))
+  {
+    LG_UNLOCK(this->frameLock);
+    return true;
+  }
+
+  LG_LOCK(this->formatLock);
+  glBindTexture(GL_TEXTURE_2D, this->frames[this->texWIndex]);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[this->texWIndex]);
 
   const int bpp = this->format.bpp / 8;
   glPixelStorei(GL_UNPACK_ALIGNMENT , bpp);
@@ -1329,6 +1349,8 @@ static bool draw_frame(struct Inst * this)
     this
   );
 
+  LG_UNLOCK(this->frameLock);
+
   // update the texture
   glTexSubImage2D(
     GL_TEXTURE_2D,
@@ -1343,14 +1365,10 @@ static bool draw_frame(struct Inst * this)
   );
   if (check_gl_error("glTexSubImage2D"))
   {
-    DEBUG_ERROR("texIndex: %u, width: %u, height: %u, vboFormat: %x, texSize: %lu",
-      this->texIndex, this->format.width, this->format.height, this->vboFormat, this->texSize
+    DEBUG_ERROR("texWIndex: %u, width: %u, height: %u, vboFormat: %x, texSize: %lu",
+      this->texWIndex, this->format.width, this->format.height, this->vboFormat, this->texSize
     );
   }
-
-  // set a fence so we don't overwrite a buffer in use
-  this->fences[this->texIndex] =
-    glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
   // unbind the buffer
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -1359,7 +1377,6 @@ static bool draw_frame(struct Inst * this)
     (this->format.width  > this->destRect.w) ||
     (this->format.height > this->destRect.h));
 
-  glBindTexture(GL_TEXTURE_2D, this->frames[this->texIndex]);
   if (mipmap)
   {
     glGenerateMipmap(GL_TEXTURE_2D);
@@ -1372,6 +1389,11 @@ static bool draw_frame(struct Inst * this)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   }
   glBindTexture(GL_TEXTURE_2D, 0);
+
+  // set a fence so we don't overwrite a buffer in use
+  this->fences[this->texWIndex] =
+    glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  glFlush();
 
   LG_UNLOCK(this->formatLock);
   this->texReady = true;

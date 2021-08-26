@@ -1,21 +1,22 @@
-/*
-KVMGFX Client - A KVM Client for VGA Passthrough
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "common/option.h"
 #include "common/debug.h"
@@ -37,7 +38,7 @@ struct OptionGroup
 
 struct State
 {
-  bool                 doHelp;
+  enum doHelpMode      doHelp;
   struct Option     ** options;
   int                  oCount;
   struct OptionGroup * groups;
@@ -46,7 +47,7 @@ struct State
 
 static struct State state =
 {
-  .doHelp  = false,
+  .doHelp  = DOHELP_MODE_NO,
   .options = NULL,
   .oCount  = 0,
   .groups  = NULL,
@@ -258,7 +259,13 @@ bool option_parse(int argc, char * argv[])
     {
       if (strcmp(argv[a], "-h") == 0 || strcmp(argv[a], "--help") == 0)
       {
-        state.doHelp = true;
+        state.doHelp = DOHELP_MODE_YES;
+        continue;
+      }
+
+      if (strcmp(argv[a], "--rst-help") == 0)
+      {
+        state.doHelp = DOHELP_MODE_RST;
         continue;
       }
 
@@ -363,6 +370,29 @@ static char * file_parse_module(FILE * fp)
   return NULL;
 }
 
+static bool process_option_line(const char * module, const char * name,
+    char * value, int valueLen, int lineno)
+{
+  if (!module)
+  {
+    DEBUG_ERROR("Syntax error on line %d, module not specified for option", lineno);
+    return false;
+  }
+
+  struct Option * o = option_get(module, name);
+  if (!o)
+    DEBUG_WARN("Ignored unknown option %s:%s", module, name);
+  else
+  {
+    if (value)
+      value[valueLen] = '\0';
+
+    if (!option_set(o, value))
+      DEBUG_ERROR("Failed to set the option value");
+  }
+  return true;
+}
+
 bool option_load(const char * filename)
 {
   FILE * fp = fopen(filename, "r");
@@ -424,26 +454,10 @@ bool option_load(const char * filename)
         continue;
 
       case '\n':
-        if (name)
+        if (name && !process_option_line(module, name, value, valueLen, lineno))
         {
-          if (!module)
-          {
-            DEBUG_ERROR("Syntax error on line %d, module not specified for option", lineno);
-            result = false;
-            goto exit;
-          }
-
-          struct Option * o = option_get(module, name);
-          if (!o)
-            DEBUG_WARN("Ignored unknown option %s:%s", module, name);
-          else
-          {
-            if (value)
-              value[valueLen] = '\0';
-
-            if (!option_set(o, value))
-              DEBUG_ERROR("Failed to set the option value");
-          }
+          result = false;
+          goto exit;
         }
 
         line        = true;
@@ -497,6 +511,10 @@ bool option_load(const char * filename)
         // fallthrough
 
       default:
+        // ignore non-typeable ascii characters
+        if (c < 32 || c > 126)
+          continue;
+
         if (expectLine)
         {
           DEBUG_ERROR("Syntax error on line %d, expected new line", lineno);
@@ -516,6 +534,9 @@ bool option_load(const char * filename)
     }
   }
 
+  if (name && !process_option_line(module, name, value, valueLen, lineno))
+    result = false;
+
 exit:
   fclose(fp);
 
@@ -528,7 +549,7 @@ exit:
 
 bool option_validate(void)
 {
-  if (state.doHelp)
+  if (state.doHelp != DOHELP_MODE_NO)
   {
     option_print();
     return false;
@@ -577,6 +598,24 @@ bool option_validate(void)
   return ok;
 }
 
+void option_print_hrule(char * headerLine, int maxLen, char ruleChar)
+{
+  printf("  +%c", ruleChar);
+  for (int i = 0; i < maxLen; i++)
+  {
+    if(i < strlen(headerLine))
+    {
+      if (headerLine[i] == '|')
+      {
+        putc('+', stdout);
+        continue;
+      }
+    }
+    putc(ruleChar, stdout);
+  }
+  printf("%c+\n", ruleChar);
+}
+
 void option_print(void)
 {
   printf(
@@ -591,6 +630,7 @@ void option_print(void)
     int maxLen;
     int valueLen = 5;
     char * line;
+    char * headerLine;
 
     // ensure the pad length is atleast as wide as the heading
     if (state.groups[g].pad < 4)
@@ -626,6 +666,7 @@ void option_print(void)
     );
 
     assert(maxLen > 0);
+    headerLine = line;
     stringlist_push(lines, line);
 
     for(int i = 0; i < state.groups[g].count; ++i)
@@ -659,11 +700,7 @@ void option_print(void)
     {
       if (i == 0)
       {
-        // print a horizontal rule
-        printf("  |");
-        for(int i = 0; i < maxLen + 2; ++i)
-          putc('-', stdout);
-        printf("|\n");
+        option_print_hrule(headerLine, maxLen, '-');
       }
 
       char * line = stringlist_at(lines, i);
@@ -671,19 +708,15 @@ void option_print(void)
 
       if (i == 0)
       {
-        // print a horizontal rule
-        printf("  |");
-        for(int i = 0; i < maxLen + 2; ++i)
-          putc('-', stdout);
-        printf("|\n");
+        option_print_hrule(headerLine, maxLen, state.doHelp == DOHELP_MODE_RST ? '=' : '-');
+      }
+      else if (state.doHelp == DOHELP_MODE_RST && i < stringlist_count(lines) - 1)
+      {
+        option_print_hrule(headerLine, maxLen, '-');
       }
     }
 
-    // print a horizontal rule
-    printf("  |");
-    for(int i = 0; i < maxLen + 2; ++i)
-      putc('-', stdout);
-    printf("|\n");
+    option_print_hrule(headerLine, maxLen, '-');
 
     stringlist_free(&lines);
 

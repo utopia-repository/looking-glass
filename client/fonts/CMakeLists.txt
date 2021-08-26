@@ -19,7 +19,7 @@ function(add_font name)
 endfunction()
 
 # Add/remove fonts here!
-add_font(SDL)
+add_font(freetype)
 
 list(REMOVE_AT FONTS      0)
 list(REMOVE_AT FONTS_LINK 0)

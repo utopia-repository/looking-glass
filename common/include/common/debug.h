@@ -1,29 +1,55 @@
-/*
-KVMGFX Client - A KVM Client for VGA Passthrough
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+#ifndef _H_LG_COMMON_DEBUG_
+#define _H_LG_COMMON_DEBUG_
 
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
 #endif
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
 #include "time.h"
+
+enum DebugLevel
+{
+  DEBUG_LEVEL_NONE,
+  DEBUG_LEVEL_INFO,
+  DEBUG_LEVEL_WARN,
+  DEBUG_LEVEL_ERROR,
+  DEBUG_LEVEL_FIXME,
+  DEBUG_LEVEL_FATAL
+};
+
+extern const char ** debug_lookup;
+
+void debug_init(void);
+
+#ifdef ENABLE_BACKTRACE
+void printBacktrace(void);
+#define DEBUG_PRINT_BACKTRACE() printBacktrace()
+#else
+#define DEBUG_PRINT_BACKTRACE()
+#endif
 
 #if defined(_WIN32) && !defined(__GNUC__)
   #define DIRECTORY_SEPARATOR '\\'
@@ -53,16 +79,28 @@ Place, Suite 330, Boston, MA 02111-1307 USA
   sizeof(s) > 20 && (s)[sizeof(s)-21] == DIRECTORY_SEPARATOR ? (s) + sizeof(s) - 20 : \
   sizeof(s) > 21 && (s)[sizeof(s)-22] == DIRECTORY_SEPARATOR ? (s) + sizeof(s) - 21 : (s))
 
-#define DEBUG_PRINT(type, fmt, ...) do {fprintf(stderr, "%12" PRId64 " " type " %20s:%-4u | %-30s | " fmt "\n", microtime(), STRIPPATH(__FILE__), __LINE__, __FUNCTION__, ##__VA_ARGS__);} while (0)
+#define DEBUG_PRINT(level, fmt, ...) do { \
+  fprintf(stderr, "%s%12" PRId64 "%20s:%-4u | %-30s | " fmt "%s\n", \
+      debug_lookup[level], microtime(), STRIPPATH(__FILE__), \
+      __LINE__, __FUNCTION__, ##__VA_ARGS__, debug_lookup[DEBUG_LEVEL_NONE]); \
+} while (0)
 
-#define DEBUG_BREAK() DEBUG_PRINT("[ ]", "%s", "================================================================================")
-#define DEBUG_INFO(fmt, ...) DEBUG_PRINT("[I]", fmt, ##__VA_ARGS__)
-#define DEBUG_WARN(fmt, ...) DEBUG_PRINT("[W]", fmt, ##__VA_ARGS__)
-#define DEBUG_ERROR(fmt, ...) DEBUG_PRINT("[E]", fmt, ##__VA_ARGS__)
-#define DEBUG_FIXME(fmt, ...) DEBUG_PRINT("[F]", fmt, ##__VA_ARGS__)
+#define DEBUG_BREAK() DEBUG_PRINT(DEBUG_LEVEL_INFO, "================================================================================")
+#define DEBUG_INFO(fmt, ...) DEBUG_PRINT(DEBUG_LEVEL_INFO, fmt, ##__VA_ARGS__)
+#define DEBUG_WARN(fmt, ...) DEBUG_PRINT(DEBUG_LEVEL_WARN, fmt, ##__VA_ARGS__)
+#define DEBUG_ERROR(fmt, ...) DEBUG_PRINT(DEBUG_LEVEL_ERROR, fmt, ##__VA_ARGS__)
+#define DEBUG_FIXME(fmt, ...) DEBUG_PRINT(DEBUG_LEVEL_FIXME, fmt, ##__VA_ARGS__)
+#define DEBUG_FATAL(fmt, ...) do { \
+  DEBUG_BREAK(); \
+  DEBUG_PRINT(DEBUG_LEVEL_FATAL, fmt, ##__VA_ARGS__); \
+  DEBUG_PRINT_BACKTRACE(); \
+  abort(); \
+} while(0)
 
 #if defined(DEBUG_SPICE) | defined(DEBUG_IVSHMEM)
   #define DEBUG_PROTO(fmt, args...) DEBUG_PRINT("[P]", fmt, ##args)
 #else
   #define DEBUG_PROTO(fmt, ...) do {} while(0)
+#endif
+
 #endif

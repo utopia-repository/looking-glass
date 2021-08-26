@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/capture.h"
 #include "interface/platform.h"
@@ -53,7 +54,6 @@ struct xcb * this = NULL;
 // forwards
 
 static bool xcb_deinit();
-static unsigned int xcb_getMaxFrameSize();
 
 // implementation
 
@@ -108,7 +108,8 @@ static bool xcb_init(void)
   DEBUG_INFO("Frame Size       : %u x %u", this->width, this->height);
 
   this->seg   = xcb_generate_id(this->xcb);
-  this->shmID = shmget(IPC_PRIVATE, xcb_getMaxFrameSize(), IPC_CREAT | 0777);
+  const size_t maxFrameSize = this->width * this->height * 4;
+  this->shmID = shmget(IPC_PRIVATE, maxFrameSize, IPC_CREAT | 0777);
   if (this->shmID == -1)
   {
     DEBUG_ERROR("shmget failed");
@@ -164,11 +165,6 @@ static void xcb_free(void)
   this = NULL;
 }
 
-static unsigned int xcb_getMaxFrameSize(void)
-{
-  return this->width * this->height * 4;
-}
-
 static unsigned int xcb_getMouseScale(void)
 {
   return 100;
@@ -199,21 +195,25 @@ static CaptureResult xcb_capture(void)
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult xcb_waitFrame(CaptureFrame * frame)
+static CaptureResult xcb_waitFrame(CaptureFrame * frame,
+    const size_t maxFrameSize)
 {
   lgWaitEvent(this->frameEvent, TIMEOUT_INFINITE);
 
-  frame->width    = this->width;
-  frame->height   = this->height;
-  frame->pitch    = this->width * 4;
-  frame->stride   = this->width;
-  frame->format   = CAPTURE_FMT_BGRA;
-  frame->rotation = CAPTURE_ROT_0;
+  const unsigned int maxHeight = maxFrameSize / (this->width * 4);
+
+  frame->width      = this->width;
+  frame->height     = maxHeight > this->height ? this->height : maxHeight;
+  frame->realHeight = this->height;
+  frame->pitch      = this->width * 4;
+  frame->stride     = this->width;
+  frame->format     = CAPTURE_FMT_BGRA;
+  frame->rotation   = CAPTURE_ROT_0;
 
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult xcb_getFrame(FrameBuffer * frame)
+static CaptureResult xcb_getFrame(FrameBuffer * frame, const unsigned int height)
 {
   assert(this);
   assert(this->initialized);
@@ -226,7 +226,7 @@ static CaptureResult xcb_getFrame(FrameBuffer * frame)
     return CAPTURE_RESULT_ERROR;
   }
 
-  framebuffer_write(frame, this->data, this->width * this->height * 4);
+  framebuffer_write(frame, this->data, this->width * height * 4);
   free(img);
 
   this->hasFrame = false;
@@ -235,12 +235,13 @@ static CaptureResult xcb_getFrame(FrameBuffer * frame)
 
 struct CaptureInterface Capture_XCB =
 {
+  .shortName       = "XCB",
+  .asyncCapture    = true,
   .getName         = xcb_getName,
   .create          = xcb_create,
   .init            = xcb_init,
   .deinit          = xcb_deinit,
   .free            = xcb_free,
-  .getMaxFrameSize = xcb_getMaxFrameSize,
   .getMouseScale   = xcb_getMouseScale,
   .capture         = xcb_capture,
   .waitFrame       = xcb_waitFrame,

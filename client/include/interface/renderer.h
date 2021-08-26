@@ -1,28 +1,26 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
-
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
 
 #include "app.h"
 #include "common/KVMFR.h"
@@ -38,6 +36,8 @@ Place, Suite 330, Boston, MA 02111-1307 USA
    (x)->on_mouse_shape && \
    (x)->on_mouse_event && \
    (x)->on_alert       && \
+   (x)->on_help        && \
+   (x)->on_show_fps    && \
    (x)->render_startup && \
    (x)->render         && \
    (x)->update_fps)
@@ -46,7 +46,6 @@ typedef struct LG_RendererParams
 {
 //  TTF_Font * font;
 //  TTF_Font * alertFont;
-  bool       showFPS;
   bool       quickSplash;
 }
 LG_RendererParams;
@@ -106,19 +105,21 @@ typedef const char * (* LG_RendererGetName)();
 // called pre-creation to allow the renderer to register any options it might have
 typedef void         (* LG_RendererSetup)();
 
-typedef bool         (* LG_RendererCreate       )(void ** opaque, const LG_RendererParams params);
-typedef bool         (* LG_RendererInitialize   )(void * opaque, Uint32 * sdlFlags);
+typedef bool         (* LG_RendererCreate       )(void ** opaque, const LG_RendererParams params, bool * needsOpenGL);
+typedef bool         (* LG_RendererInitialize   )(void * opaque);
 typedef void         (* LG_RendererDeInitialize )(void * opaque);
 typedef bool         (* LG_RendererSupports     )(void * opaque, LG_RendererSupport support);
 typedef void         (* LG_RendererOnRestart    )(void * opaque);
-typedef void         (* LG_RendererOnResize     )(void * opaque, const int width, const int height, const LG_RendererRect destRect, LG_RendererRotate rotate);
+typedef void         (* LG_RendererOnResize     )(void * opaque, const int width, const int height, const double scale, const LG_RendererRect destRect, LG_RendererRotate rotate);
 typedef bool         (* LG_RendererOnMouseShape )(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data);
 typedef bool         (* LG_RendererOnMouseEvent )(void * opaque, const bool visible , const int x, const int y);
 typedef bool         (* LG_RendererOnFrameFormat)(void * opaque, const LG_RendererFormat format, bool useDMA);
 typedef bool         (* LG_RendererOnFrame      )(void * opaque, const FrameBuffer * frame, int dmaFD);
 typedef void         (* LG_RendererOnAlert      )(void * opaque, const LG_MsgAlert alert, const char * message, bool ** closeFlag);
-typedef bool         (* LG_RendererRenderStartup)(void * opaque, SDL_Window *window);
-typedef bool         (* LG_RendererRender       )(void * opaque, SDL_Window *window, LG_RendererRotate rotate);
+typedef void         (* LG_RendererOnHelp       )(void * opaque, const char * message);
+typedef void         (* LG_RendererOnShowFPS    )(void * opaque, bool showFPS);
+typedef bool         (* LG_RendererRenderStartup)(void * opaque);
+typedef bool         (* LG_RendererRender       )(void * opaque, LG_RendererRotate rotate);
 typedef void         (* LG_RendererUpdateFPS    )(void * opaque, const float avgUPS, const float avgFPS);
 
 typedef struct LG_Renderer
@@ -137,6 +138,8 @@ typedef struct LG_Renderer
   LG_RendererOnFrameFormat  on_frame_format;
   LG_RendererOnFrame        on_frame;
   LG_RendererOnAlert        on_alert;
+  LG_RendererOnHelp         on_help;
+  LG_RendererOnShowFPS      on_show_fps;
   LG_RendererRenderStartup  render_startup;
   LG_RendererRender         render;
   LG_RendererUpdateFPS      update_fps;

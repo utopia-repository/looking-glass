@@ -1,21 +1,22 @@
-/*
-KVMGFX Client - A KVM Client for VGA Passthrough
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "common/crash.h"
 #include "common/debug.h"
@@ -50,18 +51,19 @@ struct crash
   asection     * section;
   asymbol     ** syms;
   long           symCount;
+  bool           loaded;
 };
 
 static struct crash crash = {0};
 
-static void load_symbols(void)
+static bool load_symbols(void)
 {
   bfd_init();
   crash.fd = bfd_openr(crash.exe, NULL);
   if (!crash.fd)
   {
     DEBUG_ERROR("failed to open '%s'", crash.exe);
-    return;
+    return false;
   }
 
   crash.fd->flags |= BFD_DECOMPRESS;
@@ -70,20 +72,20 @@ static void load_symbols(void)
   if (!bfd_check_format_matches(crash.fd, bfd_object, &matching))
   {
     DEBUG_ERROR("executable is not a bfd_object");
-    return;
+    return false;
   }
 
   crash.section = bfd_get_section_by_name(crash.fd, ".text");
   if (!crash.section)
   {
     DEBUG_ERROR("failed to find .text section");
-    return;
+    return false;
   }
 
   if ((bfd_get_file_flags(crash.fd) & HAS_SYMS) == 0)
   {
     DEBUG_ERROR("executable '%s' has no symbols", crash.exe);
-    return;
+    return false;
   }
 
   long storage   = bfd_get_symtab_upper_bound(crash.fd);
@@ -92,8 +94,10 @@ static void load_symbols(void)
   if (crash.symCount < 0)
   {
     DEBUG_ERROR("failed to get the symbol count");
-    return;
+    return false;
   }
+
+  return true;
 }
 
 static bool lookup_address(bfd_vma pc, const char ** filename, const char ** function, unsigned int * line, unsigned int * discriminator)
@@ -131,7 +135,7 @@ static bool lookup_address(bfd_vma pc, const char ** filename, const char ** fun
   return true;
 }
 
-static void cleanup(void)
+void cleanupCrashHandler(void)
 {
   if (crash.syms)
     free(crash.syms);
@@ -168,17 +172,11 @@ static int dl_iterate_phdr_callback(struct dl_phdr_info * info, size_t size, voi
   return 0;
 }
 
-static void crit_err_hdlr(int sig_num, siginfo_t * info, void * ucontext)
+void printBacktrace(void)
 {
   void *             array[50];
   char **            messages;
   int                size, i;
-
-  dl_iterate_phdr(dl_iterate_phdr_callback, NULL);
-  load_symbols();
-
-  DEBUG_ERROR("==== FATAL CRASH (%s) ====", BUILD_VERSION);
-  DEBUG_ERROR("signal %d (%s), address is %p", sig_num, strsignal(sig_num), info->si_addr);
 
   size     = backtrace(array, 50);
   messages = backtrace_symbols(array, size);
@@ -210,8 +208,15 @@ static void crit_err_hdlr(int sig_num, siginfo_t * info, void * ucontext)
   }
 
   free(messages);
-  cleanup();
-  exit(EXIT_FAILURE);
+}
+
+static void crit_err_hdlr(int sig_num, siginfo_t * info, void * ucontext)
+{
+  DEBUG_ERROR("==== FATAL CRASH (%s) ====", BUILD_VERSION);
+  DEBUG_ERROR("signal %d (%s), address is %p", sig_num, strsignal(sig_num), info->si_addr);
+  printBacktrace();
+  cleanupCrashHandler();
+  abort();
 }
 
 bool installCrashHandler(const char * exe)
@@ -219,6 +224,13 @@ bool installCrashHandler(const char * exe)
   struct sigaction sigact = { 0 };
 
   crash.exe = realpath(exe, NULL);
+  if (!load_symbols())
+  {
+    DEBUG_WARN("Unable to load the binary symbols, not installing crash handler");
+    return true;
+  }
+  dl_iterate_phdr(dl_iterate_phdr_callback, NULL);
+
   sigact.sa_sigaction = crit_err_hdlr;
   sigact.sa_flags = SA_RESTART | SA_SIGINFO;
 
@@ -236,6 +248,14 @@ bool installCrashHandler(const char * exe)
 bool installCrashHandler(const char * exe)
 {
   return true;
+}
+
+void cleanupCrashHandler(void)
+{
+}
+
+void printBacktrace(void)
+{
 }
 
 #endif

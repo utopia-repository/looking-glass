@@ -1,21 +1,22 @@
-/*
-Looking Glass - KVM FrameRelay (KVMFR) Client
-Copyright (C) 2017-2019 Geoffrey McRae <geoff@hostfission.com>
-https://looking-glass.hostfission.com
-
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; either version 2 of the License, or (at your option) any later
-version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY
-WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
-PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with
-this program; if not, write to the Free Software Foundation, Inc., 59 Temple
-Place, Suite 330, Boston, MA 02111-1307 USA
-*/
+/**
+ * Looking Glass
+ * Copyright (C) 2017-2021 The Looking Glass Authors
+ * https://looking-glass.io
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc., 59
+ * Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
 
 #include "interface/capture.h"
 #include "interface/platform.h"
@@ -25,6 +26,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include "common/locking.h"
 #include "common/event.h"
 #include "common/dpi.h"
+#include "common/runningavg.h"
 
 #include <assert.h>
 #include <stdatomic.h>
@@ -34,18 +36,6 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <d3dcommon.h>
 
 #include "dxgi_extra.h"
-
-typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
-{
-  D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE,
-  D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL,
-  D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
-  D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
-  D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
-  D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
-}
-D3DKMT_SCHEDULINGPRIORITYCLASS;
-typedef NTSTATUS WINAPI (*PD3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
 
 #define LOCKED(x) INTERLOCKED_SECTION(this->deviceContextLock, x)
 
@@ -62,6 +52,7 @@ typedef struct Texture
   volatile enum TextureState state;
   ID3D11Texture2D          * tex;
   D3D11_MAPPED_SUBRESOURCE   map;
+  uint64_t                   copyTime;
 }
 Texture;
 
@@ -88,6 +79,9 @@ struct iface
   int                        texWIndex;
   atomic_int                 texReady;
   bool                       needsRelease;
+
+  RunningAvg                 avgMapTime;
+  uint64_t                   usleepMapTime;
 
   CaptureGetPointerBuffer    getPointerBufferFn;
   CapturePostPointerBuffer   postPointerBufferFn;
@@ -143,12 +137,12 @@ static void dxgi_initOptions(void)
       .name           = "maxTextures",
       .description    = "The maximum number of frames to buffer before skipping",
       .type           = OPTION_TYPE_INT,
-      .value.x_int    = 3
+      .value.x_int    = 4
     },
     {
       .module         = "dxgi",
       .name           = "useAcquireLock",
-      .description    = "Enable locking around `AcquireFrame` (EXPERIMENTAL, leave enabled if you're not sure!)",
+      .description    = "Enable locking around `AcquireNextFrame` (EXPERIMENTAL, leave enabled if you're not sure!)",
       .type           = OPTION_TYPE_BOOL,
       .value.x_bool   = true
     },
@@ -184,6 +178,7 @@ static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostP
   this->texture             = calloc(sizeof(struct Texture), this->maxTextures);
   this->getPointerBufferFn  = getPointerBufferFn;
   this->postPointerBufferFn = postPointerBufferFn;
+  this->avgMapTime          = runningavg_new(10);
   return true;
 }
 
@@ -220,6 +215,9 @@ static bool dxgi_init(void)
   this->texWIndex = 0;
   atomic_store(&this->texReady, 0);
 
+  runningavg_reset(this->avgMapTime);
+  this->usleepMapTime = 0;
+
   lgResetEvent(this->frameEvent);
 
   status = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&this->factory);
@@ -232,7 +230,7 @@ static bool dxgi_init(void)
   const char * optAdapter = option_get_string("dxgi", "adapter");
   const char * optOutput  = option_get_string("dxgi", "output" );
 
-  for(int i = 0; IDXGIFactory1_EnumAdapters1(this->factory, i, &this->adapter) != DXGI_ERROR_NOT_FOUND; ++i)
+  for (int i = 0; IDXGIFactory1_EnumAdapters1(this->factory, i, &this->adapter) != DXGI_ERROR_NOT_FOUND; ++i)
   {
     if (optAdapter)
     {
@@ -261,7 +259,7 @@ static bool dxgi_init(void)
       DEBUG_INFO("Adapter matched, trying: %ls", adapterDesc.Description);
     }
 
-    for(int n = 0; IDXGIAdapter1_EnumOutputs(this->adapter, n, &this->output) != DXGI_ERROR_NOT_FOUND; ++n)
+    for (int n = 0; IDXGIAdapter1_EnumOutputs(this->adapter, n, &this->output) != DXGI_ERROR_NOT_FOUND; ++n)
     {
       IDXGIOutput_GetDesc(this->output, &outputDesc);
       if (optOutput)
@@ -303,6 +301,16 @@ static bool dxgi_init(void)
     DEBUG_ERROR("Failed to locate a valid output device");
     goto fail;
   }
+
+  DXGI_ADAPTER_DESC1 adapterDesc;
+  IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
+  DEBUG_INFO("Device Name      : %ls"    , outputDesc.DeviceName);
+  DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
+  DEBUG_INFO("Device Vendor ID : 0x%x"   , adapterDesc.VendorId);
+  DEBUG_INFO("Device Device ID : 0x%x"   , adapterDesc.DeviceId);
+  DEBUG_INFO("Device Video Mem : %u MiB" , (unsigned)(adapterDesc.DedicatedVideoMemory  / 1048576));
+  DEBUG_INFO("Device Sys Mem   : %u MiB" , (unsigned)(adapterDesc.DedicatedSystemMemory / 1048576));
+  DEBUG_INFO("Shared Sys Mem   : %u MiB" , (unsigned)(adapterDesc.SharedSystemMemory    / 1048576));
 
   static const D3D_FEATURE_LEVEL win8[] =
   {
@@ -370,9 +378,6 @@ static bool dxgi_init(void)
     goto fail;
   }
 
-  DXGI_ADAPTER_DESC1 adapterDesc;
-  IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
-
   switch(outputDesc.Rotation)
   {
     case DXGI_MODE_ROTATION_ROTATE90:
@@ -413,48 +418,9 @@ static bool dxgi_init(void)
   this->dpi = monitor_dpi(outputDesc.Monitor);
   ++this->formatVer;
 
-  DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
-  DEBUG_INFO("Device Vendor ID : 0x%x"   , adapterDesc.VendorId);
-  DEBUG_INFO("Device Device ID : 0x%x"   , adapterDesc.DeviceId);
-  DEBUG_INFO("Device Video Mem : %u MiB" , (unsigned)(adapterDesc.DedicatedVideoMemory  / 1048576));
-  DEBUG_INFO("Device Sys Mem   : %u MiB" , (unsigned)(adapterDesc.DedicatedSystemMemory / 1048576));
-  DEBUG_INFO("Shared Sys Mem   : %u MiB" , (unsigned)(adapterDesc.SharedSystemMemory    / 1048576));
   DEBUG_INFO("Feature Level    : 0x%x"   , this->featureLevel);
   DEBUG_INFO("Capture Size     : %u x %u", this->width, this->height);
   DEBUG_INFO("AcquireLock      : %s"     , this->useAcquireLock ? "enabled" : "disabled");
-
-  // bump up our priority
-  {
-    HMODULE gdi32 = GetModuleHandleA("GDI32");
-    if (gdi32)
-    {
-      PD3DKMTSetProcessSchedulingPriorityClass fn =
-        (PD3DKMTSetProcessSchedulingPriorityClass)GetProcAddress(gdi32, "D3DKMTSetProcessSchedulingPriorityClass");
-
-      if (fn)
-      {
-        status = fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME);
-        if (FAILED(status))
-        {
-          DEBUG_WARN("Failed to set realtime GPU priority.");
-          DEBUG_INFO("This is not a failure, please do not report this as an issue.");
-          DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
-          DEBUG_INFO("looking-glass-host.exe InstallService");
-        }
-      }
-    }
-
-    IDXGIDevice * dxgi;
-    status = ID3D11Device_QueryInterface(this->device, &IID_IDXGIDevice, (void **)&dxgi);
-    if (FAILED(status))
-    {
-      DEBUG_WINERROR("failed to query DXGI interface from device", status);
-      goto fail;
-    }
-
-    IDXGIDevice_SetGPUThreadPriority(dxgi, 7);
-    IDXGIDevice_Release(dxgi);
-  }
 
   // try to reduce the latency
   {
@@ -577,7 +543,7 @@ static bool dxgi_init(void)
   texDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
   texDesc.MiscFlags          = 0;
 
-  for(int i = 0; i < this->maxTextures; ++i)
+  for (int i = 0; i < this->maxTextures; ++i)
   {
     status = ID3D11Device_CreateTexture2D(this->device, &texDesc, NULL, &this->texture[i].tex);
     if (FAILED(status))
@@ -618,7 +584,7 @@ static bool dxgi_deinit(void)
 {
   assert(this);
 
-  for(int i = 0; i < this->maxTextures; ++i)
+  for (int i = 0; i < this->maxTextures; ++i)
   {
     this->texture[i].state = TEXTURE_STATE_UNUSED;
 
@@ -699,16 +665,9 @@ static void dxgi_free(void)
 
   free(this->texture);
 
+  runningavg_free(&this->avgMapTime);
   free(this);
   this = NULL;
-}
-
-static unsigned int dxgi_getMaxFrameSize(void)
-{
-  assert(this);
-  assert(this->initialized);
-
-  return this->height * this->pitch;
 }
 
 static unsigned int dxgi_getMouseScale(void)
@@ -806,7 +765,7 @@ static CaptureResult dxgi_capture(void)
   uint32_t bufferSize;
   if (frameInfo.PointerShapeBufferSize > 0)
   {
-    if(!this->getPointerBufferFn(&pointerShape, &bufferSize))
+    if (!this->getPointerBufferFn(&pointerShape, &bufferSize))
       DEBUG_WARN("Failed to obtain a buffer for the pointer shape");
     else
       copyPointer = true;
@@ -820,6 +779,7 @@ static CaptureResult dxgi_capture(void)
       if (copyFrame)
       {
         // issue the copy from GPU to CPU RAM
+        tex->copyTime = microtime();
         ID3D11DeviceContext_CopyResource(this->deviceContext,
           (ID3D11Resource *)tex->tex, (ID3D11Resource *)src);
       }
@@ -916,23 +876,28 @@ static CaptureResult dxgi_capture(void)
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
+static CaptureResult dxgi_waitFrame(CaptureFrame * frame, const size_t maxFrameSize)
 {
   assert(this);
   assert(this->initialized);
 
   // NOTE: the event may be signaled when there are no frames available
-  if(atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
+  if (atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
   {
     if (!lgWaitEvent(this->frameEvent, 1000))
       return CAPTURE_RESULT_TIMEOUT;
 
     // the count will still be zero if we are stopping
-    if(atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
+    if (atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
       return CAPTURE_RESULT_TIMEOUT;
   }
 
   Texture * tex = &this->texture[this->texRIndex];
+
+  // sleep until it's close to time to map
+  const uint64_t delta = microtime() - tex->copyTime;
+  if (delta < this->usleepMapTime)
+    usleep(this->usleepMapTime - delta);
 
   // try to map the resource, but don't wait for it
   for (int i = 0; ; ++i)
@@ -957,28 +922,36 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame)
     break;
   }
 
+  // update the sleep average and sleep for 80% of the average on the next call
+  runningavg_push(this->avgMapTime, microtime() - tex->copyTime);
+  this->usleepMapTime = (uint64_t)(runningavg_calc(this->avgMapTime) * 0.8);
+
   tex->state = TEXTURE_STATE_MAPPED;
 
-  frame->formatVer = tex->formatVer;
-  frame->width     = this->width;
-  frame->height    = this->height;
-  frame->pitch     = this->pitch;
-  frame->stride    = this->stride;
-  frame->format    = this->format;
-  frame->rotation  = this->rotation;
+  const unsigned int maxHeight = maxFrameSize / this->pitch;
+
+  frame->formatVer  = tex->formatVer;
+  frame->width      = this->width;
+  frame->height     = maxHeight > this->height ? this->height : maxHeight;
+  frame->realHeight = this->height;
+  frame->pitch      = this->pitch;
+  frame->stride     = this->stride;
+  frame->format     = this->format;
+  frame->rotation   = this->rotation;
 
   atomic_fetch_sub_explicit(&this->texReady, 1, memory_order_release);
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult dxgi_getFrame(FrameBuffer * frame)
+static CaptureResult dxgi_getFrame(FrameBuffer * frame,
+    const unsigned int height)
 {
   assert(this);
   assert(this->initialized);
 
   Texture * tex = &this->texture[this->texRIndex];
 
-  framebuffer_write(frame, tex->map.pData, this->pitch * this->height);
+  framebuffer_write(frame, tex->map.pData, this->pitch * height);
   LOCKED({ID3D11DeviceContext_Unmap(this->deviceContext, (ID3D11Resource*)tex->tex, 0);});
   tex->state = TEXTURE_STATE_UNUSED;
 
@@ -1023,6 +996,8 @@ static CaptureResult dxgi_releaseFrame(void)
 
 struct CaptureInterface Capture_DXGI =
 {
+  .shortName       = "DXGI",
+  .asyncCapture    = true,
   .getName         = dxgi_getName,
   .initOptions     = dxgi_initOptions,
   .create          = dxgi_create,
@@ -1030,7 +1005,6 @@ struct CaptureInterface Capture_DXGI =
   .stop            = dxgi_stop,
   .deinit          = dxgi_deinit,
   .free            = dxgi_free,
-  .getMaxFrameSize = dxgi_getMaxFrameSize,
   .getMouseScale   = dxgi_getMouseScale,
   .capture         = dxgi_capture,
   .waitFrame       = dxgi_waitFrame,

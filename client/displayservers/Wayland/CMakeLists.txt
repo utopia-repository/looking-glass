@@ -9,8 +9,33 @@ pkg_check_modules(DISPLAYSERVER_Wayland_PKGCONFIG REQUIRED
 #pkg_check_modules(DISPLAYSERVER_Wayland_OPT_PKGCONFIG
 #)
 
+set(displayserver_Wayland_SHELL_SRC "")
+
+if (ENABLE_LIBDECOR)
+	pkg_check_modules(DISPLAYSERVER_Wayland_LIBDECOR REQUIRED
+		libdecor-0.1
+	)
+	list(APPEND DISPLAYSERVER_Wayland_PKGCONFIG_LIBRARIES ${DISPLAYSERVER_Wayland_LIBDECOR_LIBRARIES})
+	list(APPEND DISPLAYSERVER_Wayland_PKGCONFIG_INCLUDE_DIRS ${DISPLAYSERVER_Wayland_LIBDECOR_INCLUDE_DIRS})
+	list(APPEND displayserver_Wayland_SHELL_SRC shell_libdecor.c)
+	add_definitions(-D ENABLE_LIBDECOR)
+else()
+	list(APPEND displayserver_Wayland_SHELL_SRC shell_xdg.c)
+endif()
+
 add_library(displayserver_Wayland STATIC
+	clipboard.c
+	cursor.c
+	gl.c
+	idle.c
+	input.c
+	output.c
+	poll.c
+	state.c
+	registry.c
 	wayland.c
+	window.c
+	${displayserver_Wayland_SHELL_SRC}
 )
 
 target_link_libraries(displayserver_Wayland
@@ -46,6 +71,12 @@ endmacro()
 
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/wayland")
 include_directories("${CMAKE_BINARY_DIR}/wayland")
+wayland_generate(
+    "${WAYLAND_PROTOCOLS_BASE}/stable/xdg-shell/xdg-shell.xml"
+    "${CMAKE_BINARY_DIR}/wayland/wayland-xdg-shell-client-protocol")
+wayland_generate(
+    "${WAYLAND_PROTOCOLS_BASE}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+    "${CMAKE_BINARY_DIR}/wayland/wayland-xdg-decoration-unstable-v1-client-protocol")
 wayland_generate(
     "${WAYLAND_PROTOCOLS_BASE}/unstable/relative-pointer/relative-pointer-unstable-v1.xml"
     "${CMAKE_BINARY_DIR}/wayland/wayland-relative-pointer-unstable-v1-client-protocol")

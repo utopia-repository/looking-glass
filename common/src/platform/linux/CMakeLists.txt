@@ -7,6 +7,7 @@ include_directories(
 )
 
 add_library(lg_common_platform_code STATIC
+    debug.c
     crash.c
     sysinfo.c
     thread.c
@@ -16,7 +17,8 @@ add_library(lg_common_platform_code STATIC
 )
 
 if(ENABLE_BACKTRACE)
-  target_link_libraries(lg_common_platform_code bfd)
+  find_package(BFD)
+  target_link_libraries(lg_common_platform_code ${BFD_LIBRARIES})
 endif()
 
 target_link_libraries(lg_common_platform_code
