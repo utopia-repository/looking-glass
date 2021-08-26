@@ -41,26 +41,19 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <spice/protocol.h>
 #include <spice/vd_agent.h>
 
+#include "locking.h"
 #include "messages.h"
 #include "rsa.h"
-
-#define SPICE_LOCK_INIT(x) \
-  atomic_flag_clear(&(x))
-
-#define SPICE_LOCK(x) \
-  while(atomic_flag_test_and_set_explicit(&(x), memory_order_acquire)) { ; }
-
-#define SPICE_UNLOCK(x) \
-  atomic_flag_clear_explicit(&(x), memory_order_release);
+#include "queue.h"
 
 // we don't really need flow control because we are all local
 // instead do what the spice-gtk library does and provide the largest
 // possible number
 #define SPICE_AGENT_TOKENS_MAX ~0
 
-#define SPICE_RAW_PACKET(htype, dataSize, extraData) \
+#define _SPICE_RAW_PACKET(htype, dataSize, extraData, _alloc) \
 ({ \
-  uint8_t * packet = alloca(sizeof(ssize_t) + sizeof(SpiceMiniDataHeader) + dataSize); \
+  uint8_t * packet = _alloc(sizeof(ssize_t) + sizeof(SpiceMiniDataHeader) + dataSize); \
   ssize_t * sz = (ssize_t*)packet; \
   SpiceMiniDataHeader * header = (SpiceMiniDataHeader *)(sz + 1); \
   *sz          = sizeof(SpiceMiniDataHeader) + dataSize; \
@@ -69,8 +62,32 @@ Place, Suite 330, Boston, MA 02111-1307 USA
   (header + 1); \
 })
 
+#define SPICE_RAW_PACKET(htype, dataSize, extraData) \
+  _SPICE_RAW_PACKET(htype, dataSize, extraData, alloca)
+
+#define SPICE_RAW_PACKET_MALLOC(htype, dataSize, extraData) \
+  _SPICE_RAW_PACKET(htype, dataSize, extraData, malloc)
+
+#define SPICE_RAW_PACKET_FREE(packet) \
+{ \
+  SpiceMiniDataHeader * header = (SpiceMiniDataHeader *)(((uint8_t *)packet) - \
+      sizeof(SpiceMiniDataHeader)); \
+  ssize_t *sz = (ssize_t *)(((uint8_t *)header) - sizeof(ssize_t)); \
+  free(sz); \
+}
+
+#define SPICE_SET_PACKET_SIZE(packet, sz) \
+{ \
+   SpiceMiniDataHeader * header = (SpiceMiniDataHeader *)(((uint8_t *)packet) - \
+      sizeof(SpiceMiniDataHeader)); \
+   header->size = sz; \
+}
+
 #define SPICE_PACKET(htype, payloadType, extraData) \
   ((payloadType *)SPICE_RAW_PACKET(htype, sizeof(payloadType), extraData))
+
+#define SPICE_PACKET_MALLOC(htype, payloadType, extraData) \
+  ((payloadType *)SPICE_RAW_PACKET_MALLOC(htype, sizeof(payloadType), extraData))
 
 #define SPICE_SEND_PACKET(channel, packet) \
 ({ \
@@ -130,6 +147,7 @@ struct SpiceKeyboard
 
 struct SpiceMouse
 {
+  atomic_flag lock;
   uint32_t buttonState;
 
   atomic_int sentCount;
@@ -151,7 +169,7 @@ struct Spice
   union SpiceAddr addr;
 
   bool     hasAgent;
-  uint32_t serverTokens;
+  _Atomic(uint32_t) serverTokens;
   uint32_t sessionID;
   uint32_t channelID;
   ssize_t  agentMsg;
@@ -179,6 +197,8 @@ struct Spice
 
   uint8_t * motionBuffer;
   size_t    motionBufferSize;
+
+  struct Queue * agentQueue;
 };
 
 // globals
@@ -202,6 +222,7 @@ SPICE_STATUS spice_on_main_channel_read  (int * dataAvailable);
 SPICE_STATUS spice_on_inputs_channel_read(int * dataAvailable);
 
 SPICE_STATUS spice_agent_process  (uint32_t dataSize, int * dataAvailable);
+bool         spice_agent_process_queue(void);
 SPICE_STATUS spice_agent_connect  ();
 SPICE_STATUS spice_agent_send_caps(bool request);
 void         spice_agent_on_clipboard();
@@ -270,6 +291,17 @@ void spice_disconnect()
     free(spice.motionBuffer);
     spice.motionBuffer = NULL;
   }
+
+  if (spice.agentQueue)
+  {
+    void * msg;
+    while(queue_shift(spice.agentQueue, &msg))
+      SPICE_RAW_PACKET_FREE(msg);
+    queue_free(spice.agentQueue);
+    spice.agentQueue = NULL;
+  }
+
+  spice.hasAgent = false;
 }
 
 // ============================================================================
@@ -545,9 +577,8 @@ SPICE_STATUS spice_on_main_channel_read(int * dataAvailable)
 
     spice.sessionID = msg.session_id;
 
-    spice.serverTokens = msg.agent_tokens;
-    spice.hasAgent     = msg.agent_connected;
-    if (spice.hasAgent && (status = spice_agent_connect()) != SPICE_STATUS_OK)
+    atomic_store(&spice.serverTokens, msg.agent_tokens);
+    if (msg.agent_connected && (status = spice_agent_connect()) != SPICE_STATUS_OK)
     {
       spice_disconnect();
       return status;
@@ -606,7 +637,6 @@ SPICE_STATUS spice_on_main_channel_read(int * dataAvailable)
 
   if (header.type == SPICE_MSG_MAIN_AGENT_CONNECTED)
   {
-    spice.hasAgent = true;
     if ((status = spice_agent_connect()) != SPICE_STATUS_OK)
     {
       spice_disconnect();
@@ -624,8 +654,7 @@ SPICE_STATUS spice_on_main_channel_read(int * dataAvailable)
       return status;
     }
 
-    spice.hasAgent    = true;
-    spice.serverTokens = num_tokens;
+    atomic_store(&spice.serverTokens, num_tokens);
     if ((status = spice_agent_connect()) != SPICE_STATUS_OK)
     {
       spice_disconnect();
@@ -676,7 +705,13 @@ SPICE_STATUS spice_on_main_channel_read(int * dataAvailable)
       return status;
     }
 
-    spice.serverTokens = num_tokens;
+    atomic_fetch_add(&spice.serverTokens, num_tokens);
+    if (!spice_agent_process_queue())
+    {
+      spice_disconnect();
+      return SPICE_STATUS_ERROR;
+    }
+
     return SPICE_STATUS_OK;
   }
 
@@ -742,6 +777,9 @@ SPICE_STATUS spice_connect_channel(struct SpiceChannel * channel)
   channel->initDone     = false;
   channel->ackFrequency = 0;
   channel->ackCount     = 0;
+
+  if (channel == &spice.scInputs)
+    SPICE_LOCK_INIT(spice.mouse.lock);
 
   SPICE_LOCK_INIT(channel->lock);
 
@@ -943,12 +981,29 @@ void spice_disconnect_channel(struct SpiceChannel * channel)
 
 SPICE_STATUS spice_agent_connect()
 {
+  if (!spice.agentQueue)
+    spice.agentQueue = queue_new();
+  else
+  {
+    void * msg;
+    while(queue_shift(spice.agentQueue, &msg))
+      SPICE_RAW_PACKET_FREE(msg);
+  }
+
   uint32_t * packet = SPICE_PACKET(SPICE_MSGC_MAIN_AGENT_START, uint32_t, 0);
   memcpy(packet, &(uint32_t){SPICE_AGENT_TOKENS_MAX}, sizeof(uint32_t));
   if (!SPICE_SEND_PACKET(&spice.scMain, packet))
     return SPICE_STATUS_ERROR;
 
-  return spice_agent_send_caps(true);
+  spice.hasAgent = true;
+  SPICE_STATUS ret = spice_agent_send_caps(true);
+  if (ret != SPICE_STATUS_OK)
+  {
+    spice.hasAgent = false;
+    return ret;
+  }
+
+  return SPICE_STATUS_OK;
 }
 
 // ============================================================================
@@ -1140,6 +1195,9 @@ void spice_agent_on_clipboard()
 
 SPICE_STATUS spice_agent_send_caps(bool request)
 {
+  if (!spice.hasAgent)
+    return SPICE_STATUS_ERROR;
+
   const ssize_t capsSize = sizeof(VDAgentAnnounceCapabilities) + VD_AGENT_CAPS_BYTES;
   VDAgentAnnounceCapabilities *caps = (VDAgentAnnounceCapabilities *)alloca(capsSize);
   memset(caps, 0, capsSize);
@@ -1157,28 +1215,59 @@ SPICE_STATUS spice_agent_send_caps(bool request)
 
 // ============================================================================
 
+bool spice_take_server_token(void)
+{
+  uint32_t tokens;
+  do
+  {
+    if (!spice.scMain.connected)
+      return false;
+
+    tokens = atomic_load(&spice.serverTokens);
+    if (tokens == 0)
+      return false;
+  }
+  while(!atomic_compare_exchange_weak(&spice.serverTokens, &tokens, tokens - 1));
+
+  return true;
+}
+
+// ============================================================================
+
+bool spice_agent_process_queue(void)
+{
+  SPICE_LOCK(spice.scMain.lock);
+  while (queue_peek(spice.agentQueue, NULL) && spice_take_server_token())
+  {
+    void * msg;
+    queue_shift(spice.agentQueue, &msg);
+    if (!SPICE_SEND_PACKET_NL(&spice.scMain, msg))
+    {
+      SPICE_RAW_PACKET_FREE(msg);
+      SPICE_UNLOCK(spice.scMain.lock);
+      return false;
+    }
+    SPICE_RAW_PACKET_FREE(msg);
+  }
+  SPICE_UNLOCK(spice.scMain.lock);
+  return true;
+}
+
+// ============================================================================
+
 bool spice_agent_start_msg(uint32_t type, ssize_t size)
 {
   VDAgentMessage * msg =
-    SPICE_PACKET(SPICE_MSGC_MAIN_AGENT_DATA, VDAgentMessage, 0);
+    SPICE_PACKET_MALLOC(SPICE_MSGC_MAIN_AGENT_DATA, VDAgentMessage, 0);
 
   msg->protocol  = VD_AGENT_PROTOCOL;
   msg->type      = type;
   msg->opaque    = 0;
   msg->size      = size;
   spice.agentMsg = size;
+  queue_push(spice.agentQueue, msg);
 
-  SPICE_LOCK(spice.scMain.lock);
-  if (!SPICE_SEND_PACKET_NL(&spice.scMain, msg))
-  {
-    SPICE_UNLOCK(spice.scMain.lock);
-    return false;
-  }
-
-  if (size == 0)
-    SPICE_UNLOCK(spice.scMain.lock);
-
-  return true;
+  return spice_agent_process_queue();
 }
 
 // ============================================================================
@@ -1192,26 +1281,16 @@ bool spice_agent_write_msg(const void * buffer, ssize_t size)
     const ssize_t toWrite = size > VD_AGENT_MAX_DATA_SIZE ?
       VD_AGENT_MAX_DATA_SIZE : size;
 
-    void * p = SPICE_RAW_PACKET(SPICE_MSGC_MAIN_AGENT_DATA, 0, toWrite);
-    if (!SPICE_SEND_PACKET_NL(&spice.scMain, p))
-      goto err;
-
-    if (spice_write_nl(&spice.scMain, buffer, toWrite) != toWrite)
-      goto err;
+    void * msg = SPICE_RAW_PACKET_MALLOC(SPICE_MSGC_MAIN_AGENT_DATA, toWrite, 0);
+    memcpy(msg, buffer, toWrite);
+    queue_push(spice.agentQueue, msg);
 
     size           -= toWrite;
     buffer         += toWrite;
     spice.agentMsg -= toWrite;
   }
 
-  if (!spice.agentMsg)
-    SPICE_UNLOCK(spice.scMain.lock);
-
-  return true;
-
-err:
-  SPICE_UNLOCK(spice.scMain.lock);
-  return false;
+  return spice_agent_process_queue();
 }
 
 // ============================================================================
@@ -1346,10 +1425,12 @@ bool spice_mouse_position(uint32_t x, uint32_t y)
   SpiceMsgcMousePosition * msg =
     SPICE_PACKET(SPICE_MSGC_INPUTS_MOUSE_POSITION, SpiceMsgcMousePosition, 0);
 
+  SPICE_LOCK(spice.mouse.lock);
   msg->display_id   = 0;
   msg->button_state = spice.mouse.buttonState;
   msg->x            = x;
   msg->y            = y;
+  SPICE_UNLOCK(spice.mouse.lock);
 
   atomic_fetch_add(&spice.mouse.sentCount, 1);
   if (!SPICE_SEND_PACKET(&spice.scInputs, msg))
@@ -1388,6 +1469,7 @@ bool spice_mouse_motion(int32_t x, int32_t y)
   uint8_t * buffer = spice.motionBuffer;
   uint8_t * msg    = buffer;
 
+  SPICE_LOCK(spice.mouse.lock);
   while(x != 0 || y != 0)
   {
     SpiceMiniDataHeader  *h = (SpiceMiniDataHeader  *)msg;
@@ -1404,6 +1486,7 @@ bool spice_mouse_motion(int32_t x, int32_t y)
     x -= m->x;
     y -= m->y;
   }
+  SPICE_UNLOCK(spice.mouse.lock);
 
   atomic_fetch_add(&spice.mouse.sentCount, msgs);
 
@@ -1421,6 +1504,7 @@ bool spice_mouse_press(uint32_t button)
   if (!spice.scInputs.connected)
     return false;
 
+  SPICE_LOCK(spice.mouse.lock);
   switch(button)
   {
     case SPICE_MOUSE_BUTTON_LEFT   : spice.mouse.buttonState |= SPICE_MOUSE_BUTTON_MASK_LEFT   ; break;
@@ -1435,6 +1519,7 @@ bool spice_mouse_press(uint32_t button)
 
   msg->button       = button;
   msg->button_state = spice.mouse.buttonState;
+  SPICE_UNLOCK(spice.mouse.lock);
 
   return SPICE_SEND_PACKET(&spice.scInputs, msg);
 }
@@ -1446,6 +1531,7 @@ bool spice_mouse_release(uint32_t button)
   if (!spice.scInputs.connected)
     return false;
 
+  SPICE_LOCK(spice.mouse.lock);
   switch(button)
   {
     case SPICE_MOUSE_BUTTON_LEFT   : spice.mouse.buttonState &= ~SPICE_MOUSE_BUTTON_MASK_LEFT   ; break;
@@ -1460,6 +1546,7 @@ bool spice_mouse_release(uint32_t button)
 
   msg->button       = button;
   msg->button_state = spice.mouse.buttonState;
+  SPICE_UNLOCK(spice.mouse.lock);
 
   return SPICE_SEND_PACKET(&spice.scInputs, msg);
 }
@@ -1498,6 +1585,9 @@ static SpiceDataType agent_type_to_spice_type(uint32_t type)
 
 bool spice_clipboard_request(SpiceDataType type)
 {
+  if (!spice.hasAgent)
+    return false;
+
   VDAgentClipboardRequest req;
 
   if (!spice.cbAgentGrabbed)
@@ -1531,27 +1621,44 @@ bool spice_set_clipboard_cb(SpiceClipboardNotice cbNoticeFn, SpiceClipboardData 
 
 // ============================================================================
 
-bool spice_clipboard_grab(SpiceDataType type)
+bool spice_clipboard_grab(SpiceDataType types[], int count)
 {
-  if (type == SPICE_DATA_NONE)
+  if (!spice.hasAgent)
+    return false;
+
+  if (count == 0)
     return false;
 
   if (spice.cbSelection)
   {
-    uint8_t req[8] = { VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD };
-    ((uint32_t*)req)[1] = spice_type_to_agent_type(type);
+    struct Msg
+    {
+      uint8_t  selection;
+      uint8_t  reserved;
+      uint32_t types[0];
+    };
 
-    if (!spice_agent_start_msg(VD_AGENT_CLIPBOARD_GRAB, sizeof(req)) ||
-        !spice_agent_write_msg(req, sizeof(req)))
+    const int size = sizeof(struct Msg) + count * sizeof(uint32_t);
+    struct Msg * msg = alloca(size);
+    msg->selection = VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD;
+    msg->reserved  = 0;
+    for(int i = 0; i < count; ++i)
+      msg->types[i] = spice_type_to_agent_type(types[i]);
+
+    if (!spice_agent_start_msg(VD_AGENT_CLIPBOARD_GRAB, size) ||
+        !spice_agent_write_msg(msg, size))
       return false;
 
     spice.cbClientGrabbed = true;
     return true;
   }
 
-  uint32_t req = spice_type_to_agent_type(type);
-  if (!spice_agent_start_msg(VD_AGENT_CLIPBOARD_GRAB, sizeof(req)) ||
-      !spice_agent_write_msg(&req, sizeof(req)))
+  uint32_t msg[count];
+  for(int i = 0; i < count; ++i)
+    msg[i] = spice_type_to_agent_type(types[i]);
+
+  if (!spice_agent_start_msg(VD_AGENT_CLIPBOARD_GRAB, sizeof(msg)) ||
+      !spice_agent_write_msg(&msg, sizeof(msg)))
     return false;
 
   spice.cbClientGrabbed = true;
@@ -1562,6 +1669,9 @@ bool spice_clipboard_grab(SpiceDataType type)
 
 bool spice_clipboard_release()
 {
+  if (!spice.hasAgent)
+    return false;
+
   // check if if there is anything to release first
   if (!spice.cbClientGrabbed)
     return true;
@@ -1588,6 +1698,9 @@ bool spice_clipboard_release()
 
 bool spice_clipboard_data_start(SpiceDataType type, size_t size)
 {
+  if (!spice.hasAgent)
+    return false;
+
   uint8_t buffer[8];
   size_t  bufSize;
 
@@ -1612,5 +1725,8 @@ bool spice_clipboard_data_start(SpiceDataType type, size_t size)
 
 bool spice_clipboard_data(SpiceDataType type, uint8_t * data, size_t size)
 {
+  if (!spice.hasAgent)
+    return false;
+
   return spice_agent_write_msg(data, size);
 }
