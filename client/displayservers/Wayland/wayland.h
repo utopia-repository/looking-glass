@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,24 +22,31 @@
 #include <sys/types.h>
 
 #include <wayland-client.h>
+#include <wayland-cursor.h>
 
 #if defined(ENABLE_EGL) || defined(ENABLE_OPENGL)
 # include <wayland-egl.h>
 # include <EGL/egl.h>
 # include <EGL/eglext.h>
+# include "eglutil.h"
 #endif
 
+#include "app.h"
 #include "egl_dynprocs.h"
 #include "common/locking.h"
 #include "common/countedbuffer.h"
+#include "common/ringbuffer.h"
 #include "interface/displayserver.h"
 
 #include "wayland-xdg-shell-client-protocol.h"
+#include "wayland-presentation-time-client-protocol.h"
+#include "wayland-viewporter-client-protocol.h"
 #include "wayland-xdg-decoration-unstable-v1-client-protocol.h"
 #include "wayland-keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
 #include "wayland-pointer-constraints-unstable-v1-client-protocol.h"
 #include "wayland-relative-pointer-unstable-v1-client-protocol.h"
 #include "wayland-idle-inhibit-unstable-v1-client-protocol.h"
+#include "wayland-xdg-output-unstable-v1-client-protocol.h"
 
 typedef void (*WaylandPollCallback)(uint32_t events, void * opaque);
 
@@ -55,8 +62,15 @@ struct WaylandPoll
 struct WaylandOutput
 {
   uint32_t name;
-  int32_t scale;
+  wl_fixed_t scale;
+  int32_t scaleInt;
+  int32_t logicalWidth;
+  int32_t logicalHeight;
+  int32_t modeWidth;
+  int32_t modeHeight;
+  bool    modeRotate;
   struct wl_output * output;
+  struct zxdg_output_v1 * xdgOutput;
   uint32_t version;
   struct wl_list link;
 };
@@ -74,6 +88,10 @@ enum EGLSwapWithDamageState {
   SWAP_WITH_DAMAGE_EXT,
 };
 
+struct xkb_context;
+struct xkb_keymap;
+struct xkb_state;
+
 struct WaylandDSState
 {
   bool pointerGrabbed;
@@ -88,7 +106,9 @@ struct WaylandDSState
   struct wl_shm * shm;
   struct wl_compositor * compositor;
 
-  int32_t width, height, scale;
+  int32_t width, height;
+  wl_fixed_t scale;
+  bool fractionalScale;
   bool needsResize;
   bool fullscreen;
   uint32_t resizeSerial;
@@ -98,10 +118,7 @@ struct WaylandDSState
 
 #if defined(ENABLE_EGL) || defined(ENABLE_OPENGL)
   struct wl_egl_window * eglWindow;
-  bool eglSwapWithDamageInit;
-  eglSwapBuffersWithDamageKHR_t eglSwapWithDamage;
-  EGLint * eglDamageRects;
-  int eglDamageRectCount;
+  struct SwapWithDamageData swapWithDamage;
 #endif
 
 #ifdef ENABLE_OPENGL
@@ -109,6 +126,11 @@ struct WaylandDSState
   EGLConfig glConfig;
   EGLSurface glSurface;
 #endif
+
+  struct wp_presentation * presentation;
+  clockid_t clkId;
+  RingBuffer photonTimings;
+  GraphHandle photonGraph;
 
 #ifdef ENABLE_LIBDECOR
   struct libdecor * libdecor;
@@ -121,8 +143,17 @@ struct WaylandDSState
   struct zxdg_toplevel_decoration_v1 * xdgToplevelDecoration;
 #endif
 
-  struct wl_surface * cursor;
-  struct wl_buffer * cursorBuffer;
+  const char             * cursorThemeName;
+  int                      cursorSize;
+  int                      cursorScale;
+  struct wl_cursor_theme * cursorTheme;
+  struct wl_buffer       * cursorSquareBuffer;
+  struct wl_surface      * cursors[LG_POINTER_COUNT];
+  struct Point             cursorHot[LG_POINTER_COUNT];
+  LG_DSPointer             cursorId;
+  struct wl_surface      * cursor;
+  int                      cursorHotX;
+  int                      cursorHotY;
 
   struct wl_data_device_manager * dataDeviceManager;
 
@@ -132,6 +163,9 @@ struct WaylandDSState
   struct zwp_keyboard_shortcuts_inhibit_manager_v1 * keyboardInhibitManager;
   struct zwp_keyboard_shortcuts_inhibitor_v1 * keyboardInhibitor;
   uint32_t keyboardEnterSerial;
+  struct xkb_context * xkb;
+  struct xkb_state * xkbState;
+  struct xkb_keymap * keymap;
 
   struct wl_pointer * pointer;
   struct zwp_relative_pointer_manager_v1 * relativePointerManager;
@@ -146,8 +180,14 @@ struct WaylandDSState
   struct zwp_idle_inhibit_manager_v1 * idleInhibitManager;
   struct zwp_idle_inhibitor_v1 * idleInhibitor;
 
+  struct wp_viewporter * viewporter;
+  struct wp_viewport * viewport;
+  struct zxdg_output_manager_v1 * xdgOutputManager;
   struct wl_list outputs; // WaylandOutput::link
   struct wl_list surfaceOutputs; // SurfaceOutput::link
+  bool useFractionalScale;
+
+  LGEvent * frameEvent;
 
   struct wl_list poll; // WaylandPoll::link
   struct wl_list pollFree; // WaylandPoll::link
@@ -201,7 +241,8 @@ void waylandCBInvalidate(void);
 // cursor module
 bool waylandCursorInit(void);
 void waylandCursorFree(void);
-void waylandShowPointer(bool show);
+void waylandSetPointer(LG_DSPointer pointer);
+void waylandCursorScaleChange(void);
 
 // gl module
 #if defined(ENABLE_EGL) || defined(ENABLE_OPENGL)
@@ -247,7 +288,7 @@ bool waylandOutputInit(void);
 void waylandOutputFree(void);
 void waylandOutputBind(uint32_t name, uint32_t version);
 void waylandOutputTryUnbind(uint32_t name);
-int32_t waylandOutputGetScale(struct wl_output * output);
+wl_fixed_t waylandOutputGetScale(struct wl_output * output);
 
 // poll module
 bool waylandPollInit(void);
@@ -255,20 +296,29 @@ void waylandWait(unsigned int time);
 bool waylandPollRegister(int fd, WaylandPollCallback callback, void * opaque, uint32_t events);
 bool waylandPollUnregister(int fd);
 
+// presentation module
+bool waylandPresentationInit(void);
+void waylandPresentationFrame(void);
+void waylandPresentationFree(void);
+
 // registry module
 bool waylandRegistryInit(void);
 void waylandRegistryFree(void);
 
 // shell module
-bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless);
+bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless, bool resizable);
 void waylandShellAckConfigureIfNeeded(void);
 void waylandSetFullscreen(bool fs);
 bool waylandGetFullscreen(void);
 void waylandMinimize(void);
+void waylandShellResize(int w, int h);
 
 // window module
-bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool borderless);
+bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool borderless, bool resizable);
 void waylandWindowFree(void);
 void waylandWindowUpdateScale(void);
 void waylandSetWindowSize(int x, int y);
 bool waylandIsValidPointerPos(int x, int y);
+bool waylandWaitFrame(void);
+void waylandSkipFrame(void);
+void waylandStopWaitFrame(void);

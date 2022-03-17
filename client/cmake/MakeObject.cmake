@@ -5,15 +5,15 @@ function(make_object out_var)
     file(RELATIVE_PATH out_f ${CMAKE_CURRENT_SOURCE_DIR} "${CMAKE_CURRENT_SOURCE_DIR}/${in_f}")
     set(out_h "${CMAKE_CURRENT_BINARY_DIR}/${out_f}.h")
     set(out_f "${CMAKE_CURRENT_BINARY_DIR}/${out_f}.o")
-    string(REGEX REPLACE "[/.]" "_" sym_in  ${in_f})
+    string(REGEX REPLACE "[/.-]" "_" sym_in "${in_f}")
 
     add_custom_command(OUTPUT ${out_f}
-      COMMAND ${CMAKE_LINKER} -r -b binary -o ${out_f} ${in_f}
+      COMMAND ${CMAKE_LINKER} -r -b binary -o ${out_f} "${in_f}"
       COMMAND ${CMAKE_OBJCOPY} --rename-section .data=.rodata,CONTENTS,ALLOC,LOAD,READONLY,DATA ${out_f} ${out_f}
       COMMAND ${CMAKE_OBJCOPY} --redefine-sym _binary_${sym_in}_start=b_${sym_in} ${out_f} ${out_f}
       COMMAND ${CMAKE_OBJCOPY} --redefine-sym _binary_${sym_in}_end=b_${sym_in}_end ${out_f} ${out_f}
       COMMAND ${CMAKE_OBJCOPY} --strip-symbol _binary_${sym_in}_size ${out_f} ${out_f}
-      DEPENDS ${in_f}
+      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${in_f}"
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       COMMENT "Creating object from ${in_f}"
       VERBATIM

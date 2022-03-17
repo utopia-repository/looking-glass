@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -28,7 +28,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <assert.h>
 
 struct EGL_Model
 {
@@ -37,8 +36,8 @@ struct EGL_Model
   size_t      vertexCount;
   bool        finish;
 
-  bool    hasBuffer;
   GLuint  buffer;
+  GLuint  vao;
 
   EGL_Shader  * shader;
   EGL_Texture * texture;
@@ -53,23 +52,23 @@ struct FloatList
 
 void update_uniform_bindings(EGL_Model * model);
 
-bool egl_model_init(EGL_Model ** model)
+bool egl_modelInit(EGL_Model ** model)
 {
-  *model = (EGL_Model *)malloc(sizeof(EGL_Model));
+  *model = malloc(sizeof(**model));
   if (!*model)
   {
     DEBUG_ERROR("Failed to malloc EGL_Model");
     return false;
   }
 
-  memset(*model, 0, sizeof(EGL_Model));
+  memset(*model, 0, sizeof(**model));
 
   (*model)->verticies = ll_new();
 
   return true;
 }
 
-void egl_model_free(EGL_Model ** model)
+void egl_modelFree(EGL_Model ** model)
 {
   if (!*model)
     return;
@@ -83,14 +82,17 @@ void egl_model_free(EGL_Model ** model)
   }
   ll_free((*model)->verticies);
 
-  if ((*model)->hasBuffer)
+  if ((*model)->buffer)
     glDeleteBuffers(1, &(*model)->buffer);
+
+  if ((*model)->vao)
+    glDeleteVertexArrays(1, &(*model)->vao);
 
   free(*model);
   *model = NULL;
 }
 
-void egl_model_set_default(EGL_Model * model)
+void egl_modelSetDefault(EGL_Model * model, bool flipped)
 {
   static const GLfloat square[] =
   {
@@ -100,7 +102,15 @@ void egl_model_set_default(EGL_Model * model)
      1.0f,  1.0f, 0.0f
   };
 
-  static const GLfloat uvs[] =
+  static const GLfloat uvsNormal[] =
+  {
+    0.0f, 0.0f,
+    1.0f, 0.0f,
+    0.0f, 1.0f,
+    1.0f, 1.0f
+  };
+
+  static const GLfloat uvsFlipped[] =
   {
     0.0f, 1.0f,
     1.0f, 1.0f,
@@ -108,16 +118,16 @@ void egl_model_set_default(EGL_Model * model)
     1.0f, 0.0f
   };
 
-  egl_model_add_verticies(model, square, uvs, 4);
+  egl_modelAddVerts(model, square, flipped ? uvsFlipped : uvsNormal, 4);
 }
 
-void egl_model_add_verticies(EGL_Model * model, const GLfloat * verticies, const GLfloat * uvs, const size_t count)
+void egl_modelAddVerts(EGL_Model * model, const GLfloat * verticies, const GLfloat * uvs, const size_t count)
 {
-  struct FloatList * fl = (struct FloatList *)malloc(sizeof(struct FloatList));
+  struct FloatList * fl = malloc(sizeof(*fl));
 
   fl->count = count;
-  fl->v     = (GLfloat *)malloc(sizeof(GLfloat) * count * 3);
-  fl->u     = (GLfloat *)malloc(sizeof(GLfloat) * count * 2);
+  fl->v     = malloc(sizeof(GLfloat) * count * 3);
+  fl->u     = malloc(sizeof(GLfloat) * count * 2);
   memcpy(fl->v, verticies, sizeof(GLfloat) * count * 3);
 
   if (uvs)
@@ -130,15 +140,20 @@ void egl_model_add_verticies(EGL_Model * model, const GLfloat * verticies, const
   model->vertexCount += count;
 }
 
-void egl_model_render(EGL_Model * model)
+void egl_modelRender(EGL_Model * model)
 {
   if (!model->vertexCount)
     return;
 
   if (model->rebuild)
   {
-    if (model->hasBuffer)
+    if (model->buffer)
       glDeleteBuffers(1, &model->buffer);
+
+    if (!model->vao)
+      glGenVertexArrays(1, &model->vao);
+
+    glBindVertexArray(model->vao);
 
     /* create a buffer large enough */
     glGenBuffers(1, &model->buffer);
@@ -162,22 +177,24 @@ void egl_model_render(EGL_Model * model)
       offset += sizeof(GLfloat) * fl->count * 2;
     }
 
+    /* set up vertex arrays in the VAO */
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, (void*)(sizeof(GLfloat) * model->vertexCount * 3));
+
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
     model->rebuild = false;
   }
 
-  /* bind the model buffer and setup the pointers */
-  glBindBuffer(GL_ARRAY_BUFFER, model->buffer);
-  glEnableVertexAttribArray(0);
-  glEnableVertexAttribArray(1);
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, (void*)0);
-  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, (void*)(sizeof(GLfloat) * model->vertexCount * 3));
+  glBindVertexArray(model->vao);
 
   if (model->shader)
-    egl_shader_use(model->shader);
+    egl_shaderUse(model->shader);
 
   if (model->texture)
-    egl_texture_bind(model->texture);
+    egl_textureBind(model->texture);
 
   /* draw the arrays */
   GLint offset = 0;
@@ -190,18 +207,17 @@ void egl_model_render(EGL_Model * model)
 
   /* unbind and cleanup */
   glBindTexture(GL_TEXTURE_2D, 0);
-  glDisableVertexAttribArray(0);
-  glDisableVertexAttribArray(1);
+  glBindVertexArray(0);
   glUseProgram(0);
 }
 
-void egl_model_set_shader(EGL_Model * model, EGL_Shader * shader)
+void egl_modelSetShader(EGL_Model * model, EGL_Shader * shader)
 {
   model->shader = shader;
   update_uniform_bindings(model);
 }
 
-void egl_model_set_texture(EGL_Model * model, EGL_Texture * texture)
+void egl_modelSetTexture(EGL_Model * model, EGL_Texture * texture)
 {
   model->texture = texture;
   update_uniform_bindings(model);
@@ -212,6 +228,5 @@ void update_uniform_bindings(EGL_Model * model)
   if (!model->shader || !model->texture)
     return;
 
-  const int count = egl_texture_count(model->texture);
-  egl_shader_associate_textures(model->shader, count);
+  egl_shaderAssocTextures(model->shader, 1);
 }

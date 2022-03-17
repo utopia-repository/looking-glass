@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,11 +31,13 @@ bool core_warpPointer(int x, int y, bool exiting);
 void core_updatePositionInfo(void);
 void core_alignToGuest(void);
 bool core_isValidPointerPos(int x, int y);
+bool core_startCursorThread(void);
+void core_stopCursorThread(void);
 bool core_startFrameThread(void);
 void core_stopFrameThread(void);
 void core_handleGuestMouseUpdate(void);
 void core_handleMouseGrabbed(double ex, double ey);
 void core_handleMouseNormal(double ex, double ey);
-
+void core_resetOverlayInputState(void);
 
 #endif

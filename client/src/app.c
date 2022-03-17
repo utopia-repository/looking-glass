@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -30,10 +30,16 @@
 
 #include "common/debug.h"
 #include "common/stringutils.h"
+#include "interface/overlay.h"
+#include "overlays.h"
+
+#include "cimgui.h"
 
 #include <stdarg.h>
 #include <math.h>
 #include <string.h>
+
+#define ALERT_TIMEOUT 2000000
 
 bool app_isRunning(void)
 {
@@ -57,16 +63,29 @@ bool app_isFormatValid(void)
   return g_state.formatValid;
 }
 
+bool app_isOverlayMode(void)
+{
+  return g_state.overlayInput;
+}
+
 void app_updateCursorPos(double x, double y)
 {
   g_cursor.pos.x = x;
   g_cursor.pos.y = y;
   g_cursor.valid = true;
+
+  if (g_state.overlayInput)
+    g_state.io->MousePos = (ImVec2) { x, y };
 }
 
 void app_handleFocusEvent(bool focused)
 {
   g_state.focused = focused;
+
+  // release any imgui buttons/keys if we lost focus
+  if (!focused && g_state.overlayInput)
+    core_resetOverlayInputState();
+
   if (!core_inputEnabled())
   {
     if (!focused && g_params.minimizeOnFocusLoss && app_getFullscreen())
@@ -84,8 +103,10 @@ void app_handleFocusEvent(bool focused)
         if (g_state.keyDown[key])
           app_handleKeyRelease(key);
 
+    g_state.escapeActive = false;
+
     if (!g_params.showCursorDot)
-      g_state.ds->showPointer(false);
+      g_state.ds->setPointer(LG_POINTER_NONE);
 
     if (g_params.minimizeOnFocusLoss)
       g_state.ds->minimize();
@@ -109,6 +130,15 @@ void app_handleEnterEvent(bool entered)
   {
     g_cursor.inWindow = false;
     core_setCursorInView(false);
+
+    // stop the user being able to drag windows off the screen and work around
+    // the mouse button release being missed due to not being in capture mode.
+    if (g_state.overlayInput)
+    {
+      g_state.io->MouseDown[ImGuiMouseButton_Left  ] = false;
+      g_state.io->MouseDown[ImGuiMouseButton_Right ] = false;
+      g_state.io->MouseDown[ImGuiMouseButton_Middle] = false;
+    }
 
     if (!core_inputEnabled())
       return;
@@ -186,7 +216,7 @@ void app_clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
   if (!g_params.clipboardToLocal)
     return;
 
-  struct CBRequest * cbr = (struct CBRequest *)malloc(sizeof(struct CBRequest));
+  struct CBRequest * cbr = malloc(sizeof(*cbr));
 
   cbr->type    = g_state.cbType;
   cbr->replyFn = replyFn;
@@ -196,21 +226,32 @@ void app_clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
   spice_clipboard_request(g_state.cbType);
 }
 
-void spiceClipboardNotice(const SpiceDataType type)
+static int mapSpiceToImGuiButton(uint32_t button)
 {
-  if (!g_params.clipboardToLocal)
-    return;
+  switch (button)
+  {
+    case 1:  // SPICE_MOUSE_BUTTON_LEFT
+      return ImGuiMouseButton_Left;
+    case 2:  // SPICE_MOUSE_BUTTON_MIDDLE
+      return ImGuiMouseButton_Middle;
+    case 3:  // SPICE_MOUSE_BUTTON_RIGHT
+      return ImGuiMouseButton_Right;
+  }
 
-  if (!g_state.cbAvailable)
-    return;
-
-  g_state.cbType = type;
-  g_state.ds->cbNotice(cb_spiceTypeToLGType(type));
+  return -1;
 }
 
 void app_handleButtonPress(int button)
 {
   g_cursor.buttons |= (1U << button);
+
+  if (g_state.overlayInput)
+  {
+    int igButton = mapSpiceToImGuiButton(button);
+    if (igButton != -1)
+      g_state.io->MouseDown[igButton] = true;
+    return;
+  }
 
   if (!core_inputEnabled() || !g_cursor.inView)
     return;
@@ -223,6 +264,14 @@ void app_handleButtonRelease(int button)
 {
   g_cursor.buttons &= ~(1U << button);
 
+  if (g_state.overlayInput)
+  {
+    int igButton = mapSpiceToImGuiButton(button);
+    if (igButton != -1)
+      g_state.io->MouseDown[igButton] = false;
+    return;
+  }
+
   if (!core_inputEnabled())
     return;
 
@@ -230,19 +279,37 @@ void app_handleButtonRelease(int button)
     DEBUG_ERROR("app_handleButtonRelease: failed to send message");
 }
 
+void app_handleWheelMotion(double motion)
+{
+  if (g_state.overlayInput)
+    g_state.io->MouseWheel -= motion;
+}
+
 void app_handleKeyPress(int sc)
 {
-  if (sc == g_params.escapeKey && !g_state.escapeActive)
+  if (!g_state.overlayInput || !g_state.io->WantCaptureKeyboard)
   {
-    g_state.escapeActive = true;
-    g_state.escapeTime   = microtime();
-    g_state.escapeAction = -1;
-    return;
+    if (sc == g_params.escapeKey && !g_state.escapeActive)
+    {
+      g_state.escapeActive = true;
+      g_state.escapeTime   = microtime();
+      g_state.escapeAction = -1;
+      return;
+    }
+
+    if (g_state.escapeActive)
+    {
+      g_state.escapeAction = sc;
+      return;
+    }
   }
 
-  if (g_state.escapeActive)
+  if (g_state.overlayInput)
   {
-    g_state.escapeAction = sc;
+    if (sc == KEY_ESC)
+      app_setOverlay(false);
+    else
+      g_state.io->KeysDown[sc] = true;
     return;
   }
 
@@ -254,7 +321,7 @@ void app_handleKeyPress(int sc)
 
   if (!g_state.keyDown[sc])
   {
-    uint32_t ps2 = xfree86_to_ps2[sc];
+    uint32_t ps2 = linux_to_ps2[sc];
     if (!ps2)
       return;
 
@@ -274,7 +341,7 @@ void app_handleKeyRelease(int sc)
   {
     if (g_state.escapeAction == -1)
     {
-      if (!g_state.escapeHelp && g_params.useSpiceInput)
+      if (!g_state.escapeHelp && g_params.useSpiceInput && !g_state.overlayInput)
         core_setGrab(!g_cursor.grab);
     }
     else
@@ -291,6 +358,12 @@ void app_handleKeyRelease(int sc)
       g_state.escapeActive = false;
   }
 
+  if (g_state.overlayInput)
+  {
+    g_state.io->KeysDown[sc] = false;
+    return;
+  }
+
   if (!core_inputEnabled())
     return;
 
@@ -301,7 +374,7 @@ void app_handleKeyRelease(int sc)
   if (g_params.ignoreWindowsKeys && (sc == KEY_LEFTMETA || sc == KEY_RIGHTMETA))
     return;
 
-  uint32_t ps2 = xfree86_to_ps2[sc];
+  uint32_t ps2 = linux_to_ps2[sc];
   if (!ps2)
     return;
 
@@ -314,9 +387,39 @@ void app_handleKeyRelease(int sc)
   }
 }
 
+void app_handleKeyboardTyped(const char * typed)
+{
+  ImGuiIO_AddInputCharactersUTF8(g_state.io, typed);
+}
+
+void app_handleKeyboardModifiers(bool ctrl, bool shift, bool alt, bool super)
+{
+  g_state.modCtrl  = ctrl;
+  g_state.modShift = shift;
+  g_state.modAlt   = alt;
+  g_state.modSuper = super;
+}
+
+void app_handleKeyboardLEDs(bool numLock, bool capsLock, bool scrollLock)
+{
+  if (!core_inputEnabled())
+    return;
+
+  uint32_t modifiers =
+    (scrollLock ? 1 /* SPICE_SCROLL_LOCK_MODIFIER */ : 0) |
+    (numLock    ? 2 /* SPICE_NUM_LOCK_MODIFIER    */ : 0) |
+    (capsLock   ? 4 /* SPICE_CAPS_LOCK_MODIFIER   */ : 0);
+
+  if (!spice_key_modifiers(modifiers))
+    DEBUG_ERROR("app_handleKeyboardLEDs: failed to send message");
+}
+
 void app_handleMouseRelative(double normx, double normy,
     double rawx, double rawy)
 {
+  if (g_state.overlayInput)
+    return;
+
   if (g_cursor.grab)
   {
     if (g_params.rawMouse)
@@ -336,7 +439,7 @@ void app_handleMouseRelative(double normx, double normy,
 void app_handleMouseBasic()
 {
   /* do not pass mouse events to the guest if we do not have focus */
-  if (!g_cursor.guest.valid || !g_state.haveSrcSize || !g_state.focused)
+  if (!g_cursor.guest.valid || !g_state.haveSrcSize || !g_state.focused || g_state.overlayInput)
     return;
 
   if (!core_inputEnabled())
@@ -412,6 +515,13 @@ void app_handleResizeEvent(int w, int h, double scale, const struct Border borde
   }
 }
 
+void app_invalidateWindow(bool full)
+{
+  if (full)
+    atomic_store(&g_state.invalidateWindow, true);
+  lgSignalEvent(g_state.frameEvent);
+}
+
 void app_handleCloseEvent(void)
 {
   if (!g_params.ignoreQuit || !g_cursor.inView)
@@ -420,12 +530,13 @@ void app_handleCloseEvent(void)
 
 void app_handleRenderEvent(const uint64_t timeUs)
 {
+  bool invalidate = false;
   if (!g_state.escapeActive)
   {
     if (g_state.escapeHelp)
     {
       g_state.escapeHelp = false;
-      app_showHelp(false);
+      invalidate = true;
     }
   }
   else
@@ -433,9 +544,21 @@ void app_handleRenderEvent(const uint64_t timeUs)
     if (!g_state.escapeHelp && timeUs - g_state.escapeTime > g_params.helpMenuDelayUs)
     {
       g_state.escapeHelp = true;
-      app_showHelp(true);
+      invalidate = true;
     }
   }
+
+  if (g_state.alertShow)
+    if (g_state.alertTimeout < timeUs)
+    {
+      g_state.alertShow = false;
+      free(g_state.alertMessage);
+      g_state.alertMessage = NULL;
+      invalidate = true;
+    }
+
+  if (invalidate)
+    app_invalidateWindow(false);
 }
 
 void app_setFullscreen(bool fs)
@@ -509,14 +632,12 @@ void app_alert(LG_MsgAlert type, const char * fmt, ...)
   valloc_sprintf(&buffer, fmt, args);
   va_end(args);
 
-  g_state.lgr->on_alert(
-    g_state.lgrData,
-    type,
-    buffer,
-    NULL
-  );
-
-  free(buffer);
+  free(g_state.alertMessage);
+  g_state.alertMessage = buffer;
+  g_state.alertTimeout = microtime() + ALERT_TIMEOUT;
+  g_state.alertType    = type;
+  g_state.alertShow    = true;
+  app_invalidateWindow(false);
 }
 
 KeybindHandle app_registerKeybind(int sc, KeybindFn callback, void * opaque, const char * description)
@@ -528,7 +649,7 @@ KeybindHandle app_registerKeybind(int sc, KeybindFn callback, void * opaque, con
     return NULL;
   }
 
-  KeybindHandle handle = (KeybindHandle)malloc(sizeof(struct KeybindHandle));
+  KeybindHandle handle = malloc(sizeof(*handle));
   handle->sc       = sc;
   handle->callback = callback;
   handle->opaque   = opaque;
@@ -558,62 +679,246 @@ void app_releaseAllKeybinds(void)
     }
 }
 
-static char * build_help_str()
+GraphHandle app_registerGraph(const char * name, RingBuffer buffer, float min, float max)
 {
-  size_t size   = 50;
-  size_t offset = 0;
-  char * buffer = malloc(size);
+  return overlayGraph_register(name, buffer, min, max);
+}
 
-  if (!buffer)
-    return NULL;
+void app_unregisterGraph(GraphHandle handle)
+{
+  overlayGraph_unregister(handle);
+}
 
-  const char * escapeName = xfree86_to_display[g_params.escapeKey];
+struct Overlay
+{
+  const struct LG_OverlayOps * ops;
+  const void * params;
+  void * udata;
+  int lastRectCount;
+  struct Rect lastRects[MAX_OVERLAY_RECTS];
+};
 
-  offset += snprintf(buffer, size, "%s %-10s Toggle capture mode\n", escapeName, "");
-  if (offset >= size)
+void app_registerOverlay(const struct LG_OverlayOps * ops, const void * params)
+{
+  ASSERT_LG_OVERLAY_VALID(ops);
+
+  struct Overlay * overlay = malloc(sizeof(*overlay));
+  overlay->ops           = ops;
+  overlay->params        = params;
+  overlay->udata         = NULL;
+  overlay->lastRectCount = 0;
+  ll_push(g_state.overlays, overlay);
+
+  if (ops->earlyInit)
+    ops->earlyInit();
+}
+
+void app_initOverlays(void)
+{
+  struct Overlay * overlay;
+  for (ll_reset(g_state.overlays);
+      ll_walk(g_state.overlays, (void **)&overlay); )
   {
-    DEBUG_ERROR("Help string somehow overflowed. This should be impossible.");
-    return NULL;
+    if (!overlay->ops->init(&overlay->udata, overlay->params))
+    {
+      DEBUG_ERROR("Overlay `%s` failed to initialize", overlay->ops->name);
+      overlay->ops = NULL;
+    }
+  }
+}
+
+static inline void mergeRect(struct Rect * dest, const struct Rect * a, const struct Rect * b)
+{
+  int x2 = max(a->x + a->w, b->x + b->w);
+  int y2 = max(a->y + a->h, b->y + b->h);
+
+  dest->x = min(a->x, b->x);
+  dest->y = min(a->y, b->y);
+  dest->w = x2 - dest->x;
+  dest->h = y2 - dest->y;
+}
+
+static inline LG_DSPointer mapImGuiCursor(ImGuiMouseCursor cursor)
+{
+  switch (cursor)
+  {
+    case ImGuiMouseCursor_None:
+      return LG_POINTER_NONE;
+    case ImGuiMouseCursor_Arrow:
+      return LG_POINTER_ARROW;
+    case ImGuiMouseCursor_TextInput:
+      return LG_POINTER_INPUT;
+    case ImGuiMouseCursor_ResizeAll:
+      return LG_POINTER_MOVE;
+    case ImGuiMouseCursor_ResizeNS:
+      return LG_POINTER_RESIZE_NS;
+    case ImGuiMouseCursor_ResizeEW:
+      return LG_POINTER_RESIZE_EW;
+    case ImGuiMouseCursor_ResizeNESW:
+      return LG_POINTER_RESIZE_NESW;
+    case ImGuiMouseCursor_ResizeNWSE:
+      return LG_POINTER_RESIZE_NWSE;
+    case ImGuiMouseCursor_Hand:
+      return LG_POINTER_HAND;
+    case ImGuiMouseCursor_NotAllowed:
+      return LG_POINTER_NOT_ALLOWED;
+    default:
+      return LG_POINTER_ARROW;
+  }
+}
+
+bool app_overlayNeedsRender(void)
+{
+  struct Overlay * overlay;
+
+  if (g_state.overlayInput)
+    return true;
+
+  for (ll_reset(g_state.overlays);
+      ll_walk(g_state.overlays, (void **)&overlay); )
+  {
+    if (!overlay->ops->needs_render)
+      continue;
+
+    if (overlay->ops->needs_render(overlay->udata, g_state.overlayInput))
+      return true;
   }
 
-  for (int i = 0; i < KEY_MAX; ++i)
+  return false;
+}
+
+int app_renderOverlay(struct Rect * rects, int maxRects)
+{
+  int  totalRects  = 0;
+  bool totalDamage = false;
+  struct Overlay * overlay;
+  struct Rect buffer[MAX_OVERLAY_RECTS];
+
+  g_state.io->KeyCtrl  = g_state.modCtrl;
+  g_state.io->KeyShift = g_state.modShift;
+  g_state.io->KeyAlt   = g_state.modAlt;
+  g_state.io->KeySuper = g_state.modSuper;
+
+  uint64_t now = nanotime();
+  g_state.io->DeltaTime  = (now - g_state.lastImGuiFrame) * 1e-9f;
+  g_state.lastImGuiFrame = now;
+
+  igNewFrame();
+
+  if (g_state.overlayInput)
   {
-    if (g_state.keyDescription[i])
+    totalDamage = true;
+    ImDrawList_AddRectFilled(igGetBackgroundDrawListNil(), (ImVec2) { 0.0f , 0.0f },
+      g_state.io->DisplaySize, igGetColorU32Col(ImGuiCol_ModalWindowDimBg, 1.0f), 0, 0);
+
+//    bool test;
+//    igShowDemoWindow(&test);
+  }
+
+  // render the overlays
+  for (ll_reset(g_state.overlays);
+      ll_walk(g_state.overlays, (void **)&overlay); )
+  {
+    const int written =
+      overlay->ops->render(overlay->udata, g_state.overlayInput,
+          buffer, MAX_OVERLAY_RECTS);
+
+    for (int i = 0; i < written; ++i)
     {
-      const char * keyName = xfree86_to_display[i];
-      const char * desc    = g_state.keyDescription[i];
-      int needed = snprintf(buffer + offset, size - offset, "%s+%-10s %s\n", escapeName, keyName, desc);
-      if (offset + needed < size)
-        offset += needed;
-      else
-      {
-        size = size * 2 + needed;
-        void * new = realloc(buffer, size);
-        if (!new) {
-          free(buffer);
-          DEBUG_ERROR("Out of memory when constructing help text");
-          return NULL;
-        }
-        buffer = new;
-        offset += snprintf(buffer + offset, size - offset, "%s+%-10s %s\n", escapeName, keyName, desc);
-      }
+      buffer[i].x *= g_state.windowScale;
+      buffer[i].y *= g_state.windowScale;
+      buffer[i].w *= g_state.windowScale;
+      buffer[i].h *= g_state.windowScale;
+    }
+
+    // It is an error to run out of rectangles, because we will not be able to
+    // correctly calculate the damage of the next frame.
+    DEBUG_ASSERT(written >= 0);
+
+    const int toAdd = max(written, overlay->lastRectCount);
+    totalDamage |= toAdd > maxRects;
+
+    if (!totalDamage && toAdd)
+    {
+      int i = 0;
+      for (; i < overlay->lastRectCount && i < written; ++i)
+        mergeRect(rects + i, buffer + i, overlay->lastRects + i);
+
+      // only one of the following memcpys will copy non-zero bytes.
+      memcpy(rects + i, buffer + i, (written - i) * sizeof(struct Rect));
+      memcpy(rects + i, overlay->lastRects + i, (overlay->lastRectCount - i) * sizeof(struct Rect));
+
+      rects      += toAdd;
+      totalRects += toAdd;
+      maxRects   -= toAdd;
+    }
+
+    memcpy(overlay->lastRects, buffer, sizeof(struct Rect) * written);
+    overlay->lastRectCount = written;
+  }
+
+  if (g_state.overlayInput)
+  {
+    ImGuiMouseCursor cursor = igGetMouseCursor();
+    if (cursor != g_state.cursorLast)
+    {
+      g_state.ds->setPointer(mapImGuiCursor(cursor));
+      g_state.cursorLast = cursor;
     }
   }
 
-  return buffer;
+  igRender();
+
+  return totalDamage ? -1 : totalRects;
 }
 
-void app_showHelp(bool show)
+void app_freeOverlays(void)
 {
-  char * help = show ? build_help_str() : NULL;
-  g_state.lgr->on_help(g_state.lgrData, help);
-  free(help);
+  struct Overlay * overlay;
+  while(ll_shift(g_state.overlays, (void **)&overlay))
+  {
+    overlay->ops->free(overlay->udata);
+    free(overlay);
+  }
 }
 
-void app_showFPS(bool showFPS)
+void app_setOverlay(bool enable)
 {
-  if (!g_state.lgr)
+  static bool wasGrabbed = false;
+
+  if (g_state.overlayInput == enable)
     return;
 
-  g_state.lgr->on_show_fps(g_state.lgrData, showFPS);
+  g_state.overlayInput = enable;
+  g_state.cursorLast   = -2;
+
+  if (g_state.overlayInput)
+  {
+    wasGrabbed = g_cursor.grab;
+
+    g_state.io->ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+    g_state.io->MousePos = (ImVec2) { g_cursor.pos.x, g_cursor.pos.y };
+
+    core_setGrabQuiet(false);
+    core_setCursorInView(false);
+  }
+  else
+  {
+    g_state.io->ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    core_resetOverlayInputState();
+    core_setGrabQuiet(wasGrabbed);
+    app_invalidateWindow(false);
+  }
+}
+
+void app_overlayConfigRegister(const char * title,
+    void (*callback)(void * udata, int * id), void * udata)
+{
+  overlayConfig_register(title, callback, udata);
+}
+
+void app_overlayConfigRegisterTab(const char * title,
+    void (*callback)(void * udata, int * id), void * udata)
+{
+  overlayConfig_registerTab(title, callback, udata);
 }

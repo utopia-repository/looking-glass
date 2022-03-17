@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,6 +22,7 @@
 
 #include <stdbool.h>
 
+#include "egl.h"
 #include "interface/renderer.h"
 
 typedef struct EGL_Cursor EGL_Cursor;
@@ -31,10 +32,10 @@ struct CursorState {
   struct Rect rect;
 };
 
-bool egl_cursor_init(EGL_Cursor ** cursor);
-void egl_cursor_free(EGL_Cursor ** cursor);
+bool egl_cursorInit(EGL_Cursor ** cursor);
+void egl_cursorFree(EGL_Cursor ** cursor);
 
-bool egl_cursor_set_shape(
+bool egl_cursorSetShape(
     EGL_Cursor * cursor,
     const LG_RendererCursor type,
     const int width,
@@ -42,11 +43,10 @@ bool egl_cursor_set_shape(
     const int stride,
     const uint8_t * data);
 
-void egl_cursor_set_size(EGL_Cursor * cursor, const float x, const float y);
+void egl_cursorSetSize(EGL_Cursor * cursor, const float x, const float y);
 
-void egl_cursor_set_state(EGL_Cursor * cursor, const bool visible,
+void egl_cursorSetState(EGL_Cursor * cursor, const bool visible,
     const float x, const float y);
 
-struct CursorState egl_cursor_get_state(EGL_Cursor * cursor, int width, int height);
-
-void egl_cursor_render(EGL_Cursor * cursor, LG_RendererRotate rotate);
+struct CursorState egl_cursorRender(EGL_Cursor * cursor,
+    LG_RendererRotate rotate, int width, int height);

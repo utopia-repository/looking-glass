@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <EGL/egl.h>
 #include "common/types.h"
+#include "common/debug.h"
 
 typedef enum LG_ClipboardData
 {
@@ -62,6 +63,24 @@ enum LG_DSWarpSupport
   LG_DS_WARP_SCREEN,
 };
 
+typedef enum LG_DSPointer
+{
+  LG_POINTER_NONE = 0,
+  LG_POINTER_SQUARE,
+  LG_POINTER_ARROW,
+  LG_POINTER_INPUT,
+  LG_POINTER_MOVE,
+  LG_POINTER_RESIZE_NS,
+  LG_POINTER_RESIZE_EW,
+  LG_POINTER_RESIZE_NESW,
+  LG_POINTER_RESIZE_NWSE,
+  LG_POINTER_HAND,
+  LG_POINTER_NOT_ALLOWED,
+}
+LG_DSPointer;
+
+#define LG_POINTER_COUNT (LG_POINTER_NOT_ALLOWED + 1)
+
 typedef struct LG_DSInitParams
 {
   const char * title;
@@ -74,6 +93,10 @@ typedef struct LG_DSInitParams
 
   // if true the renderer requires an OpenGL context
   bool opengl;
+
+  // x11 needs to know if this is in use so we can decide to setup for
+  // presentation times
+  bool jitRender;
 }
 LG_DSInitParams;
 
@@ -82,6 +105,8 @@ typedef void (* LG_ClipboardReplyFn)(void * opaque, const LG_ClipboardData type,
 
 typedef struct LG_DSGLContext
   * LG_DSGLContext;
+
+typedef struct LGEvent LGEvent;
 
 struct LG_DisplayServerOps
 {
@@ -129,9 +154,22 @@ struct LG_DisplayServerOps
   void (*glSwapBuffers)(void);
 #endif
 
+  /* Waits for a good time to render the next frame in time for the next vblank.
+   * This is optional and a display server may choose to not implement it.
+   *
+   * return true to force the frame to be rendered, this is used by X11 for
+   * calibration */
+  bool (*waitFrame)(void);
+
+  /* This must be called when waitFrame returns, but no frame is actually rendered. */
+  void (*skipFrame)(void);
+
+  /* This is used to interrupt waitFrame. */
+  void (*stopWaitFrame)(void);
+
   /* dm specific cursor implementations */
   void (*guestPointerUpdated)(double x, double y, double localX, double localY);
-  void (*showPointer)(bool show);
+  void (*setPointer)(LG_DSPointer pointer);
   void (*grabKeyboard)();
   void (*ungrabKeyboard)();
   /* (un)grabPointer is used to toggle cursor tracking/confine in normal mode */
@@ -173,49 +211,50 @@ struct LG_DisplayServerOps
 };
 
 #ifdef ENABLE_EGL
-  #define ASSERT_EGL_FN(x) assert(x);
+  #define ASSERT_EGL_FN(x) DEBUG_ASSERT(x)
 #else
   #define ASSERT_EGL_FN(x)
 #endif
 
 #ifdef ENABLE_OPENGL
-  #define ASSERT_OPENGL_FN(x) assert(x)
+  #define ASSERT_OPENGL_FN(x) DEBUG_ASSERT(x)
 #else
   #define ASSERT_OPENGL_FN(x)
 #endif
 
 #define ASSERT_LG_DS_VALID(x) \
-  assert((x)->setup              ); \
-  assert((x)->probe              ); \
-  assert((x)->earlyInit          ); \
-  assert((x)->init               ); \
-  assert((x)->startup            ); \
-  assert((x)->shutdown           ); \
-  assert((x)->free               ); \
-  assert((x)->getProp            ); \
-  ASSERT_EGL_FN((x)->getEGLDisplay      ); \
-  ASSERT_EGL_FN((x)->getEGLNativeWindow ); \
-  ASSERT_EGL_FN((x)->eglSwapBuffers     ); \
+  DEBUG_ASSERT((x)->setup    ); \
+  DEBUG_ASSERT((x)->probe    ); \
+  DEBUG_ASSERT((x)->earlyInit); \
+  DEBUG_ASSERT((x)->init     ); \
+  DEBUG_ASSERT((x)->startup  ); \
+  DEBUG_ASSERT((x)->shutdown ); \
+  DEBUG_ASSERT((x)->free     ); \
+  DEBUG_ASSERT((x)->getProp  ); \
+  ASSERT_EGL_FN((x)->getEGLDisplay     ); \
+  ASSERT_EGL_FN((x)->getEGLNativeWindow); \
+  ASSERT_EGL_FN((x)->eglSwapBuffers    ); \
   ASSERT_OPENGL_FN((x)->glCreateContext  ); \
   ASSERT_OPENGL_FN((x)->glDeleteContext  ); \
   ASSERT_OPENGL_FN((x)->glMakeCurrent    ); \
   ASSERT_OPENGL_FN((x)->glSetSwapInterval); \
   ASSERT_OPENGL_FN((x)->glSwapBuffers    ); \
-  assert((x)->guestPointerUpdated); \
-  assert((x)->showPointer        ); \
-  assert((x)->grabPointer        ); \
-  assert((x)->ungrabPointer      ); \
-  assert((x)->capturePointer     ); \
-  assert((x)->uncapturePointer   ); \
-  assert((x)->warpPointer        ); \
-  assert((x)->realignPointer     ); \
-  assert((x)->isValidPointerPos  ); \
-  assert((x)->inhibitIdle        ); \
-  assert((x)->uninhibitIdle      ); \
-  assert((x)->wait               ); \
-  assert((x)->setWindowSize      ); \
-  assert((x)->setFullscreen      ); \
-  assert((x)->getFullscreen      ); \
-  assert((x)->minimize           );
+  DEBUG_ASSERT(!(x)->waitFrame == !(x)->stopWaitFrame); \
+  DEBUG_ASSERT((x)->guestPointerUpdated); \
+  DEBUG_ASSERT((x)->setPointer         ); \
+  DEBUG_ASSERT((x)->grabPointer        ); \
+  DEBUG_ASSERT((x)->ungrabPointer      ); \
+  DEBUG_ASSERT((x)->capturePointer     ); \
+  DEBUG_ASSERT((x)->uncapturePointer   ); \
+  DEBUG_ASSERT((x)->warpPointer        ); \
+  DEBUG_ASSERT((x)->realignPointer     ); \
+  DEBUG_ASSERT((x)->isValidPointerPos  ); \
+  DEBUG_ASSERT((x)->inhibitIdle        ); \
+  DEBUG_ASSERT((x)->uninhibitIdle      ); \
+  DEBUG_ASSERT((x)->wait               ); \
+  DEBUG_ASSERT((x)->setWindowSize      ); \
+  DEBUG_ASSERT((x)->setFullscreen      ); \
+  DEBUG_ASSERT((x)->getFullscreen      ); \
+  DEBUG_ASSERT((x)->minimize           );
 
 #endif

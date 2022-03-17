@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -89,7 +89,7 @@ static bool load_symbols(void)
   }
 
   long storage   = bfd_get_symtab_upper_bound(crash.fd);
-  crash.syms     = (asymbol **)malloc(storage);
+  crash.syms     = malloc(storage);
   crash.symCount = bfd_canonicalize_symtab(crash.fd, crash.syms);
   if (crash.symCount < 0)
   {
@@ -164,7 +164,7 @@ static int dl_iterate_phdr_callback(struct dl_phdr_info * info, size_t size, voi
       ttl += hdr.p_memsz;
   }
 
-  crash.ranges = realloc(crash.ranges, sizeof(struct range) * (crash.rangeCount + 1));
+  crash.ranges = realloc(crash.ranges, sizeof(*crash.ranges) * (crash.rangeCount + 1));
   crash.ranges[crash.rangeCount].start = info->dlpi_addr;
   crash.ranges[crash.rangeCount].end   = info->dlpi_addr + ttl;
   ++crash.rangeCount;

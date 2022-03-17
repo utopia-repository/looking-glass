@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
 
 #include "common/option.h"
 #include "common/debug.h"
+#include "common/paths.h"
 #include "common/stringutils.h"
 
 #include <sys/stat.h>
@@ -210,16 +211,8 @@ static struct Option options[] =
   },
   {
     .module         = "win",
-    .name           = "showFPS",
-    .description    = "Enable the FPS & UPS display",
-    .shortopt       = 'k',
-    .type           = OPTION_TYPE_BOOL,
-    .value.x_bool   = false,
-  },
-  {
-    .module         = "win",
     .name           = "ignoreQuit",
-    .description    = "Ignore requests to quit (ie: Alt+F4)",
+    .description    = "Ignore requests to quit (i.e. Alt+F4)",
     .shortopt       = 'Q',
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = false,
@@ -262,6 +255,27 @@ static struct Option options[] =
     .validator      = optRotateValidate,
     .value.x_int    = 0,
   },
+  {
+    .module         = "win",
+    .name           = "uiFont",
+    .description    = "The font to use when rendering on-screen UI",
+    .type           = OPTION_TYPE_STRING,
+    .value.x_string = "DejaVu Sans Mono",
+  },
+  {
+    .module         = "win",
+    .name           = "uiSize",
+    .description    = "The font size to use when rendering on-screen UI",
+    .type           = OPTION_TYPE_INT,
+    .value.x_int    = 14
+  },
+  {
+    .module         = "win",
+    .name           = "jitRender",
+    .description    = "Enable just-in-time rendering",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false,
+  },
 
   // input options
   {
@@ -277,7 +291,7 @@ static struct Option options[] =
     .name           = "grabKeyboardOnFocus",
     .description    = "Grab the keyboard when focused",
     .type           = OPTION_TYPE_BOOL,
-    .value.x_bool   = true,
+    .value.x_bool   = false,
   },
   {
     .module         = "input",
@@ -396,21 +410,21 @@ static struct Option options[] =
   {
     .module         = "spice",
     .name           = "clipboard",
-    .description    = "Use SPICE to syncronize the clipboard contents with the guest",
+    .description    = "Use SPICE to synchronize the clipboard contents with the guest",
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true
   },
   {
     .module         = "spice",
     .name           = "clipboardToVM",
-    .description    = "Allow the clipboard to be syncronized TO the VM",
+    .description    = "Allow the clipboard to be synchronized TO the VM",
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true
   },
   {
     .module         = "spice",
     .name           = "clipboardToLocal",
-    .description    = "Allow the clipboard to be syncronized FROM the VM",
+    .description    = "Allow the clipboard to be synchronized FROM the VM",
     .type           = OPTION_TYPE_BOOL,
     .value.x_bool   = true
   },
@@ -459,18 +473,18 @@ bool config_load(int argc, char * argv[])
 {
   // load any global options first
   struct stat st;
-  if (stat("/etc/looking-glass-client.ini", &st) >= 0)
+  if (stat("/etc/looking-glass-client.ini", &st) >= 0 && S_ISREG(st.st_mode))
   {
     DEBUG_INFO("Loading config from: /etc/looking-glass-client.ini");
     if (!option_load("/etc/looking-glass-client.ini"))
       return false;
   }
 
-  // load user's local options
+  // load config from user's home directory
   struct passwd * pw = getpwuid(getuid());
   char * localFile;
   alloc_sprintf(&localFile, "%s/.looking-glass-client.ini", pw->pw_dir);
-  if (stat(localFile, &st) >= 0)
+  if (stat(localFile, &st) >= 0 && S_ISREG(st.st_mode))
   {
     DEBUG_INFO("Loading config from: %s", localFile);
     if (!option_load(localFile))
@@ -481,6 +495,21 @@ bool config_load(int argc, char * argv[])
   }
   free(localFile);
 
+  // load config from XDG_CONFIG_HOME
+  char * xdgFile;
+  alloc_sprintf(&xdgFile, "%s/client.ini", lgConfigDir());
+
+  if (xdgFile && stat(xdgFile, &st) >= 0 && S_ISREG(st.st_mode))
+  {
+    DEBUG_INFO("Loading config from: %s", xdgFile);
+    if (!option_load(xdgFile))
+    {
+      free(xdgFile);
+      return false;
+    }
+  }
+  free(xdgFile);
+
   // parse the command line arguments
   if (!option_parse(argc, argv))
     return false;
@@ -489,6 +518,12 @@ bool config_load(int argc, char * argv[])
   const char * configFile = option_get_string("app", "configFile");
   if (configFile)
   {
+    if (stat(configFile, &st) < 0 || !S_ISREG(st.st_mode))
+    {
+      DEBUG_ERROR("app:configFile set to invalid file: %s", configFile);
+      return false;
+    }
+
     DEBUG_INFO("Loading config from: %s", configFile);
     if (!option_load(configFile))
       return false;
@@ -520,17 +555,19 @@ bool config_load(int argc, char * argv[])
   g_params.fullscreen      = option_get_bool  ("win", "fullScreen"     );
   g_params.maximize        = option_get_bool  ("win", "maximize"       );
   g_params.fpsMin          = option_get_int   ("win", "fpsMin"         );
-  g_params.showFPS         = option_get_bool  ("win", "showFPS"        );
   g_params.ignoreQuit      = option_get_bool  ("win", "ignoreQuit"     );
   g_params.noScreensaver   = option_get_bool  ("win", "noScreensaver"  );
   g_params.autoScreensaver = option_get_bool  ("win", "autoScreensaver");
   g_params.showAlerts      = option_get_bool  ("win", "alerts"         );
   g_params.quickSplash     = option_get_bool  ("win", "quickSplash"    );
+  g_params.uiFont          = option_get_string("win"  , "uiFont"       );
+  g_params.uiSize          = option_get_int   ("win"  , "uiSize"       );
+  g_params.jitRender       = option_get_bool  ("win"  , "jitRender"    );
 
   if (g_params.noScreensaver && g_params.autoScreensaver)
   {
-    fprintf(stderr, "win:noScreensaver (-S) and win:autoScreensaver "
-        "can't be used simultaneously\n");
+    DEBUG_WARN("win:noScreensaver (-S) and win:autoScreensaver "
+        "can't be used simultaneously");
     return false;
   }
 
@@ -554,6 +591,12 @@ bool config_load(int argc, char * argv[])
   g_params.mouseRedraw            = option_get_bool("input", "mouseRedraw"           );
   g_params.autoCapture            = option_get_bool("input", "autoCapture"           );
   g_params.captureInputOnly       = option_get_bool("input", "captureOnly"           );
+
+  if (g_params.jitRender && !g_params.mouseRedraw)
+  {
+    DEBUG_WARN("win:jitRender is enabled, forcing input:mouseRedraw");
+    g_params.mouseRedraw = true;
+  }
 
   g_params.helpMenuDelayUs = option_get_int("input", "helpMenuDelay") * (uint64_t) 1000;
 
@@ -596,24 +639,26 @@ void config_free(void)
 static void doLicense(void)
 {
   fprintf(stderr,
+    // BEGIN LICENSE BLOCK
     "\n"
-    "Looking Glass - KVM FrameRelay (KVMFR) Client\n"
-    "Copyright(C) 2017-2021 Geoffrey McRae <geoff@hostfission.com>\n"
-    "https://looking-glass.hostfission.com\n"
+    "Looking Glass\n"
+    "Copyright © 2017-2021 The Looking Glass Authors\n"
+    "https://looking-glass.io\n"
     "\n"
-    "This program is free software; you can redistribute it and / or modify it under\n"
+    "This program is free software; you can redistribute it and/or modify it under\n"
     "the terms of the GNU General Public License as published by the Free Software\n"
     "Foundation; either version 2 of the License, or (at your option) any later\n"
     "version.\n"
     "\n"
     "This program is distributed in the hope that it will be useful, but WITHOUT ANY\n"
     "WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A\n"
-    "PARTICULAR PURPOSE.See the GNU General Public License for more details.\n"
+    "PARTICULAR PURPOSE. See the GNU General Public License for more details.\n"
     "\n"
     "You should have received a copy of the GNU General Public License along with\n"
     "this program; if not, write to the Free Software Foundation, Inc., 59 Temple\n"
-    "Place, Suite 330, Boston, MA 02111 - 1307 USA\n"
+    "Place, Suite 330, Boston, MA 02111-1307 USA\n"
     "\n"
+    // END LICENSE BLOCK
   );
 }
 
@@ -629,7 +674,7 @@ static bool optRendererParse(struct Option * opt, const char * str)
   }
 
   for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
-    if (strcasecmp(str, LG_Renderers[i]->get_name()) == 0)
+    if (strcasecmp(str, LG_Renderers[i]->getName()) == 0)
     {
       g_params.forceRenderer      = true;
       g_params.forceRendererIndex = i;
@@ -645,7 +690,7 @@ static StringList optRendererValues(struct Option * opt)
 
   // this typecast is safe as the stringlist doesn't own the values
   for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
-    stringlist_push(sl, (char *)LG_Renderers[i]->get_name());
+    stringlist_push(sl, (char *)LG_Renderers[i]->getName());
 
   return sl;
 }
@@ -658,7 +703,7 @@ static char * optRendererToString(struct Option * opt)
   if (g_params.forceRendererIndex >= LG_RENDERER_COUNT)
     return NULL;
 
-  return strdup(LG_Renderers[g_params.forceRendererIndex]->get_name());
+  return strdup(LG_Renderers[g_params.forceRendererIndex]->getName());
 }
 
 static bool optPosParse(struct Option * opt, const char * str)
@@ -685,7 +730,7 @@ static StringList optPosValues(struct Option * opt)
 {
   StringList sl = stringlist_new(false);
   stringlist_push(sl, "center");
-  stringlist_push(sl, "<left>x<top>, ie: 100x100");
+  stringlist_push(sl, "<left>x<top>, e.g. 100x100");
   return sl;
 }
 
@@ -706,7 +751,7 @@ static bool optSizeParse(struct Option * opt, const char * str)
   if (!str)
     return false;
 
-  if (sscanf(str, "%dx%d", &g_params.w, &g_params.h) == 2)
+  if (sscanf(str, "%ux%u", &g_params.w, &g_params.h) == 2)
   {
     if (g_params.w < 1 || g_params.h < 1)
       return false;
@@ -719,15 +764,15 @@ static bool optSizeParse(struct Option * opt, const char * str)
 static StringList optSizeValues(struct Option * opt)
 {
   StringList sl = stringlist_new(false);
-  stringlist_push(sl, "<left>x<top>, ie: 100x100");
+  stringlist_push(sl, "<left>x<top>, e.g. 100x100");
   return sl;
 }
 
 static char * optSizeToString(struct Option * opt)
 {
-  int len = snprintf(NULL, 0, "%dx%d", g_params.w, g_params.h);
+  int len = snprintf(NULL, 0, "%ux%u", g_params.w, g_params.h);
   char * str = malloc(len + 1);
-  sprintf(str, "%dx%d", g_params.w, g_params.h);
+  sprintf(str, "%ux%u", g_params.w, g_params.h);
 
   return str;
 }
@@ -745,7 +790,7 @@ static char * optScancodeToString(struct Option * opt)
 {
   char * str;
   alloc_sprintf(&str, "%d = %s", opt->value.x_int,
-      xfree86_to_str[opt->value.x_int]);
+      linux_to_str[opt->value.x_int]);
   return str;
 }
 

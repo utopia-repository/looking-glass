@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
 
 struct CountedBuffer * countedBufferNew(size_t size)
 {
-  struct CountedBuffer * buffer = malloc(sizeof(struct CountedBuffer) + size);
+  struct CountedBuffer * buffer = malloc(sizeof(*buffer) + size);
   if (!buffer)
     return NULL;
 

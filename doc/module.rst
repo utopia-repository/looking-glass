@@ -25,40 +25,10 @@ Then switch to the ``module/`` directory
 
    cd module/
 
-.. _module_manual:
-
-Compiling & Loading (Manual)
-----------------------------
-
-To compile the module manually, run ``make`` in the module directory.
-
-.. _module_manual_loading:
-
-Loading
-~~~~~~~
-
-For VM->VM mode, run:
-
-.. code:: bash
-
-   insmod kvmfr.ko
-
-For VM->host mode with dmabuf, instead of creating a shared memory file,
-load this module with the parameter ``static_size_mb``. For example, a
-32 MB shared memory device can be created with:
-
-.. code:: bash
-
-   insmod kvmfr.ko static_size_mb=32
-
-Multiple devices can be created by separating the sizes with commas. For
-example, ``static_size_mb=128,64`` would create two kvmfr devices:
-``kvmfr0`` would be 128 MB and ``kvmfr1`` would be 64 MB.
-
 .. _module_dkms:
 
-Using DKMS
-----------
+Using DKMS (Recommended)
+------------------------
 
 You can use the kernel's DKMS feature to keep the module across upgrades.
 ``dkms`` must be installed.
@@ -97,6 +67,46 @@ For VM->host with dmabuf, modprobe with the parameter
 Just like above, multiple devices can be created by separating the sizes
 with commas.
 
+
+.. _module_manual:
+
+Compiling & Loading (Manual)
+----------------------------
+
+To compile the module manually, run ``make`` in the module directory.
+
+.. _module_manual_loading:
+
+Loading
+~~~~~~~
+
+For VM->VM mode, run:
+
+.. code:: bash
+
+   insmod kvmfr.ko
+
+For VM->host mode with dmabuf, instead of creating a shared memory file,
+load this module with the parameter ``static_size_mb``. For example, a
+32 MB shared memory device can be created with:
+
+.. code:: bash
+
+   insmod kvmfr.ko static_size_mb=32
+
+Multiple devices can be created by separating the sizes with commas. For
+example, ``static_size_mb=128,64`` would create two kvmfr devices:
+``kvmfr0`` would be 128 MB and ``kvmfr1`` would be 64 MB.
+
+.. note::
+
+   If you have already loaded an older version of the module, unload it
+   first. You can do this by rebooting, or with ``rmmod``:
+
+   .. code:: bash
+
+      rmmod kvmfr.ko
+
 .. _module_usage:
 
 Usage
@@ -105,7 +115,7 @@ Usage
 The module will create the ``/dev/kvmfr0`` node, which represents the KVMFR
 interface. To use the interface, you need permission to access it by
 either: creating a udev rule to ensure your user can read and write to
-it, or simply change its ownership manually, ie:
+it, or simply change its ownership manually, i.e.:
 
 .. code:: bash
 
@@ -156,7 +166,30 @@ Add the following arguments to your ``qemu`` command line::
 libvirt
 ^^^^^^^
 
-Create the following XML block in your domain:
+Starting with QEMU 6.2 and libvirt 7.9, JSON style QEMU configuration is the 
+default syntax. Users running QEMU 6.2 or later **and** libvirt 7.9 or later, 
+should use this XML block to configure their VM for kvmfr:
+
+.. code:: xml
+
+   <qemu:commandline>
+     <qemu:arg value='-device'/>
+     <qemu:arg value='{"driver":"ivshmem-plain","id":"shmem0","memdev":"looking-glass"}'/>
+     <qemu:arg value='-object'/>
+     <qemu:arg value='{"qom-type":"memory-backend-file","id":"looking-glass","mem-path":"/dev/kvmfr0","size":33554432,"share":true}'/>
+   </qemu:commandline>
+
+.. note::
+
+   -  The ``"size"`` tag represents the size of the shared memory device in 
+      bytes. Once you determine the proper size of the device as per
+      :ref:`Determining Memory <client_determining_memory>`, use the figure you
+      got to calculate the size in bytes:
+
+     ``size_in_MB x 1024 x 1024 = size_in_bytes``
+
+If you are running QEMU older than 6.2 or libvirt older than 7.9, please use
+legacy syntax for IVSHMEM setup:
 
 .. code:: xml
 
@@ -169,24 +202,28 @@ Create the following XML block in your domain:
 
 .. note::
 
-   Remember to add ``xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'``
-   to the ``<domain>`` tag.
+   -  Using the legacy syntax on QEMU 6.2/libvirt 7.9 may cause QEMU to 
+      abort with the following error message:
+      "``error: internal error: ... PCI: slot 1 function 0 not available for pcie-root-port, in use by ivshmem-plain``"
+
+   -  Remember to add ``xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'``
+      to the ``<domain>`` tag.
 
 Running libvirt this way violates AppArmor and cgroups policies, which will
 block the VM from running. These policies must be amended to allow the VM
-to start.
+to start:
 
-For AppArmor, create ``/etc/apparmor.d/local/abstractions/libvirt-qemu`` if
-it doesn't exist, and add the following::
+- For AppArmor, create ``/etc/apparmor.d/local/abstractions/libvirt-qemu`` if
+  it doesn't exist, and add the following::
 
-   # Looking Glass
-   /dev/kvmfr0 rw,
+     # Looking Glass
+     /dev/kvmfr0 rw,
 
-For cgroups, edit ``/etc/libvirt/qemu.conf``, uncomment the
-``cgroup_device_acl`` block, and add ``/dev/kvmfr0`` to the list.
-Then restart ``libvirtd``:
+- For cgroups, edit ``/etc/libvirt/qemu.conf``, uncomment the
+  ``cgroup_device_acl`` block, and add ``/dev/kvmfr0`` to the list.
+  Then restart ``libvirtd``:
 
-.. code:: bash
+  .. code:: bash
 
    sudo systemctl restart libvirtd.service
 

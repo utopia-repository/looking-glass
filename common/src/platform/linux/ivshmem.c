@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,7 +20,6 @@
 
 #include "common/ivshmem.h"
 
-#include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,8 +30,10 @@
 #include <string.h>
 #include <errno.h>
 
+#include "common/array.h"
 #include "common/debug.h"
 #include "common/option.h"
+#include "common/sysinfo.h"
 #include "common/stringutils.h"
 #include "module/kvmfr.h"
 
@@ -91,7 +92,7 @@ void ivshmemOptionsInit(void)
       .module         = "app",
       .name           = "shmFile",
       .shortopt       = 'f',
-      .description    = "The path to the shared memory file, or the name of the kvmfr device to use, ie: kvmfr0",
+      .description    = "The path to the shared memory file, or the name of the kvmfr device to use, e.g. kvmfr0",
       .type           = OPTION_TYPE_STRING,
       .value.x_string = "/dev/shm/looking-glass",
       .validator      = ivshmemDeviceValidator,
@@ -116,7 +117,7 @@ bool ivshmemOpen(struct IVSHMEM * dev)
 
 bool ivshmemOpenDev(struct IVSHMEM * dev, const char * shmDevice)
 {
-  assert(dev);
+  DEBUG_ASSERT(dev);
 
   unsigned int devSize;
   int devFd = -1;
@@ -170,8 +171,7 @@ bool ivshmemOpenDev(struct IVSHMEM * dev, const char * shmDevice)
     return false;
   }
 
-  struct IVSHMEMInfo * info =
-    (struct IVSHMEMInfo *)malloc(sizeof(struct IVSHMEMInfo));
+  struct IVSHMEMInfo * info = malloc(sizeof(*info));
   info->size   = devSize;
   info->devFd  = devFd;
   info->hasDMA = hasDMA;
@@ -184,7 +184,7 @@ bool ivshmemOpenDev(struct IVSHMEM * dev, const char * shmDevice)
 
 void ivshmemClose(struct IVSHMEM * dev)
 {
-  assert(dev);
+  DEBUG_ASSERT(dev);
 
   if (!dev->opaque)
     return;
@@ -208,7 +208,7 @@ void ivshmemFree(struct IVSHMEM * dev)
 
 bool ivshmemHasDMA(struct IVSHMEM * dev)
 {
-  assert(dev && dev->opaque);
+  DEBUG_ASSERT(dev && dev->opaque);
 
   struct IVSHMEMInfo * info =
     (struct IVSHMEMInfo *)dev->opaque;
@@ -218,15 +218,20 @@ bool ivshmemHasDMA(struct IVSHMEM * dev)
 
 int ivshmemGetDMABuf(struct IVSHMEM * dev, uint64_t offset, uint64_t size)
 {
-  assert(ivshmemHasDMA(dev));
-  assert(dev && dev->opaque);
-  assert(offset + size <= dev->size);
+  DEBUG_ASSERT(ivshmemHasDMA(dev));
+  DEBUG_ASSERT(dev && dev->opaque);
+  DEBUG_ASSERT(offset + size <= dev->size);
+
+  static long pageSize = 0;
+
+  if (!pageSize)
+    pageSize = sysinfo_getPageSize();
 
   struct IVSHMEMInfo * info =
     (struct IVSHMEMInfo *)dev->opaque;
 
   // align to the page size
-  size = (size & ~(0x1000-1)) + 0x1000;
+  size = ALIGN_PAD(size, pageSize);
 
   const struct kvmfr_dmabuf_create create =
   {

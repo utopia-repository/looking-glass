@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -32,6 +32,7 @@
 #include "common/sysinfo.h"
 #include "common/time.h"
 #include "common/stringutils.h"
+#include "common/cpuinfo.h"
 
 #include <lgmp/host.h>
 
@@ -44,9 +45,6 @@
 
 #define CONFIG_FILE "looking-glass-host.ini"
 #define POINTER_SHAPE_BUFFERS 3
-
-#define ALIGN_DN(x) ((uintptr_t)(x) & ~0x7F)
-#define ALIGN_UP(x) ALIGN_DN(x + 0x7F)
 
 static const struct LGMPQueueConfig FRAME_QUEUE_CONFIG =
 {
@@ -94,6 +92,7 @@ struct app
   PLGMPMemory    frameMemory[LGMP_Q_FRAME_LEN];
   unsigned int   frameIndex;
   bool           frameValid;
+  uint32_t       frameSerial;
 
   CaptureInterface * iface;
 
@@ -126,6 +125,13 @@ static struct Option options[] =
     .value.x_string = "",
     .validator      = validateCaptureBackend,
   },
+  {
+    .module         = "app",
+    .name           = "throttleFPS",
+    .description    = "Throttle Capture Frame Rate",
+    .type           = OPTION_TYPE_INT,
+    .value.x_int    = 0,
+  },
   {0}
 };
 
@@ -137,6 +143,24 @@ static bool lgmpTimer(void * opaque)
     DEBUG_ERROR("lgmpHostProcess Failed: %s", lgmpStatusString(status));
     app.state = APP_STATE_SHUTDOWN;
     return false;
+  }
+
+  uint8_t data[LGMP_MSGS_SIZE];
+  size_t size;
+  while((status = lgmpHostReadData(app.pointerQueue, &data, &size)) == LGMP_OK)
+  {
+    KVMFRMessage *msg = (KVMFRMessage *)data;
+    switch(msg->type)
+    {
+      case KVMFR_MESSAGE_SETCURSORPOS:
+      {
+        KVMFRSetCursorPos *sp = (KVMFRSetCursorPos *)msg;
+        os_setCursorPos(sp->x, sp->y);
+        break;
+      }
+    }
+
+    lgmpHostAckData(app.pointerQueue);
   }
 
   return true;
@@ -161,6 +185,8 @@ static bool sendFrame(void)
   switch(app.iface->waitFrame(&frame, app.maxFrameSize))
   {
     case CAPTURE_RESULT_OK:
+      // reading the new subs count zeros it
+      lgmpHostQueueNewSubs(app.frameQueue);
       break;
 
     case CAPTURE_RESULT_REINIT:
@@ -181,7 +207,7 @@ static bool sendFrame(void)
       if (app.frameValid && lgmpHostQueueNewSubs(app.frameQueue) > 0)
       {
         // resend the last frame
-        repeatFrame = true;
+        repeatFrame = app.iface->asyncCapture;
         break;
       }
 
@@ -194,7 +220,8 @@ static bool sendFrame(void)
   // if we are repeating a frame just send the last frame again
   if (repeatFrame)
   {
-    if ((status = lgmpHostQueuePost(app.frameQueue, 0, app.frameMemory[app.frameIndex])) != LGMP_OK)
+    if ((status = lgmpHostQueuePost(app.frameQueue, 0,
+           app.frameMemory[app.frameIndex])) != LGMP_OK)
       DEBUG_ERROR("%s", lgmpStatusString(status));
     return true;
   }
@@ -229,15 +256,18 @@ static bool sendFrame(void)
   }
 
   fi->formatVer         = frame.formatVer;
+  fi->frameSerial       = app.frameSerial++;
   fi->width             = frame.width;
   fi->height            = frame.height;
   fi->realHeight        = frame.realHeight;
   fi->stride            = frame.stride;
   fi->pitch             = frame.pitch;
   fi->offset            = app.pageSize - FrameBufferStructSize;
-  fi->mouseScalePercent = app.iface->getMouseScale();
   fi->blockScreensaver  = os_blockScreensaver();
   app.frameValid        = true;
+
+  fi->damageRectsCount  = frame.damageRectsCount;
+  memcpy(fi->damageRects, frame.damageRects, frame.damageRectsCount * sizeof(FrameDamageRect));
 
   // put the framebuffer on the border of the next page
   // this is to allow for aligned DMA transfers by the receiver
@@ -251,7 +281,7 @@ static bool sendFrame(void)
     return true;
   }
 
-  app.iface->getFrame(fb, frame.height);
+  app.iface->getFrame(fb, frame.height, app.frameIndex);
   return true;
 }
 
@@ -512,6 +542,7 @@ int app_main(int argc, char * argv[])
     return LG_HOST_EXIT_FATAL;
 
   DEBUG_INFO("Looking Glass Host (%s)", BUILD_VERSION);
+  lgDebugCPU();
 
   struct IVSHMEM shmDev = { 0 };
   if (!ivshmemInit(&shmDev))
@@ -533,8 +564,9 @@ int app_main(int argc, char * argv[])
   DEBUG_INFO("KVMFR Version    : %u", KVMFR_VERSION);
 
   KVMFR udata = {
-    .magic   = KVMFR_MAGIC,
-    .version = KVMFR_VERSION,
+    .magic    = KVMFR_MAGIC,
+    .version  = KVMFR_VERSION,
+    .features = os_hasSetCursorPos() ? KVMFR_FEATURE_SETCURSORPOS : 0
   };
   strncpy(udata.hostver, BUILD_VERSION, sizeof(udata.hostver)-1);
 
@@ -603,6 +635,10 @@ int app_main(int argc, char * argv[])
     }
   }
 
+  int throttleFps = option_get_int("app", "throttleFPS");
+  int throttleUs = throttleFps ? 1000000 / throttleFps : 0;
+  uint64_t previousFrameTime = 0;
+
   const char * ifaceName = option_get_string("app", "capture");
   CaptureInterface * iface = NULL;
   for(int i = 0; CaptureInterfaces[i]; ++i)
@@ -645,7 +681,7 @@ int app_main(int argc, char * argv[])
 
   LG_LOCK_INIT(app.pointerLock);
 
-  if (!lgCreateTimer(100, lgmpTimer, NULL, &app.lgmpTimer))
+  if (!lgCreateTimer(10, lgmpTimer, NULL, &app.lgmpTimer))
   {
     DEBUG_ERROR("Failed to create the LGMP timer");
 
@@ -716,12 +752,30 @@ int app_main(int argc, char * argv[])
         LG_UNLOCK(app.pointerLock);
       }
 
+      const uint64_t now = microtime();
+      const uint64_t delta = now - previousFrameTime;
+      if (delta < throttleUs)
+      {
+        nsleep((throttleUs - delta) * 1000);
+        previousFrameTime = microtime();
+      }
+      else
+        previousFrameTime = now;
+
       switch(iface->capture())
       {
         case CAPTURE_RESULT_OK:
           break;
 
         case CAPTURE_RESULT_TIMEOUT:
+          if (!iface->asyncCapture)
+            if (app.frameValid && lgmpHostQueueNewSubs(app.frameQueue) > 0)
+            {
+              if ((status = lgmpHostQueuePost(app.frameQueue, 0,
+                      app.frameMemory[app.frameIndex])) != LGMP_OK)
+                DEBUG_ERROR("%s", lgmpStatusString(status));
+            }
+
           continue;
 
         case CAPTURE_RESULT_REINIT:
@@ -785,6 +839,7 @@ fail_lgmp:
 fail_ivshmem:
   ivshmemClose(&shmDev);
   ivshmemFree(&shmDev);
+  DEBUG_INFO("Host application exited");
   return exitcode;
 }
 

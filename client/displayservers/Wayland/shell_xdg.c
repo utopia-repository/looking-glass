@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -46,6 +46,8 @@ static void xdgSurfaceConfigure(void * data, struct xdg_surface * xdgSurface,
   {
     wlWm.needsResize  = true;
     wlWm.resizeSerial = serial;
+    app_invalidateWindow(true);
+    waylandStopWaitFrame();
   }
   else
   {
@@ -85,7 +87,7 @@ static const struct xdg_toplevel_listener xdgToplevelListener = {
   .close     = xdgToplevelClose,
 };
 
-bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless)
+bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless, bool resizable)
 {
   if (!wlWm.xdgWmBase)
   {
@@ -150,4 +152,9 @@ bool waylandGetFullscreen(void)
 void waylandMinimize(void)
 {
   xdg_toplevel_set_minimized(wlWm.xdgToplevel);
+}
+
+void waylandShellResize(int w, int h)
+{
+  //TODO: Implement resize for XDG.
 }

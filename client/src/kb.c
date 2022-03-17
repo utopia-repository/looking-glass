@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -18,12 +18,10 @@
  * Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
-#ifndef _H_LG_KB_
-#define _H_LG_KB_
-
 #include "kb.h"
+#include "cimgui.h"
 
-const uint32_t xfree86_to_ps2[KEY_MAX] =
+const uint32_t linux_to_ps2[KEY_MAX] =
 {
   [KEY_RESERVED]         /* = USB   0 */ = 0x000000,
   [KEY_ESC]              /* = USB  41 */ = 0x000001,
@@ -146,7 +144,7 @@ const uint32_t xfree86_to_ps2[KEY_MAX] =
   [KEY_PRINT]            /* = USB  70 */ = 0x00E037,
 };
 
-const char * xfree86_to_str[KEY_MAX] =
+const char * linux_to_str[KEY_MAX] =
 {
   [KEY_RESERVED]         = "KEY_RESERVED",
   [KEY_ESC]              = "KEY_ESC",
@@ -269,7 +267,7 @@ const char * xfree86_to_str[KEY_MAX] =
   [KEY_PRINT]            = "KEY_PRINT",
 };
 
-const char * xfree86_to_display[KEY_MAX] =
+const char * linux_to_display[KEY_MAX] =
 {
   [KEY_RESERVED]         = "Reserved",
   [KEY_ESC]              = "Esc",
@@ -392,4 +390,28 @@ const char * xfree86_to_display[KEY_MAX] =
   [KEY_PRINT]            = "Print",
 };
 
-#endif
+void initImGuiKeyMap(int * keymap)
+{
+  keymap[ImGuiKey_Tab        ] = KEY_TAB;
+  keymap[ImGuiKey_LeftArrow  ] = KEY_LEFT;
+  keymap[ImGuiKey_RightArrow ] = KEY_RIGHT;
+  keymap[ImGuiKey_UpArrow    ] = KEY_UP;
+  keymap[ImGuiKey_DownArrow  ] = KEY_DOWN;
+  keymap[ImGuiKey_PageUp     ] = KEY_PAGEUP;
+  keymap[ImGuiKey_PageDown   ] = KEY_PAGEDOWN;
+  keymap[ImGuiKey_Home       ] = KEY_HOME;
+  keymap[ImGuiKey_End        ] = KEY_END;
+  keymap[ImGuiKey_Insert     ] = KEY_INSERT;
+  keymap[ImGuiKey_Delete     ] = KEY_DELETE;
+  keymap[ImGuiKey_Backspace  ] = KEY_BACKSPACE;
+  keymap[ImGuiKey_Space      ] = KEY_SPACE;
+  keymap[ImGuiKey_Enter      ] = KEY_ENTER;
+  keymap[ImGuiKey_Escape     ] = KEY_SPACE;
+  keymap[ImGuiKey_KeyPadEnter] = KEY_KPENTER;
+  keymap[ImGuiKey_A          ] = KEY_A;
+  keymap[ImGuiKey_C          ] = KEY_C;
+  keymap[ImGuiKey_V          ] = KEY_V;
+  keymap[ImGuiKey_X          ] = KEY_X;
+  keymap[ImGuiKey_Y          ] = KEY_Y;
+  keymap[ImGuiKey_Z          ] = KEY_Z;
+}

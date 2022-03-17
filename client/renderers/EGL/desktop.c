@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,11 +22,13 @@
 #include "common/debug.h"
 #include "common/option.h"
 #include "common/locking.h"
+#include "common/array.h"
 
 #include "app.h"
 #include "texture.h"
 #include "shader.h"
-#include "model.h"
+#include "desktop_rects.h"
+#include "cimgui.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -36,31 +38,33 @@
 #include "desktop_rgb.frag.h"
 #include "desktop_rgb.def.h"
 
+#include "postprocess.h"
+#include "filters.h"
+
 struct DesktopShader
 {
   EGL_Shader * shader;
-  GLint uDesktopPos;
+  GLint uTransform;
   GLint uDesktopSize;
-  GLint uRotate;
   GLint uScaleAlgo;
-  GLint uNV, uNVGain;
+  GLint uNVGain;
   GLint uCBMode;
 };
 
 struct EGL_Desktop
 {
+  EGL * egl;
   EGLDisplay * display;
 
   EGL_Texture          * texture;
-  struct DesktopShader * shader; // the active shader
-  EGL_Model            * model;
+  GLuint                 sampler;
+  struct DesktopShader shader;
+  EGL_DesktopRects     * mesh;
+  CountedBuffer        * matrix;
 
   // internals
   int               width, height;
   LG_RendererRotate rotate;
-
-  // shader instances
-  struct DesktopShader shader_generic;
 
   // scale algorithm
   int scaleAlgo;
@@ -71,59 +75,65 @@ struct EGL_Desktop
 
   // colorblind mode
   int cbMode;
+
+  bool useDMA;
+  LG_RendererFormat format;
+
+  EGL_PostProcess * pp;
+  _Atomic(bool) processFrame;
 };
 
 // forwards
-void egl_desktop_toggle_nv(int key, void * opaque);
-void egl_desktop_toggle_scale_algo(int key, void * opaque);
+void toggleNV(int key, void * opaque);
 
-static bool egl_init_desktop_shader(
+static bool egl_initDesktopShader(
   struct DesktopShader * shader,
   const char * vertex_code  , size_t vertex_size,
   const char * fragment_code, size_t fragment_size
 )
 {
-  if (!egl_shader_init(&shader->shader))
+  if (!egl_shaderInit(&shader->shader))
     return false;
 
-  if (!egl_shader_compile(shader->shader,
+  if (!egl_shaderCompile(shader->shader,
         vertex_code  , vertex_size,
         fragment_code, fragment_size))
   {
     return false;
   }
 
-  shader->uDesktopPos  = egl_shader_get_uniform_location(shader->shader, "position" );
-  shader->uDesktopSize = egl_shader_get_uniform_location(shader->shader, "size"     );
-  shader->uRotate      = egl_shader_get_uniform_location(shader->shader, "rotate"   );
-  shader->uScaleAlgo   = egl_shader_get_uniform_location(shader->shader, "scaleAlgo");
-  shader->uNV          = egl_shader_get_uniform_location(shader->shader, "nv"       );
-  shader->uNVGain      = egl_shader_get_uniform_location(shader->shader, "nvGain"   );
-  shader->uCBMode      = egl_shader_get_uniform_location(shader->shader, "cbMode"   );
+  shader->uTransform   = egl_shaderGetUniform(shader->shader, "transform"  );
+  shader->uDesktopSize = egl_shaderGetUniform(shader->shader, "desktopSize");
+  shader->uScaleAlgo   = egl_shaderGetUniform(shader->shader, "scaleAlgo"  );
+  shader->uNVGain      = egl_shaderGetUniform(shader->shader, "nvGain"     );
+  shader->uCBMode      = egl_shaderGetUniform(shader->shader, "cbMode"     );
 
   return true;
 }
 
-bool egl_desktop_init(EGL_Desktop ** desktop, EGLDisplay * display)
+bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
+    bool useDMA, int maxRects)
 {
-  *desktop = (EGL_Desktop *)malloc(sizeof(EGL_Desktop));
-  if (!*desktop)
+  EGL_Desktop * desktop = calloc(1, sizeof(EGL_Desktop));
+  if (!desktop)
   {
     DEBUG_ERROR("Failed to malloc EGL_Desktop");
     return false;
   }
+  *desktop_ = desktop;
 
-  memset(*desktop, 0, sizeof(EGL_Desktop));
-  (*desktop)->display = display;
+  desktop->egl     = egl;
+  desktop->display = display;
 
-  if (!egl_texture_init(&(*desktop)->texture, display))
+  if (!egl_textureInit(&desktop->texture, display,
+        useDMA ? EGL_TEXTYPE_DMABUF : EGL_TEXTYPE_FRAMEBUFFER, true))
   {
     DEBUG_ERROR("Failed to initialize the desktop texture");
     return false;
   }
 
-  if (!egl_init_desktop_shader(
-    &(*desktop)->shader_generic,
+  if (!egl_initDesktopShader(
+    &desktop->shader,
     b_shader_desktop_vert    , b_shader_desktop_vert_size,
     b_shader_desktop_rgb_frag, b_shader_desktop_rgb_frag_size))
   {
@@ -131,27 +141,41 @@ bool egl_desktop_init(EGL_Desktop ** desktop, EGLDisplay * display)
     return false;
   }
 
-  if (!egl_model_init(&(*desktop)->model))
+  if (!egl_desktopRectsInit(&desktop->mesh, maxRects))
   {
-    DEBUG_ERROR("Failed to initialize the desktop model");
+    DEBUG_ERROR("Failed to initialize the desktop mesh");
     return false;
   }
 
-  egl_model_set_default((*desktop)->model);
-  egl_model_set_texture((*desktop)->model, (*desktop)->texture);
+  desktop->matrix = countedBufferNew(6 * sizeof(GLfloat));
+  if (!desktop->matrix)
+  {
+    DEBUG_ERROR("Failed to allocate the desktop matrix buffer");
+    return false;
+  }
 
-  app_registerKeybind(KEY_N, egl_desktop_toggle_nv, *desktop, "Toggle night vision mode");
-  app_registerKeybind(KEY_S, egl_desktop_toggle_scale_algo, *desktop, "Toggle scale algorithm");
+  app_registerKeybind(KEY_N, toggleNV, desktop,
+      "Toggle night vision mode");
 
-  (*desktop)->nvMax     = option_get_int("egl", "nvGainMax");
-  (*desktop)->nvGain    = option_get_int("egl", "nvGain"   );
-  (*desktop)->cbMode    = option_get_int("egl", "cbMode"   );
-  (*desktop)->scaleAlgo = option_get_int("egl", "scale"    );
+  desktop->nvMax     = option_get_int("egl", "nvGainMax");
+  desktop->nvGain    = option_get_int("egl", "nvGain"   );
+  desktop->cbMode    = option_get_int("egl", "cbMode"   );
+  desktop->scaleAlgo = option_get_int("egl", "scale"    );
+  desktop->useDMA    = useDMA;
 
+  if (!egl_postProcessInit(&desktop->pp))
+  {
+    DEBUG_ERROR("Failed to initialize the post process manager");
+    return false;
+  }
+
+  egl_postProcessAdd(desktop->pp, &egl_filterDownscaleOps);
+  egl_postProcessAdd(desktop->pp, &egl_filterFFXCASOps   );
+  egl_postProcessAdd(desktop->pp, &egl_filterFFXFSR1Ops  );
   return true;
 }
 
-void egl_desktop_toggle_nv(int key, void * opaque)
+void toggleNV(int key, void * opaque)
 {
   EGL_Desktop * desktop = (EGL_Desktop *)opaque;
   if (desktop->nvGain++ == desktop->nvMax)
@@ -160,24 +184,11 @@ void egl_desktop_toggle_nv(int key, void * opaque)
        if (desktop->nvGain == 0) app_alert(LG_ALERT_INFO, "NV Disabled");
   else if (desktop->nvGain == 1) app_alert(LG_ALERT_INFO, "NV Enabled");
   else app_alert(LG_ALERT_INFO, "NV Gain + %d", desktop->nvGain - 1);
+
+  app_invalidateWindow(true);
 }
 
-static const char * egl_desktop_scale_algo_name(int algorithm)
-{
-  switch (algorithm)
-  {
-    case EGL_SCALE_AUTO:
-      return "Automatic (downscale: linear, upscale: nearest)";
-    case EGL_SCALE_NEAREST:
-      return "Nearest";
-    case EGL_SCALE_LINEAR:
-      return "Linear";
-    default:
-      return "(unknown)";
-  }
-}
-
-bool egl_desktop_scale_validate(struct Option * opt, const char ** error)
+bool egl_desktopScaleValidate(struct Option * opt, const char ** error)
 {
   if (opt->value.x_int >= 0 && opt->value.x_int < EGL_SCALE_MAX)
     return true;
@@ -186,52 +197,82 @@ bool egl_desktop_scale_validate(struct Option * opt, const char ** error)
   return false;
 }
 
-void egl_desktop_toggle_scale_algo(int key, void * opaque)
-{
-  EGL_Desktop * desktop = (EGL_Desktop *)opaque;
-  if (++desktop->scaleAlgo == EGL_SCALE_MAX)
-    desktop->scaleAlgo = 0;
-
-  app_alert(LG_ALERT_INFO, "Scale Algorithm %d: %s", desktop->scaleAlgo,
-      egl_desktop_scale_algo_name(desktop->scaleAlgo));
-}
-
-void egl_desktop_free(EGL_Desktop ** desktop)
+void egl_desktopFree(EGL_Desktop ** desktop)
 {
   if (!*desktop)
     return;
 
-  egl_texture_free(&(*desktop)->texture              );
-  egl_shader_free (&(*desktop)->shader_generic.shader);
-  egl_model_free  (&(*desktop)->model                );
+  egl_textureFree    (&(*desktop)->texture      );
+  egl_shaderFree     (&(*desktop)->shader.shader);
+  egl_desktopRectsFree(&(*desktop)->mesh        );
+  countedBufferRelease(&(*desktop)->matrix      );
+
+  egl_postProcessFree(&(*desktop)->pp);
 
   free(*desktop);
   *desktop = NULL;
 }
 
-bool egl_desktop_setup(EGL_Desktop * desktop, const LG_RendererFormat format, bool useDMA)
+static const char * algorithmNames[EGL_SCALE_MAX] = {
+  [EGL_SCALE_AUTO]    = "Automatic (downscale: linear, upscale: nearest)",
+  [EGL_SCALE_NEAREST] = "Nearest",
+  [EGL_SCALE_LINEAR]  = "Linear",
+};
+
+void egl_desktopConfigUI(EGL_Desktop * desktop)
 {
+  igText("Scale algorithm:");
+  igPushItemWidth(igGetWindowWidth() - igGetStyle()->WindowPadding.x * 2);
+  if (igBeginCombo("##scale", algorithmNames[desktop->scaleAlgo], 0))
+  {
+    for (int i = 0; i < EGL_SCALE_MAX; ++i)
+    {
+      bool selected = i == desktop->scaleAlgo;
+      if (igSelectableBool(algorithmNames[i], selected, 0, (ImVec2) { 0.0f, 0.0f }))
+        desktop->scaleAlgo = i;
+      if (selected)
+        igSetItemDefaultFocus();
+    }
+    igEndCombo();
+  }
+  igPopItemWidth();
+
+  igText("Night vision mode:");
+  igSameLine(0.0f, -1.0f);
+  igPushItemWidth(igGetWindowWidth() - igGetCursorPosX() - igGetStyle()->WindowPadding.x);
+
+  const char * format;
+  switch (desktop->nvGain)
+  {
+    case 0: format = "off"; break;
+    case 1: format = "on";  break;
+    default: format = "gain: %d";
+  }
+  igSliderInt("##nvgain", &desktop->nvGain, 0, desktop->nvMax, format, 0);
+  igPopItemWidth();
+}
+
+bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
+{
+  memcpy(&desktop->format, &format, sizeof(LG_RendererFormat));
+
   enum EGL_PixelFormat pixFmt;
   switch(format.type)
   {
     case FRAME_TYPE_BGRA:
       pixFmt = EGL_PF_BGRA;
-      desktop->shader = &desktop->shader_generic;
       break;
 
     case FRAME_TYPE_RGBA:
       pixFmt = EGL_PF_RGBA;
-      desktop->shader = &desktop->shader_generic;
       break;
 
     case FRAME_TYPE_RGBA10:
       pixFmt = EGL_PF_RGBA10;
-      desktop->shader = &desktop->shader_generic;
       break;
 
     case FRAME_TYPE_RGBA16F:
       pixFmt = EGL_PF_RGBA16F;
-      desktop->shader = &desktop->shader_generic;
       break;
 
     default:
@@ -242,65 +283,133 @@ bool egl_desktop_setup(EGL_Desktop * desktop, const LG_RendererFormat format, bo
   desktop->width  = format.width;
   desktop->height = format.height;
 
-  if (!egl_texture_setup(
+  if (!egl_textureSetup(
     desktop->texture,
     pixFmt,
     format.width,
     format.height,
-    format.pitch,
-    true, // streaming texture
-    useDMA
+    format.pitch
   ))
   {
     DEBUG_ERROR("Failed to setup the desktop texture");
     return false;
   }
 
+  glGenSamplers(1, &desktop->sampler);
+  glSamplerParameteri(desktop->sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glSamplerParameteri(desktop->sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glSamplerParameteri(desktop->sampler, GL_TEXTURE_WRAP_S    , GL_CLAMP_TO_EDGE);
+  glSamplerParameteri(desktop->sampler, GL_TEXTURE_WRAP_T    , GL_CLAMP_TO_EDGE);
+
   return true;
 }
 
-bool egl_desktop_update(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd)
+bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd,
+    const FrameDamageRect * damageRects, int damageRectsCount)
 {
-  if (dmaFd >= 0)
+  if (desktop->useDMA && dmaFd >= 0)
   {
-    if (!egl_texture_update_from_dma(desktop->texture, frame, dmaFd))
+    if (egl_textureUpdateFromDMA(desktop->texture, frame, dmaFd))
+    {
+      atomic_store(&desktop->processFrame, true);
+      return true;
+    }
+
+    DEBUG_WARN("DMA update failed, disabling DMABUF imports");
+
+    const char * vendor  = (const char *)glGetString(GL_VENDOR);
+    if (strstr(vendor, "NVIDIA"))
+    {
+      DEBUG_WARN("NVIDIA's DMABUF support is incomplete, please direct your complaints to NVIDIA");
+      DEBUG_WARN("This is not a bug in Looking Glass");
+    }
+
+    desktop->useDMA = false;
+
+    const char * gl_exts = (const char *)glGetString(GL_EXTENSIONS);
+    if (!util_hasGLExt(gl_exts, "GL_EXT_buffer_storage"))
+    {
+      DEBUG_ERROR("GL_EXT_buffer_storage is needed to use EGL backend");
       return false;
-  }
-  else
-  {
-    if (!egl_texture_update_from_frame(desktop->texture, frame))
+    }
+
+    egl_textureFree(&desktop->texture);
+    if (!egl_textureInit(&desktop->texture, desktop->display,
+          EGL_TEXTYPE_FRAMEBUFFER, true))
+    {
+      DEBUG_ERROR("Failed to initialize the desktop texture");
+      return false;
+    }
+
+    if (!egl_desktopSetup(desktop, desktop->format))
       return false;
   }
 
+  if (egl_textureUpdateFromFrame(desktop->texture, frame,
+        damageRects, damageRectsCount))
+  {
+    atomic_store(&desktop->processFrame, true);
+    return true;
+  }
+
+  return false;
+}
+
+void egl_desktopResize(EGL_Desktop * desktop, int width, int height)
+{
+  atomic_store(&desktop->processFrame, true);
+}
+
+bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
+    unsigned int outputHeight, const float x, const float y,
+    const float scaleX, const float scaleY, enum EGL_DesktopScaleType scaleType,
+    LG_RendererRotate rotate, const struct DamageRects * rects)
+{
+  if (outputWidth == 0 && outputHeight == 0)
+    DEBUG_FATAL("outputWidth || outputHeight == 0");
+
   enum EGL_TexStatus status;
-  if ((status = egl_texture_process(desktop->texture)) != EGL_TEX_STATUS_OK)
+  if ((status = egl_textureProcess(desktop->texture)) != EGL_TEX_STATUS_OK)
   {
     if (status != EGL_TEX_STATUS_NOTREADY)
       DEBUG_ERROR("Failed to process the desktop texture");
   }
 
-  return true;
-}
-
-bool egl_desktop_render(EGL_Desktop * desktop, const float x, const float y,
-    const float scaleX, const float scaleY, enum EGL_DesktopScaleType scaleType,
-    LG_RendererRotate rotate)
-{
-  if (!desktop->shader)
-    return false;
-
   int scaleAlgo = EGL_SCALE_NEAREST;
+
+  egl_desktopRectsMatrix((float *)desktop->matrix->data,
+      desktop->width, desktop->height, x, y, scaleX, scaleY, rotate);
+  egl_desktopRectsUpdate(desktop->mesh, rects, desktop->width, desktop->height);
+
+  if (atomic_exchange(&desktop->processFrame, false) ||
+      egl_postProcessConfigModified(desktop->pp))
+    egl_postProcessRun(desktop->pp, desktop->texture, desktop->mesh,
+        desktop->width, desktop->height, outputWidth, outputHeight);
+
+  unsigned int finalSizeX, finalSizeY;
+  GLuint texture = egl_postProcessGetOutput(desktop->pp,
+      &finalSizeX, &finalSizeY);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  egl_resetViewport(desktop->egl);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, texture);
+  glBindSampler(0, desktop->sampler);
+
+  if (finalSizeX > desktop->width || finalSizeY > desktop->height)
+    scaleType = EGL_DESKTOP_DOWNSCALE;
 
   switch (desktop->scaleAlgo)
   {
     case EGL_SCALE_AUTO:
       switch (scaleType)
       {
-        case EGL_DESKTOP_NOSCALE:
         case EGL_DESKTOP_UPSCALE:
           scaleAlgo = EGL_SCALE_NEAREST;
           break;
 
+        case EGL_DESKTOP_NOSCALE:
         case EGL_DESKTOP_DOWNSCALE:
           scaleAlgo = EGL_SCALE_LINEAR;
           break;
@@ -311,22 +420,40 @@ bool egl_desktop_render(EGL_Desktop * desktop, const float x, const float y,
       scaleAlgo = desktop->scaleAlgo;
   }
 
-  const struct DesktopShader * shader = desktop->shader;
-  egl_shader_use(shader->shader);
-  glUniform4f(shader->uDesktopPos , x, y, scaleX, scaleY);
-  glUniform1i(shader->uRotate     , rotate);
-  glUniform1i(shader->uScaleAlgo  , scaleAlgo);
-  glUniform2f(shader->uDesktopSize, desktop->width, desktop->height);
-
-  if (desktop->nvGain)
+  const struct DesktopShader * shader = &desktop->shader;
+  EGL_Uniform uniforms[] =
   {
-    glUniform1i(shader->uNV, 1);
-    glUniform1f(shader->uNVGain, (float)desktop->nvGain);
-  }
-  else
-    glUniform1i(shader->uNV, 0);
+    {
+      .type        = EGL_UNIFORM_TYPE_1I,
+      .location    = shader->uScaleAlgo,
+      .i           = { scaleAlgo },
+    },
+    {
+      .type        = EGL_UNIFORM_TYPE_2F,
+      .location    = shader->uDesktopSize,
+      .f           = { desktop->width, desktop->height },
+    },
+    {
+      .type        = EGL_UNIFORM_TYPE_M3x2FV,
+      .location    = shader->uTransform,
+      .m.transpose = GL_FALSE,
+      .m.v         = desktop->matrix
+    },
+    {
+      .type        = EGL_UNIFORM_TYPE_1F,
+      .location    = shader->uNVGain,
+      .f           = { (float)desktop->nvGain }
+    },
+    {
+      .type        = EGL_UNIFORM_TYPE_1I,
+      .location    = shader->uCBMode,
+      .f           = { desktop->cbMode }
+    }
+  };
 
-  glUniform1i(shader->uCBMode, desktop->cbMode);
-  egl_model_render(desktop->model);
+  egl_shaderSetUniforms(shader->shader, uniforms, ARRAY_LENGTH(uniforms));
+  egl_shaderUse(shader->shader);
+  egl_desktopRectsRender(desktop->mesh);
+  glBindTexture(GL_TEXTURE_2D, 0);
   return true;
 }

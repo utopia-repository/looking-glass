@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -19,8 +19,8 @@
  */
 
 #include "windows/mousehook.h"
-#include "windows/delay.h"
 #include "common/windebug.h"
+#include "common/time.h"
 #include "platform.h"
 
 #include <windows.h>
@@ -105,7 +105,7 @@ static DWORD WINAPI updateThreadProc(LPVOID lParam)
         mouseHook.callback(mouseHook.x, mouseHook.y);
 
         // limit this to 1000Hz, who has a mouse that updates faster anyway?
-        delayExecution(1.0f);
+        nsleep(1000000);
         break;
     }
   }
@@ -151,6 +151,7 @@ static DWORD WINAPI threadProc(LPVOID lParam) {
         }
         break;
       default:
+        DEBUG_WINERROR("MsgWaitForMultipleObjects failed", GetLastError());
         goto exit;
     }
   }
@@ -166,7 +167,7 @@ void mouseHook_install(MouseHookFn callback)
 {
   if (!mouseHook.event)
   {
-    mouseHook.event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    mouseHook.event = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!mouseHook.event)
     {
       DEBUG_WINERROR("Failed to create mouse hook uninstall event",
@@ -201,6 +202,7 @@ void mouseHook_remove(void)
   SetEvent(mouseHook.event);
   WaitForSingleObject(mouseHook.thread      , INFINITE);
   WaitForSingleObject(mouseHook.updateThread, INFINITE);
+  ResetEvent(mouseHook.event);
   CloseHandle(mouseHook.thread);
   CloseHandle(mouseHook.updateThread);
 }

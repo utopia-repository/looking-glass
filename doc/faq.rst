@@ -77,6 +77,34 @@ host OS is the ``looking-glass-client`` application.
 You can :ref:`build <host_linux_on_linux>` a version of the host for Linux as
 well.
 
+.. _gnome_wayland_decorations:
+
+Why is there no title bar on GNOME? / Why can't I resize the window on GNOME?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This happens because GNOME on Wayland doesn't support the `standard protocol`_
+for server-side decorations, and Looking Glass doesn't implement its own
+decorations.
+
+The easiest solution is to build Looking Glass with `libdecor`_ support.
+If your distribution lacks a ``libdecor`` package, you must build it from
+`source code <libdecor_>`_.
+
+You can then build the the client with libdecor support by passing
+``-DENABLE_LIBDECOR=ON`` to ``cmake``.
+
+An alternative solution is to hold down the Super key (Windows key on most
+keyboards), then right click Looking Glass. This should bring up a menu,
+which will allow you to move the window and resize it.
+
+.. warning::
+   Libdecor support is provided for the convenience of our Wayland users on
+   GNOME, however it is not a priority feature and may break, please seek
+   alternatives if you require stable operation.
+
+.. _standard protocol: https://wayland.app/protocols/xdg-decoration-unstable-v1
+.. _libdecor: https://gitlab.gnome.org/jadahl/libdecor
+
 Mouse
 -----
 

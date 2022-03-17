@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,22 +23,23 @@
 #ifdef ENABLE_EGL
 
 #include <EGL/egl.h>
-#include <GL/gl.h>
-
-typedef EGLDisplay (*eglGetPlatformDisplayEXT_t)(EGLenum platform,
-    void *native_display, const EGLint *attrib_list);
-typedef void (*eglSwapBuffersWithDamageKHR_t)(EGLDisplay dpy,
-    EGLSurface surface, const EGLint *rects, EGLint n_rects);
-typedef void (*glEGLImageTargetTexture2DOES_t)(GLenum target,
-    GLeglImageOES image);
+#include <EGL/eglext.h>
+#undef GL_KHR_debug
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 
 struct EGLDynProcs
 {
-  eglGetPlatformDisplayEXT_t     eglGetPlatformDisplay;
-  eglGetPlatformDisplayEXT_t     eglGetPlatformDisplayEXT;
-  eglSwapBuffersWithDamageKHR_t  eglSwapBuffersWithDamageKHR;
-  eglSwapBuffersWithDamageKHR_t  eglSwapBuffersWithDamageEXT;
-  glEGLImageTargetTexture2DOES_t glEGLImageTargetTexture2DOES;
+  PFNEGLGETPLATFORMDISPLAYPROC        eglGetPlatformDisplay;
+  PFNEGLGETPLATFORMDISPLAYPROC        eglGetPlatformDisplayEXT;
+  PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC  eglSwapBuffersWithDamageKHR;
+  PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC  eglSwapBuffersWithDamageEXT;
+  PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+  PFNGLDEBUGMESSAGECALLBACKKHRPROC    glDebugMessageCallback;
+  PFNGLDEBUGMESSAGECALLBACKKHRPROC    glDebugMessageCallbackKHR;
+  PFNGLBUFFERSTORAGEEXTPROC           glBufferStorageEXT;
+  PFNEGLCREATEIMAGEPROC               eglCreateImage;
+  PFNEGLDESTROYIMAGEPROC              eglDestroyImage;
 };
 
 extern struct EGLDynProcs g_egl_dynProcs;

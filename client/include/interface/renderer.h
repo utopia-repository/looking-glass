@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,26 +27,21 @@
 #include "common/framebuffer.h"
 
 #define IS_LG_RENDERER_VALID(x) \
-  ((x)->get_name       && \
+  ((x)->getName       && \
    (x)->create         && \
    (x)->initialize     && \
    (x)->deinitialize   && \
-   (x)->on_restart     && \
-   (x)->on_resize      && \
-   (x)->on_mouse_shape && \
-   (x)->on_mouse_event && \
-   (x)->on_alert       && \
-   (x)->on_help        && \
-   (x)->on_show_fps    && \
-   (x)->render_startup && \
-   (x)->render         && \
-   (x)->update_fps)
+   (x)->onRestart     && \
+   (x)->onResize      && \
+   (x)->onMouseShape && \
+   (x)->onMouseEvent && \
+   (x)->renderStartup && \
+   (x)->needsRender   && \
+   (x)->render)
 
 typedef struct LG_RendererParams
 {
-//  TTF_Font * font;
-//  TTF_Font * alertFont;
-  bool       quickSplash;
+  bool quickSplash;
 }
 LG_RendererParams;
 
@@ -99,49 +94,82 @@ typedef enum LG_RendererCursor
 }
 LG_RendererCursor;
 
-// returns the friendly name of the renderer
-typedef const char * (* LG_RendererGetName)();
+typedef struct LG_Renderer LG_Renderer;
 
-// called pre-creation to allow the renderer to register any options it might have
-typedef void         (* LG_RendererSetup)();
+typedef struct LG_RendererOps
+{
+  /* returns the friendly name of the renderer */
+  const char * (*getName)(void);
 
-typedef bool         (* LG_RendererCreate       )(void ** opaque, const LG_RendererParams params, bool * needsOpenGL);
-typedef bool         (* LG_RendererInitialize   )(void * opaque);
-typedef void         (* LG_RendererDeInitialize )(void * opaque);
-typedef bool         (* LG_RendererSupports     )(void * opaque, LG_RendererSupport support);
-typedef void         (* LG_RendererOnRestart    )(void * opaque);
-typedef void         (* LG_RendererOnResize     )(void * opaque, const int width, const int height, const double scale, const LG_RendererRect destRect, LG_RendererRotate rotate);
-typedef bool         (* LG_RendererOnMouseShape )(void * opaque, const LG_RendererCursor cursor, const int width, const int height, const int pitch, const uint8_t * data);
-typedef bool         (* LG_RendererOnMouseEvent )(void * opaque, const bool visible , const int x, const int y);
-typedef bool         (* LG_RendererOnFrameFormat)(void * opaque, const LG_RendererFormat format, bool useDMA);
-typedef bool         (* LG_RendererOnFrame      )(void * opaque, const FrameBuffer * frame, int dmaFD);
-typedef void         (* LG_RendererOnAlert      )(void * opaque, const LG_MsgAlert alert, const char * message, bool ** closeFlag);
-typedef void         (* LG_RendererOnHelp       )(void * opaque, const char * message);
-typedef void         (* LG_RendererOnShowFPS    )(void * opaque, bool showFPS);
-typedef bool         (* LG_RendererRenderStartup)(void * opaque);
-typedef bool         (* LG_RendererRender       )(void * opaque, LG_RendererRotate rotate);
-typedef void         (* LG_RendererUpdateFPS    )(void * opaque, const float avgUPS, const float avgFPS);
+  /* called pre-creation to allow the renderer to register any options it may
+   * have */
+  void (*setup)(void);
+
+  /* creates an instance of the renderer
+   * Context: lg_run */
+  bool (*create)(LG_Renderer ** renderer, const LG_RendererParams params,
+      bool * needsOpenGL);
+
+  /* initializes the renderer for use
+   * Context: lg_run */
+  bool (*initialize)(LG_Renderer * renderer);
+
+  /* deinitializes & frees the renderer
+   * Context: lg_run & renderThread */
+  void (*deinitialize)(LG_Renderer * renderer);
+
+  /* returns true if the specified feature is supported
+   * Context: renderThread */
+  bool (*supports)(LG_Renderer * renderer, LG_RendererSupport support);
+
+  /* called when the renderer is to reset it's state
+   * Context: lg_run & frameThread */
+  void (*onRestart)(LG_Renderer * renderer);
+
+  /* called when the viewport has been resized
+   * Context: renderThrtead */
+  void (*onResize)(LG_Renderer * renderer, const int width, const int height,
+      const double scale, const LG_RendererRect destRect,
+      LG_RendererRotate rotate);
+
+  /* called when the mouse shape has changed
+   * Context: cursorThread */
+  bool (*onMouseShape)(LG_Renderer * renderer, const LG_RendererCursor cursor,
+      const int width, const int height, const int pitch, const uint8_t * data);
+
+  /* called when the mouse has moved or changed visibillity
+   * Context: cursorThread */
+  bool (*onMouseEvent)(LG_Renderer * renderer, const bool visible, const int x,
+      const int y);
+
+  /* called when the frame format has changed
+   * Context: frameThread */
+  bool (*onFrameFormat)(LG_Renderer * renderer,
+      const LG_RendererFormat format);
+
+  /* called when there is a new frame
+   * Context: frameThread */
+  bool (*onFrame)(LG_Renderer * renderer, const FrameBuffer * frame, int dmaFD,
+      const FrameDamageRect * damage, int damageCount);
+
+  /* called when the rederer is to startup
+   * Context: renderThread */
+  bool (*renderStartup)(LG_Renderer * renderer, bool useDMA);
+
+  /* returns if the render method must be called even if nothing has changed.
+   * Context: renderThread */
+  bool (*needsRender)(LG_Renderer * renderer);
+
+  /* called to render the scene
+   * Context: renderThread */
+  bool (*render)(LG_Renderer * renderer, LG_RendererRotate rotate,
+      const bool newFrame, const bool invalidateWindow,
+      void (*preSwap)(void * udata), void * udata);
+}
+LG_RendererOps;
 
 typedef struct LG_Renderer
 {
-  LG_RendererGetName      get_name;
-  LG_RendererSetup        setup;
-
-  LG_RendererCreate         create;
-  LG_RendererInitialize     initialize;
-  LG_RendererDeInitialize   deinitialize;
-  LG_RendererSupports       supports;
-  LG_RendererOnRestart      on_restart;
-  LG_RendererOnResize       on_resize;
-  LG_RendererOnMouseShape   on_mouse_shape;
-  LG_RendererOnMouseEvent   on_mouse_event;
-  LG_RendererOnFrameFormat  on_frame_format;
-  LG_RendererOnFrame        on_frame;
-  LG_RendererOnAlert        on_alert;
-  LG_RendererOnHelp         on_help;
-  LG_RendererOnShowFPS      on_show_fps;
-  LG_RendererRenderStartup  render_startup;
-  LG_RendererRender         render;
-  LG_RendererUpdateFPS      update_fps;
+  LG_RendererOps ops;
 }
 LG_Renderer;

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,14 +23,16 @@
 
 #include <stddef.h>
 
-struct CountedBuffer {
+typedef struct CountedBuffer
+{
   _Atomic(size_t) refs;
   size_t size;
   char data[];
-};
+}
+CountedBuffer;
 
 struct CountedBuffer * countedBufferNew(size_t size);
-void countedBufferAddRef(struct CountedBuffer * buffer);
-void countedBufferRelease(struct CountedBuffer ** buffer);
+void countedBufferAddRef(CountedBuffer * buffer);
+void countedBufferRelease(CountedBuffer ** buffer);
 
 #endif

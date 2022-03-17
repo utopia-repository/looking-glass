@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,12 +20,12 @@
 
 #include "common/ivshmem.h"
 #include "common/option.h"
+#include "common/vector.h"
 #include "common/windebug.h"
 
 #include <windows.h>
 #include "ivshmem.h"
 
-#include <assert.h>
 #include <setupapi.h>
 #include <io.h>
 
@@ -50,29 +50,95 @@ void ivshmemOptionsInit(void)
   option_register(options);
 }
 
+struct IVSHMEMData
+{
+  SP_DEVINFO_DATA devInfoData;
+  DWORD64         busAddr;
+};
+
+static int ivshmemComparator(const void * a_, const void * b_)
+{
+  const struct IVSHMEMData * a = a_;
+  const struct IVSHMEMData * b = b_;
+
+  if (a->busAddr < b->busAddr)
+    return -1;
+
+  if (a->busAddr > b->busAddr)
+    return 1;
+
+  return 0;
+}
+
 bool ivshmemInit(struct IVSHMEM * dev)
 {
-  assert(dev && !dev->opaque);
+  DEBUG_ASSERT(dev && !dev->opaque);
 
   HANDLE                           handle;
   HDEVINFO                         devInfoSet;
   PSP_DEVICE_INTERFACE_DETAIL_DATA infData = NULL;
+  SP_DEVINFO_DATA                  devInfoData = {0};
   SP_DEVICE_INTERFACE_DATA         devInterfaceData = {0};
+  Vector                           devices;
 
-  devInfoSet = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
+  devInfoSet = SetupDiGetClassDevs(&GUID_DEVINTERFACE_IVSHMEM, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+  devInfoData.cbSize      = sizeof(SP_DEVINFO_DATA);
   devInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
-  const int shmDevice = option_get_int("os", "shmDevice");
-  if (SetupDiEnumDeviceInterfaces(devInfoSet, NULL, &GUID_DEVINTERFACE_IVSHMEM, shmDevice, &devInterfaceData) == FALSE)
+  if (!vector_create(&devices, sizeof(struct IVSHMEMData), 1))
   {
-    DWORD error = GetLastError();
-    if (error == ERROR_NO_MORE_ITEMS)
+    DEBUG_ERROR("Failed to allocate memory");
+    return false;
+  }
+
+  for (int i = 0; SetupDiEnumDeviceInfo(devInfoSet, i, &devInfoData); ++i)
+  {
+    struct IVSHMEMData * device = vector_push(&devices, NULL);
+
+    DWORD bus, addr;
+    if (!SetupDiGetDeviceRegistryProperty(devInfoSet, &devInfoData, SPDRP_BUSNUMBER,
+        NULL, (void*) &bus, sizeof(bus), NULL))
     {
-      DEBUG_WINERROR("Unable to enumerate the device, is it attached?", error);
-      return false;
+      DEBUG_WINERROR("Failed to SetupDiGetDeviceRegistryProperty", GetLastError());
+      bus = 0xFFFF;
     }
 
-    DEBUG_WINERROR("SetupDiEnumDeviceInterfaces failed", error);
+    if (!SetupDiGetDeviceRegistryProperty(devInfoSet, &devInfoData, SPDRP_ADDRESS,
+        NULL, (void*) &addr, sizeof(addr), NULL))
+    {
+      DEBUG_WINERROR("Failed to SetupDiGetDeviceRegistryProperty", GetLastError());
+      addr = 0xFFFFFFFF;
+    }
+
+    device->busAddr = (((DWORD64) bus) << 32) | addr;
+    memcpy(&device->devInfoData, &devInfoData, sizeof(SP_DEVINFO_DATA));
+  }
+
+  if (GetLastError() != ERROR_NO_MORE_ITEMS)
+  {
+    DEBUG_WINERROR("SetupDiEnumDeviceInfo failed", GetLastError());
+    return false;
+  }
+
+  const int shmDevice = option_get_int("os", "shmDevice");
+  qsort(vector_data(&devices), vector_size(&devices), sizeof(struct IVSHMEMData), ivshmemComparator);
+
+  struct IVSHMEMData * device;
+  vector_forEachRefIdx(i, device, &devices)
+  {
+    DWORD bus = device->busAddr >> 32;
+    DWORD addr = device->busAddr & 0xFFFFFFFF;
+    DEBUG_INFO("IVSHMEM %" PRIuPTR "%c on bus 0x%lx, device 0x%lx, function 0x%lx", i,
+      i == shmDevice ? '*' : ' ', bus, addr >> 16, addr & 0xFFFF);
+  }
+
+  device = vector_ptrTo(&devices, shmDevice);
+  memcpy(&devInfoData, &device->devInfoData, sizeof(SP_DEVINFO_DATA));
+  vector_destroy(&devices);
+
+  if (SetupDiEnumDeviceInterfaces(devInfoSet, &devInfoData, &GUID_DEVINTERFACE_IVSHMEM, 0, &devInterfaceData) == FALSE)
+  {
+    DEBUG_WINERROR("SetupDiEnumDeviceInterfaces failed", GetLastError());
     return false;
   }
 
@@ -84,7 +150,7 @@ bool ivshmemInit(struct IVSHMEM * dev)
     return false;
   }
 
-  infData         = (PSP_DEVICE_INTERFACE_DETAIL_DATA)calloc(reqSize, 1);
+  infData         = calloc(1, reqSize);
   infData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
   if (!SetupDiGetDeviceInterfaceDetail(devInfoSet, &devInterfaceData, infData, reqSize, NULL, NULL))
   {
@@ -105,8 +171,7 @@ bool ivshmemInit(struct IVSHMEM * dev)
   free(infData);
   SetupDiDestroyDeviceInfoList(devInfoSet);
 
-  struct IVSHMEMInfo * info =
-    (struct IVSHMEMInfo *)malloc(sizeof(struct IVSHMEMInfo));
+  struct IVSHMEMInfo * info = malloc(sizeof(*info));
 
   info->handle = handle;
   dev->opaque  = info;
@@ -118,7 +183,7 @@ bool ivshmemInit(struct IVSHMEM * dev)
 
 bool ivshmemOpen(struct IVSHMEM * dev)
 {
-  assert(dev && dev->opaque && !dev->mem);
+  DEBUG_ASSERT(dev && dev->opaque && !dev->mem);
 
   struct IVSHMEMInfo * info = (struct IVSHMEMInfo *)dev->opaque;
 
@@ -149,7 +214,7 @@ bool ivshmemOpen(struct IVSHMEM * dev)
 
 void ivshmemClose(struct IVSHMEM * dev)
 {
-  assert(dev && dev->opaque && dev->mem);
+  DEBUG_ASSERT(dev && dev->opaque && dev->mem);
 
   struct IVSHMEMInfo * info = (struct IVSHMEMInfo *)dev->opaque;
 
@@ -162,7 +227,7 @@ void ivshmemClose(struct IVSHMEM * dev)
 
 void ivshmemFree(struct IVSHMEM * dev)
 {
-  assert(dev && dev->opaque && !dev->mem);
+  DEBUG_ASSERT(dev && dev->opaque && !dev->mem);
 
   struct IVSHMEMInfo * info = (struct IVSHMEMInfo *)dev->opaque;
 

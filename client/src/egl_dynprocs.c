@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -26,16 +26,33 @@ struct EGLDynProcs g_egl_dynProcs = {0};
 
 void egl_dynProcsInit(void)
 {
-  g_egl_dynProcs.eglGetPlatformDisplay = (eglGetPlatformDisplayEXT_t)
+  g_egl_dynProcs.eglGetPlatformDisplay = (PFNEGLGETPLATFORMDISPLAYPROC)
     eglGetProcAddress("eglGetPlatformDisplay");
-  g_egl_dynProcs.eglGetPlatformDisplayEXT = (eglGetPlatformDisplayEXT_t)
+  g_egl_dynProcs.eglGetPlatformDisplayEXT = (PFNEGLGETPLATFORMDISPLAYPROC)
     eglGetProcAddress("eglGetPlatformDisplayEXT");
-  g_egl_dynProcs.glEGLImageTargetTexture2DOES = (glEGLImageTargetTexture2DOES_t)
+  g_egl_dynProcs.glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)
     eglGetProcAddress("glEGLImageTargetTexture2DOES");
-  g_egl_dynProcs.eglSwapBuffersWithDamageKHR = (eglSwapBuffersWithDamageKHR_t)
+  g_egl_dynProcs.eglSwapBuffersWithDamageKHR = (PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC)
     eglGetProcAddress("eglSwapBuffersWithDamageKHR");
-  g_egl_dynProcs.eglSwapBuffersWithDamageEXT = (eglSwapBuffersWithDamageKHR_t)
+  g_egl_dynProcs.eglSwapBuffersWithDamageEXT = (PFNEGLSWAPBUFFERSWITHDAMAGEEXTPROC)
     eglGetProcAddress("eglSwapBuffersWithDamageEXT");
+  g_egl_dynProcs.glDebugMessageCallback = (PFNGLDEBUGMESSAGECALLBACKKHRPROC)
+    eglGetProcAddress("glDebugMessageCallback");
+  g_egl_dynProcs.glDebugMessageCallbackKHR = (PFNGLDEBUGMESSAGECALLBACKKHRPROC)
+    eglGetProcAddress("glDebugMessageCallbackKHR");
+  g_egl_dynProcs.glBufferStorageEXT = (PFNGLBUFFERSTORAGEEXTPROC)
+    eglGetProcAddress("glBufferStorageEXT");
+  g_egl_dynProcs.eglCreateImage = (PFNEGLCREATEIMAGEPROC)
+    eglGetProcAddress("eglCreateImage");
+  g_egl_dynProcs.eglDestroyImage = (PFNEGLDESTROYIMAGEPROC)
+    eglGetProcAddress("eglDestroyImage");
+
+  if (!g_egl_dynProcs.eglCreateImage)
+    g_egl_dynProcs.eglCreateImage = (PFNEGLCREATEIMAGEPROC)
+      eglGetProcAddress("eglCreateImageKHR");
+  if (!g_egl_dynProcs.eglDestroyImage)
+    g_egl_dynProcs.eglDestroyImage = (PFNEGLDESTROYIMAGEPROC)
+      eglGetProcAddress("eglDestroyImageKHR");
 };
 
 #endif

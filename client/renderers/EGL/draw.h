@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,5 +22,8 @@
 
 #include "model.h"
 
-void egl_draw_torus    (EGL_Model * model, unsigned int pts, float x, float y, float inner, float outer);
-void egl_draw_torus_arc(EGL_Model * model, unsigned int pts, float x, float y, float inner, float outer, float s, float e);
+void egl_drawTorus(EGL_Model * model, unsigned int pts, float x, float y,
+    float inner, float outer);
+
+void egl_drawTorusArc(EGL_Model * model, unsigned int pts, float x, float y,
+    float inner, float outer, float s, float e);

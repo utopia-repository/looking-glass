@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,11 +20,14 @@
 
 #include "wayland.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
+#include <xkbcommon/xkbcommon.h>
 
 #include "app.h"
 #include "common/debug.h"
@@ -52,7 +55,7 @@ static void pointerEnterHandler(void * data, struct wl_pointer * pointer,
   wlWm.pointerInSurface = true;
   app_handleEnterEvent(true);
 
-  wl_pointer_set_cursor(pointer, serial, wlWm.showPointer ? wlWm.cursor : NULL, 0, 0);
+  wl_pointer_set_cursor(pointer, serial, wlWm.cursor, wlWm.cursorHotX, wlWm.cursorHotY);
   wlWm.pointerEnterSerial = serial;
 
   wlWm.cursorX = wl_fixed_to_double(sxW);
@@ -85,11 +88,15 @@ static void pointerLeaveHandler(void * data, struct wl_pointer * pointer,
 static void pointerAxisHandler(void * data, struct wl_pointer * pointer,
   uint32_t serial, uint32_t axis, wl_fixed_t value)
 {
+  if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+    return;
+
   int button = value > 0 ?
     5 /* SPICE_MOUSE_BUTTON_DOWN */ :
     4 /* SPICE_MOUSE_BUTTON_UP */;
   app_handleButtonPress(button);
   app_handleButtonRelease(button);
+  app_handleWheelMotion(wl_fixed_to_double(value) / 15.0);
 }
 
 static int mapWaylandToSpiceButton(uint32_t button)
@@ -155,6 +162,50 @@ static const struct zwp_relative_pointer_v1_listener relativePointerListener = {
 static void keyboardKeymapHandler(void * data, struct wl_keyboard * keyboard,
     uint32_t format, int fd, uint32_t size)
 {
+  if (!wlWm.xkb)
+    goto done;
+
+  if (wlWm.keymap)
+  {
+    xkb_keymap_unref(wlWm.keymap);
+    wlWm.keymap = NULL;
+  }
+
+  if (wlWm.xkbState)
+  {
+    xkb_state_unref(wlWm.xkbState);
+    wlWm.xkbState = NULL;
+  }
+
+  if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
+  {
+    DEBUG_WARN("Unsupported keymap format, keyboard input will not work: %d", format);
+    goto done;
+  }
+
+  char * map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (map == MAP_FAILED)
+  {
+    DEBUG_ERROR("Failed to mmap keymap: %s", strerror(errno));
+    goto done;
+  }
+
+  wlWm.keymap = xkb_keymap_new_from_string(wlWm.xkb, map,
+    XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+
+  if (!wlWm.keymap)
+    DEBUG_WARN("Failed to load keymap, keyboard input will not work");
+
+  munmap(map, size);
+
+  if (wlWm.keymap)
+  {
+    wlWm.xkbState = xkb_state_new(wlWm.keymap);
+    if (!wlWm.xkbState)
+      DEBUG_WARN("Failed to create xkb_state");
+  }
+
+done:
   close(fd);
 }
 
@@ -194,13 +245,41 @@ static void keyboardKeyHandler(void * data, struct wl_keyboard * keyboard,
     app_handleKeyPress(key);
   else
     app_handleKeyRelease(key);
+
+  if (!wlWm.xkbState || !app_isOverlayMode() || state != WL_KEYBOARD_KEY_STATE_PRESSED)
+    return;
+
+  key += 8; // xkb scancode is evdev scancode + 8
+  int size = xkb_state_key_get_utf8(wlWm.xkbState, key, NULL, 0);
+
+  if (size <= 0)
+    return;
+
+  char buffer[size + 1];
+  xkb_state_key_get_utf8(wlWm.xkbState, key, buffer, size + 1);
+  app_handleKeyboardTyped(buffer);
 }
 
 static void keyboardModifiersHandler(void * data,
     struct wl_keyboard * keyboard, uint32_t serial, uint32_t modsDepressed,
     uint32_t modsLatched, uint32_t modsLocked, uint32_t group)
 {
-  // Do nothing.
+  if (!wlWm.xkbState)
+    return;
+
+  xkb_state_update_mask(wlWm.xkbState, modsDepressed, modsLatched, modsLocked, 0, 0, group);
+  app_handleKeyboardModifiers(
+    xkb_state_mod_name_is_active(wlWm.xkbState, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0,
+    xkb_state_mod_name_is_active(wlWm.xkbState, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0,
+    xkb_state_mod_name_is_active(wlWm.xkbState, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0,
+    xkb_state_mod_name_is_active(wlWm.xkbState, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0
+  );
+
+  app_handleKeyboardLEDs(
+    xkb_state_led_name_is_active(wlWm.xkbState, XKB_LED_NAME_NUM) > 0,
+    xkb_state_led_name_is_active(wlWm.xkbState, XKB_LED_NAME_CAPS) > 0,
+    xkb_state_led_name_is_active(wlWm.xkbState, XKB_LED_NAME_SCROLL) > 0
+  );
 }
 
 static const struct wl_keyboard_listener keyboardListener = {
@@ -211,20 +290,53 @@ static const struct wl_keyboard_listener keyboardListener = {
   .modifiers = keyboardModifiersHandler,
 };
 
+static void waylandCleanUpPointer(void)
+{
+  INTERLOCKED_SECTION(wlWm.confineLock, {
+    if (wlWm.lockedPointer)
+    {
+      zwp_locked_pointer_v1_destroy(wlWm.lockedPointer);
+      wlWm.lockedPointer = NULL;
+    }
+
+    if (wlWm.confinedPointer)
+    {
+      zwp_confined_pointer_v1_destroy(wlWm.confinedPointer);
+      wlWm.confinedPointer = NULL;
+    }
+  });
+
+  if (wlWm.relativePointer)
+  {
+    zwp_relative_pointer_v1_destroy(wlWm.relativePointer);
+    wlWm.relativePointer = NULL;
+  }
+
+  wl_pointer_destroy(wlWm.pointer);
+  wlWm.pointer = NULL;
+}
+
 // Seat-handling listeners.
 
 static void handlePointerCapability(uint32_t capabilities)
 {
   bool hasPointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
   if (!hasPointer && wlWm.pointer)
-  {
-    wl_pointer_destroy(wlWm.pointer);
-    wlWm.pointer = NULL;
-  }
+    waylandCleanUpPointer();
   else if (hasPointer && !wlWm.pointer)
   {
     wlWm.pointer = wl_seat_get_pointer(wlWm.seat);
     wl_pointer_add_listener(wlWm.pointer, &pointerListener, NULL);
+    waylandSetPointer(wlWm.cursorId);
+
+    if (wlWm.warpSupport)
+    {
+      wlWm.relativePointer =
+        zwp_relative_pointer_manager_v1_get_relative_pointer(
+          wlWm.relativePointerManager, wlWm.pointer);
+      zwp_relative_pointer_v1_add_listener(wlWm.relativePointer,
+        &relativePointerListener, NULL);
+    }
   }
 }
 
@@ -289,17 +401,12 @@ bool waylandInputInit(void)
     DEBUG_WARN("zwp_keyboard_shortcuts_inhibit_manager_v1 not exported by "
                "compositor, keyboard will not be grabbed");
 
+  wlWm.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (!wlWm.xkb)
+    DEBUG_WARN("Failed to initialize xkb, keyboard input will not work");
+
   wl_seat_add_listener(wlWm.seat, &seatListener, NULL);
   wl_display_roundtrip(wlWm.display);
-
-  if (wlWm.warpSupport)
-  {
-    wlWm.relativePointer =
-      zwp_relative_pointer_manager_v1_get_relative_pointer(
-        wlWm.relativePointerManager, wlWm.pointer);
-    zwp_relative_pointer_v1_add_listener(wlWm.relativePointer,
-      &relativePointerListener, NULL);
-  }
 
   LG_LOCK_INIT(wlWm.confineLock);
 
@@ -310,9 +417,25 @@ void waylandInputFree(void)
 {
   waylandUngrabPointer();
   LG_LOCK_FREE(wlWm.confineLock);
-  wl_pointer_destroy(wlWm.pointer);
-  wl_keyboard_destroy(wlWm.keyboard);
+
+  if (wlWm.pointer)
+    waylandCleanUpPointer();
+
+  // The only legal way the keyboard can be null is if it never existed.
+  // When unplugged, the compositor must have an inert object.
+  if (wlWm.keyboard)
+    wl_keyboard_destroy(wlWm.keyboard);
+
   wl_seat_destroy(wlWm.seat);
+
+  if (wlWm.xkbState)
+    xkb_state_unref(wlWm.xkbState);
+
+  if (wlWm.keymap)
+    xkb_keymap_unref(wlWm.keymap);
+
+  if (wlWm.xkb)
+    xkb_context_unref(wlWm.xkb);
 }
 
 void waylandGrabPointer(void)
@@ -340,16 +463,19 @@ void waylandGrabPointer(void)
   });
 }
 
-void waylandUngrabPointer(void)
+inline static void internalUngrabPointer(bool lock)
 {
-  INTERLOCKED_SECTION(wlWm.confineLock,
+  if (lock)
+    LG_LOCK(wlWm.confineLock);
+
+  if (wlWm.confinedPointer)
   {
-    if (wlWm.confinedPointer)
-    {
-      zwp_confined_pointer_v1_destroy(wlWm.confinedPointer);
-      wlWm.confinedPointer = NULL;
-    }
-  });
+    zwp_confined_pointer_v1_destroy(wlWm.confinedPointer);
+    wlWm.confinedPointer = NULL;
+  }
+
+  if (lock)
+    LG_UNLOCK(wlWm.confineLock);
 
   if (!wlWm.warpSupport)
   {
@@ -365,6 +491,11 @@ void waylandUngrabPointer(void)
     app_resyncMouseBasic();
     app_handleMouseBasic();
   }
+}
+
+void waylandUngrabPointer(void)
+{
+  internalUngrabPointer(true);
 }
 
 void waylandCapturePointer(void)
@@ -407,10 +538,8 @@ void waylandUncapturePointer(void)
      *   - if the user has opted to use captureInputOnly mode.
      */
     if (!wlWm.warpSupport || !app_isFormatValid() || app_isCaptureOnlyMode())
-    {
-      waylandUngrabPointer();
-    }
-    else
+      internalUngrabPointer(false);
+    else if (wlWm.pointer)
     {
       wlWm.confinedPointer = zwp_pointer_constraints_v1_confine_pointer(
           wlWm.pointerConstraints, wlWm.surface, wlWm.pointer, NULL,

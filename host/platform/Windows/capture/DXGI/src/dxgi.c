@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,24 +20,28 @@
 
 #include "interface/capture.h"
 #include "interface/platform.h"
+#include "common/array.h"
 #include "common/debug.h"
 #include "common/windebug.h"
 #include "common/option.h"
 #include "common/locking.h"
 #include "common/event.h"
-#include "common/dpi.h"
+#include "common/rects.h"
 #include "common/runningavg.h"
+#include "common/KVMFR.h"
 
-#include <assert.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3d11.h>
 #include <d3dcommon.h>
+#include <versionhelpers.h>
 
 #include "dxgi_extra.h"
 
-#define LOCKED(x) INTERLOCKED_SECTION(this->deviceContextLock, x)
+#define LOCKED(...) INTERLOCKED_SECTION(this->deviceContextLock, __VA_ARGS__)
 
 enum TextureState
 {
@@ -53,8 +57,18 @@ typedef struct Texture
   ID3D11Texture2D          * tex;
   D3D11_MAPPED_SUBRESOURCE   map;
   uint64_t                   copyTime;
+  uint32_t                   damageRectsCount;
+  FrameDamageRect            damageRects[KVMFR_MAX_DAMAGE_RECTS];
+  int32_t                    texDamageCount;
+  FrameDamageRect            texDamageRects[KVMFR_MAX_DAMAGE_RECTS];
 }
 Texture;
+
+struct FrameDamage
+{
+  int             count;
+  FrameDamageRect rects[KVMFR_MAX_DAMAGE_RECTS];
+};
 
 // locals
 struct iface
@@ -94,10 +108,11 @@ struct iface
   unsigned int    stride;
   CaptureFormat   format;
   CaptureRotation rotation;
-  unsigned int    dpi;
 
   int  lastPointerX, lastPointerY;
   bool lastPointerVisible;
+
+  struct FrameDamage frameDamage[LGMP_Q_FRAME_LEN];
 };
 
 static struct iface * this    = NULL;
@@ -154,8 +169,8 @@ static void dxgi_initOptions(void)
 
 static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostPointerBuffer postPointerBufferFn)
 {
-  assert(!this);
-  this = calloc(sizeof(struct iface), 1);
+  DEBUG_ASSERT(!this);
+  this = calloc(1, sizeof(*this));
   if (!this)
   {
     DEBUG_ERROR("failed to allocate iface struct");
@@ -175,7 +190,7 @@ static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostP
     this->maxTextures = 1;
 
   this->useAcquireLock      = option_get_bool("dxgi", "useAcquireLock");
-  this->texture             = calloc(sizeof(struct Texture), this->maxTextures);
+  this->texture             = calloc(this->maxTextures, sizeof(*this->texture));
   this->getPointerBufferFn  = getPointerBufferFn;
   this->postPointerBufferFn = postPointerBufferFn;
   this->avgMapTime          = runningavg_new(10);
@@ -184,7 +199,7 @@ static bool dxgi_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostP
 
 static bool dxgi_init(void)
 {
-  assert(this);
+  DEBUG_ASSERT(this);
 
   this->desktop = OpenInputDesktop(0, FALSE, GENERIC_READ);
   if (!this->desktop)
@@ -304,13 +319,13 @@ static bool dxgi_init(void)
 
   DXGI_ADAPTER_DESC1 adapterDesc;
   IDXGIAdapter1_GetDesc1(this->adapter, &adapterDesc);
-  DEBUG_INFO("Device Name      : %ls"    , outputDesc.DeviceName);
-  DEBUG_INFO("Device Descripion: %ls"    , adapterDesc.Description);
-  DEBUG_INFO("Device Vendor ID : 0x%x"   , adapterDesc.VendorId);
-  DEBUG_INFO("Device Device ID : 0x%x"   , adapterDesc.DeviceId);
-  DEBUG_INFO("Device Video Mem : %u MiB" , (unsigned)(adapterDesc.DedicatedVideoMemory  / 1048576));
-  DEBUG_INFO("Device Sys Mem   : %u MiB" , (unsigned)(adapterDesc.DedicatedSystemMemory / 1048576));
-  DEBUG_INFO("Shared Sys Mem   : %u MiB" , (unsigned)(adapterDesc.SharedSystemMemory    / 1048576));
+  DEBUG_INFO("Device Name       : %ls"    , outputDesc.DeviceName);
+  DEBUG_INFO("Device Description: %ls"    , adapterDesc.Description);
+  DEBUG_INFO("Device Vendor ID  : 0x%x"   , adapterDesc.VendorId);
+  DEBUG_INFO("Device Device ID  : 0x%x"   , adapterDesc.DeviceId);
+  DEBUG_INFO("Device Video Mem  : %u MiB" , (unsigned)(adapterDesc.DedicatedVideoMemory  / 1048576));
+  DEBUG_INFO("Device Sys Mem    : %u MiB" , (unsigned)(adapterDesc.DedicatedSystemMemory / 1048576));
+  DEBUG_INFO("Shared Sys Mem    : %u MiB" , (unsigned)(adapterDesc.SharedSystemMemory    / 1048576));
 
   static const D3D_FEATURE_LEVEL win8[] =
   {
@@ -338,15 +353,15 @@ static bool dxgi_init(void)
 
   const D3D_FEATURE_LEVEL * featureLevels;
   unsigned int featureLevelCount;
-  if (IsWindows8())
+  if (IsWindows10OrGreater())
   {
-    featureLevels     = win8;
-    featureLevelCount = sizeof(win8) / sizeof(D3D_FEATURE_LEVEL);
+    featureLevels     = win10;
+    featureLevelCount = ARRAY_LENGTH(win10);
   }
   else
   {
-    featureLevels     = win10;
-    featureLevelCount = sizeof(win10) / sizeof(D3D_FEATURE_LEVEL);
+    featureLevels     = win8;
+    featureLevelCount = ARRAY_LENGTH(win8);
   }
 
   IDXGIAdapter * tmp;
@@ -415,12 +430,11 @@ static bool dxgi_init(void)
       break;
   }
 
-  this->dpi = monitor_dpi(outputDesc.Monitor);
   ++this->formatVer;
 
-  DEBUG_INFO("Feature Level    : 0x%x"   , this->featureLevel);
-  DEBUG_INFO("Capture Size     : %u x %u", this->width, this->height);
-  DEBUG_INFO("AcquireLock      : %s"     , this->useAcquireLock ? "enabled" : "disabled");
+  DEBUG_INFO("Feature Level     : 0x%x"   , this->featureLevel);
+  DEBUG_INFO("Capture Size      : %u x %u", this->width, this->height);
+  DEBUG_INFO("AcquireLock       : %s"     , this->useAcquireLock ? "enabled" : "disabled");
 
   // try to reduce the latency
   {
@@ -485,7 +499,7 @@ static bool dxgi_init(void)
         output5,
         (IUnknown *)this->device,
         0,
-        sizeof(supportedFormats) / sizeof(DXGI_FORMAT),
+        ARRAY_LENGTH(supportedFormats),
         supportedFormats,
         &this->dup);
 
@@ -510,7 +524,7 @@ static bool dxgi_init(void)
 
   DXGI_OUTDUPL_DESC dupDesc;
   IDXGIOutputDuplication_GetDesc(this->dup, &dupDesc);
-  DEBUG_INFO("Source Format    : %s", GetDXGIFormatStr(dupDesc.ModeDesc.Format));
+  DEBUG_INFO("Source Format     : %s", GetDXGIFormatStr(dupDesc.ModeDesc.Format));
 
   uint8_t bpp = 4;
   switch(dupDesc.ModeDesc.Format)
@@ -545,6 +559,7 @@ static bool dxgi_init(void)
 
   for (int i = 0; i < this->maxTextures; ++i)
   {
+    this->texture[i].texDamageCount = -1;
     status = ID3D11Device_CreateTexture2D(this->device, &texDesc, NULL, &this->texture[i].tex);
     if (FAILED(status))
     {
@@ -565,6 +580,9 @@ static bool dxgi_init(void)
   this->stride = mapping.RowPitch / bpp;
   ID3D11DeviceContext_Unmap(this->deviceContext, (ID3D11Resource *)this->texture[0].tex, 0);
 
+  for (int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
+    this->frameDamage[i].count = -1;
+
   QueryPerformanceFrequency(&this->perfFreq) ;
   QueryPerformanceCounter  (&this->frameTime);
   this->initialized = true;
@@ -582,7 +600,7 @@ static void dxgi_stop(void)
 
 static bool dxgi_deinit(void)
 {
-  assert(this);
+  DEBUG_ASSERT(this);
 
   for (int i = 0; i < this->maxTextures; ++i)
   {
@@ -658,7 +676,7 @@ static bool dxgi_deinit(void)
 
 static void dxgi_free(void)
 {
-  assert(this);
+  DEBUG_ASSERT(this);
 
   if (this->initialized)
     dxgi_deinit();
@@ -668,14 +686,6 @@ static void dxgi_free(void)
   runningavg_free(&this->avgMapTime);
   free(this);
   this = NULL;
-}
-
-static unsigned int dxgi_getMouseScale(void)
-{
-  assert(this);
-  assert(this->initialized);
-
-  return this->dpi * 100 / DPI_100_PERCENT;
 }
 
 static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
@@ -697,10 +707,85 @@ static CaptureResult dxgi_hResultToCaptureResult(const HRESULT status)
   }
 }
 
+static void rectToFrameDamageRect(RECT * src, FrameDamageRect * dst)
+{
+  *dst = (FrameDamageRect)
+  {
+    .x = src->left,
+    .y = src->top,
+    .width = src->right - src->left,
+    .height = src->bottom - src->top
+  };
+}
+
+static void computeFrameDamage(Texture * tex)
+{
+  // By default, damage the full frame.
+  tex->damageRectsCount = 0;
+
+  const int maxDamageRectsCount = ARRAY_LENGTH(tex->damageRects);
+
+  // Compute dirty rectangles.
+  RECT dirtyRects[maxDamageRectsCount];
+  UINT dirtyRectsBufferSizeRequired;
+  if (FAILED(IDXGIOutputDuplication_GetFrameDirtyRects(this->dup,
+        ARRAY_LENGTH(dirtyRects), dirtyRects,
+        &dirtyRectsBufferSizeRequired)))
+    return;
+
+  const int dirtyRectsCount = dirtyRectsBufferSizeRequired / sizeof(*dirtyRects);
+
+  // Compute moved rectangles.
+  //
+  // Move rects are seemingly not generated on Windows 10, but may be present
+  // on Windows 8 and earlier.
+  //
+  // Divide by two here since each move generates two dirty regions.
+  DXGI_OUTDUPL_MOVE_RECT moveRects[(maxDamageRectsCount - dirtyRectsCount) / 2];
+  UINT moveRectsBufferSizeRequired;
+  if (FAILED(IDXGIOutputDuplication_GetFrameMoveRects(this->dup,
+        ARRAY_LENGTH(moveRects), moveRects,
+        &moveRectsBufferSizeRequired)))
+    return;
+
+  const int moveRectsCount = moveRectsBufferSizeRequired / sizeof(*moveRects);
+
+  FrameDamageRect * texDamageRect = tex->damageRects;
+  for (RECT *dirtyRect = dirtyRects;
+       dirtyRect < dirtyRects + dirtyRectsCount;
+       dirtyRect++)
+    rectToFrameDamageRect(dirtyRect, texDamageRect++);
+
+  int actuallyMovedRectsCount = 0;
+  for (DXGI_OUTDUPL_MOVE_RECT *moveRect = moveRects;
+       moveRect < moveRects + moveRectsCount;
+       moveRect++)
+  {
+    // According to WebRTC source comments, the DirectX capture API may randomly
+    // return unmoved rects, which should be skipped to avoid unnecessary work.
+    if (moveRect->SourcePoint.x == moveRect->DestinationRect.left &&
+        moveRect->SourcePoint.y == moveRect->DestinationRect.top)
+      continue;
+
+    *texDamageRect++ = (FrameDamageRect)
+    {
+      .x = moveRect->SourcePoint.x,
+      .y = moveRect->SourcePoint.y,
+      .width = moveRect->DestinationRect.right - moveRect->DestinationRect.left,
+      .height = moveRect->DestinationRect.bottom - moveRect->DestinationRect.top
+    };
+
+    rectToFrameDamageRect(&moveRect->DestinationRect, texDamageRect++);
+    actuallyMovedRectsCount += 2;
+  }
+
+  tex->damageRectsCount = dirtyRectsCount + actuallyMovedRectsCount;
+}
+
 static CaptureResult dxgi_capture(void)
 {
-  assert(this);
-  assert(this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(this->initialized);
 
   Texture                 * tex = NULL;
   CaptureResult             result;
@@ -778,10 +863,38 @@ static CaptureResult dxgi_capture(void)
     {
       if (copyFrame)
       {
+        computeFrameDamage(tex);
+
+        if (tex->texDamageCount < 0 || tex->damageRectsCount == 0 ||
+            tex->texDamageCount + tex->damageRectsCount > KVMFR_MAX_DAMAGE_RECTS)
+          tex->texDamageCount = -1;
+        else
+        {
+          memcpy(tex->texDamageRects + tex->texDamageCount, tex->damageRects,
+            tex->damageRectsCount * sizeof(*tex->damageRects));
+          tex->texDamageCount += tex->damageRectsCount;
+          tex->texDamageCount = rectsMergeOverlapping(tex->texDamageRects, tex->texDamageCount);
+        }
+
         // issue the copy from GPU to CPU RAM
         tex->copyTime = microtime();
-        ID3D11DeviceContext_CopyResource(this->deviceContext,
-          (ID3D11Resource *)tex->tex, (ID3D11Resource *)src);
+        if (tex->texDamageCount < 0)
+          ID3D11DeviceContext_CopyResource(this->deviceContext,
+            (ID3D11Resource *)tex->tex, (ID3D11Resource *)src);
+        else
+        {
+          for (int i = 0; i < tex->texDamageCount; ++i)
+          {
+            FrameDamageRect * rect = tex->texDamageRects + i;
+            D3D11_BOX box = {
+              .left = rect->x, .top = rect->y, .front = 0, .back = 1,
+              .right = rect->x + rect->width, .bottom = rect->y + rect->height,
+            };
+            ID3D11DeviceContext_CopySubresourceRegion(this->deviceContext,
+              (ID3D11Resource *)tex->tex, 0, rect->x, rect->y, 0,
+              (ID3D11Resource *)src, 0, &box);
+          }
+        }
       }
 
       if (copyPointer)
@@ -797,6 +910,22 @@ static CaptureResult dxgi_capture(void)
     if (copyFrame)
     {
       ID3D11Texture2D_Release(src);
+
+      for (int i = 0; i < this->maxTextures; ++i)
+      {
+        Texture * t = this->texture + i;
+        if (i == this->texWIndex)
+          t->texDamageCount = 0;
+        else if (tex->damageRectsCount > 0 && t->texDamageCount >= 0 &&
+                 t->texDamageCount + tex->damageRectsCount <= KVMFR_MAX_DAMAGE_RECTS)
+        {
+          memcpy(t->texDamageRects + t->texDamageCount, tex->damageRects,
+            tex->damageRectsCount * sizeof(*tex->damageRects));
+          t->texDamageCount += tex->damageRectsCount;
+        }
+        else
+          t->texDamageCount = -1;
+      }
 
       // set the state, and signal
       tex->state     = TEXTURE_STATE_PENDING_MAP;
@@ -878,8 +1007,8 @@ static CaptureResult dxgi_capture(void)
 
 static CaptureResult dxgi_waitFrame(CaptureFrame * frame, const size_t maxFrameSize)
 {
-  assert(this);
-  assert(this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(this->initialized);
 
   // NOTE: the event may be signaled when there are no frames available
   if (atomic_load_explicit(&this->texReady, memory_order_acquire) == 0)
@@ -930,28 +1059,62 @@ static CaptureResult dxgi_waitFrame(CaptureFrame * frame, const size_t maxFrameS
 
   const unsigned int maxHeight = maxFrameSize / this->pitch;
 
-  frame->formatVer  = tex->formatVer;
-  frame->width      = this->width;
-  frame->height     = maxHeight > this->height ? this->height : maxHeight;
-  frame->realHeight = this->height;
-  frame->pitch      = this->pitch;
-  frame->stride     = this->stride;
-  frame->format     = this->format;
-  frame->rotation   = this->rotation;
+  frame->formatVer        = tex->formatVer;
+  frame->width            = this->width;
+  frame->height           = maxHeight > this->height ? this->height : maxHeight;
+  frame->realHeight       = this->height;
+  frame->pitch            = this->pitch;
+  frame->stride           = this->stride;
+  frame->format           = this->format;
+  frame->rotation         = this->rotation;
+
+  frame->damageRectsCount = tex->damageRectsCount;
+  memcpy(frame->damageRects, tex->damageRects,
+      tex->damageRectsCount * sizeof(*tex->damageRects));
 
   atomic_fetch_sub_explicit(&this->texReady, 1, memory_order_release);
   return CAPTURE_RESULT_OK;
 }
 
 static CaptureResult dxgi_getFrame(FrameBuffer * frame,
-    const unsigned int height)
+    const unsigned int height, int frameIndex)
 {
-  assert(this);
-  assert(this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(this->initialized);
 
   Texture * tex = &this->texture[this->texRIndex];
 
-  framebuffer_write(frame, tex->map.pData, this->pitch * height);
+  struct FrameDamage * damage = this->frameDamage + frameIndex;
+  bool damageAll = tex->damageRectsCount == 0 || damage->count < 0 ||
+      damage->count + tex->damageRectsCount > KVMFR_MAX_DAMAGE_RECTS;
+
+  if (damageAll)
+    framebuffer_write(frame, tex->map.pData, this->pitch * height);
+  else
+  {
+    memcpy(damage->rects + damage->count, tex->damageRects,
+      tex->damageRectsCount * sizeof(*tex->damageRects));
+    damage->count += tex->damageRectsCount;
+    rectsBufferToFramebuffer(damage->rects, damage->count, frame, this->pitch,
+      height, tex->map.pData, this->pitch);
+  }
+
+  for (int i = 0; i < LGMP_Q_FRAME_LEN; ++i)
+  {
+    struct FrameDamage * damage = this->frameDamage + i;
+    if (i == frameIndex)
+      damage->count = 0;
+    else if (tex->damageRectsCount > 0 && damage->count >= 0 &&
+             damage->count + tex->damageRectsCount <= KVMFR_MAX_DAMAGE_RECTS)
+    {
+      memcpy(damage->rects + damage->count, tex->damageRects,
+        tex->damageRectsCount * sizeof(*tex->damageRects));
+      damage->count += tex->damageRectsCount;
+    }
+    else
+      damage->count = -1;
+  }
+
   LOCKED({ID3D11DeviceContext_Unmap(this->deviceContext, (ID3D11Resource*)tex->tex, 0);});
   tex->state = TEXTURE_STATE_UNUSED;
 
@@ -963,7 +1126,7 @@ static CaptureResult dxgi_getFrame(FrameBuffer * frame,
 
 static CaptureResult dxgi_releaseFrame(void)
 {
-  assert(this);
+  DEBUG_ASSERT(this);
   if (!this->needsRelease)
     return CAPTURE_RESULT_OK;
 
@@ -1005,7 +1168,6 @@ struct CaptureInterface Capture_DXGI =
   .stop            = dxgi_stop,
   .deinit          = dxgi_deinit,
   .free            = dxgi_free,
-  .getMouseScale   = dxgi_getMouseScale,
   .capture         = dxgi_capture,
   .waitFrame       = dxgi_waitFrame,
   .getFrame        = dxgi_getFrame

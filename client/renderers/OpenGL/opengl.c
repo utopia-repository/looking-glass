@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,23 +27,23 @@
 #include <math.h>
 
 #include <GL/gl.h>
-#include <GL/glx.h>
+
+#include "cimgui.h"
+#include "generator/output/cimgui_impl.h"
 
 #include "common/debug.h"
 #include "common/option.h"
 #include "common/framebuffer.h"
 #include "common/locking.h"
-#include "dynamic/fonts.h"
+#include "gl_dynprocs.h"
 #include "ll.h"
+#include "util.h"
 
 #define BUFFER_COUNT       2
 
 #define FPS_TEXTURE        0
 #define MOUSE_TEXTURE      1
-#define ALERT_TEXTURE      2
-#define TEXTURE_COUNT      3
-
-#define ALERT_TIMEOUT_FLAG ((uint64_t)-1)
+#define TEXTURE_COUNT      2
 
 #define FADE_TIME 1000000
 
@@ -102,19 +102,10 @@ struct OpenGL_Options
   bool amdPinnedMem;
 };
 
-struct Alert
-{
-  bool          ready;
-  bool          useCloseFlag;
-
-  LG_FontBitmap *text;
-  float         r, g, b, a;
-  uint64_t      timeout;
-  bool          closeFlag;
-};
-
 struct Inst
 {
+  LG_Renderer base;
+
   LG_RendererParams     params;
   struct OpenGL_Options opt;
 
@@ -127,9 +118,6 @@ struct Inst
   struct IntPoint   window;
   float             uiScale;
   _Atomic(bool)     frameUpdate;
-
-  const LG_Font   * font;
-  LG_FontObj        fontObj, alertFontObj;
 
   LG_Lock             formatLock;
   LG_RendererFormat   format;
@@ -148,7 +136,6 @@ struct Inst
   bool              texReady;
   int               texWIndex, texRIndex;
   int               texList;
-  int               fpsList;
   int               mouseList;
   LG_RendererRect   destRect;
 
@@ -156,16 +143,10 @@ struct Inst
   GLuint            frames[BUFFER_COUNT];
   GLsync            fences[BUFFER_COUNT];
   GLuint            textures[TEXTURE_COUNT];
-  struct ll       * alerts;
-  int               alertList;
 
   bool              waiting;
   uint64_t          waitFadeTime;
   bool              waitDone;
-
-  bool              showFPS;
-  bool              fpsTexture;
-  struct IntRect    fpsRect;
 
   LG_Lock           mouseLock;
   LG_RendererCursor mouseCursor;
@@ -182,8 +163,8 @@ struct Inst
   struct IntRect    mousePos;
 };
 
-static bool _check_gl_error(unsigned int line, const char * name);
-#define check_gl_error(name) _check_gl_error(__LINE__, name)
+static bool _checkGLError(unsigned int line, const char * name);
+#define check_gl_error(name) _checkGLError(__LINE__, name)
 
 enum ConfigStatus
 {
@@ -194,12 +175,12 @@ enum ConfigStatus
 
 static void deconfigure(struct Inst * this);
 static enum ConfigStatus configure(struct Inst * this);
-static void update_mouse_shape(struct Inst * this, bool * newShape);
-static bool draw_frame(struct Inst * this);
-static void draw_mouse(struct Inst * this);
-static void render_wait(struct Inst * this);
+static void updateMouseShape(struct Inst * this, bool * newShape);
+static bool drawFrame(struct Inst * this);
+static void drawMouse(struct Inst * this);
+static void renderWait(struct Inst * this);
 
-const char * opengl_get_name(void)
+const char * opengl_getName(void)
 {
   return "OpenGL";
 }
@@ -209,21 +190,19 @@ static void opengl_setup(void)
   option_register(opengl_options);
 }
 
-bool opengl_create(void ** opaque, const LG_RendererParams params,
+bool opengl_create(LG_Renderer ** renderer, const LG_RendererParams params,
     bool * needsOpenGL)
 {
   // create our local storage
-  *opaque = malloc(sizeof(struct Inst));
-  if (!*opaque)
+  struct Inst * this = calloc(1, sizeof(*this));
+  if (!this)
   {
-    DEBUG_INFO("Failed to allocate %lu bytes", sizeof(struct Inst));
+    DEBUG_INFO("Failed to allocate %lu bytes", sizeof(*this));
     return false;
   }
-  memset(*opaque, 0, sizeof(struct Inst));
+  *renderer = &this->base;
 
-  struct Inst * this = (struct Inst *)*opaque;
   memcpy(&this->params, &params, sizeof(LG_RendererParams));
-
   this->opt.mipmap        = option_get_bool("opengl", "mipmap"       );
   this->opt.vsync         = option_get_bool("opengl", "vsync"        );
   this->opt.preventBuffer = option_get_bool("opengl", "preventBuffer");
@@ -234,48 +213,29 @@ bool opengl_create(void ** opaque, const LG_RendererParams params,
   LG_LOCK_INIT(this->frameLock );
   LG_LOCK_INIT(this->mouseLock );
 
-  this->font = LG_Fonts[0];
-  if (!this->font->create(&this->fontObj, NULL, 14))
-  {
-    DEBUG_ERROR("Unable to create the font renderer");
-    return false;
-  }
-
-  if (!this->font->create(&this->alertFontObj, NULL, 18))
-  {
-    DEBUG_ERROR("Unable to create the font renderer");
-    return false;
-  }
-
-  this->alerts = ll_new();
-
   *needsOpenGL = true;
   return true;
 }
 
-bool opengl_initialize(void * opaque)
+bool opengl_initialize(LG_Renderer * renderer)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return false;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   this->waiting  = true;
   this->waitDone = false;
   return true;
 }
 
-void opengl_deinitialize(void * opaque)
+void opengl_deinitialize(LG_Renderer * renderer)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   if (this->renderStarted)
   {
+    ImGui_ImplOpenGL2_Shutdown();
+
     glDeleteLists(this->texList  , BUFFER_COUNT);
     glDeleteLists(this->mouseList, 1);
-    glDeleteLists(this->fpsList  , 1);
-    glDeleteLists(this->alertList, 1);
   }
 
   deconfigure(this);
@@ -299,31 +259,20 @@ void opengl_deinitialize(void * opaque)
   LG_LOCK_FREE(this->frameLock );
   LG_LOCK_FREE(this->mouseLock );
 
-  struct Alert * alert;
-  while(ll_shift(this->alerts, (void **)&alert))
-  {
-    if (alert->text)
-      this->font->release(this->alertFontObj, alert->text);
-    free(alert);
-  }
-  ll_free(this->alerts);
-
-  if (this->font && this->fontObj)
-    this->font->destroy(this->fontObj);
-
   free(this);
 }
 
-void opengl_on_restart(void * opaque)
+void opengl_onRestart(LG_Renderer * renderer)
 {
-  struct Inst * this = (struct Inst *)opaque;
+  struct Inst * this = UPCAST(struct Inst, renderer);
+
   this->waiting = true;
 }
 
-void opengl_on_resize(void * opaque, const int width, const int height, const double scale,
+void opengl_onResize(LG_Renderer * renderer, const int width, const int height, const double scale,
     const LG_RendererRect destRect, LG_RendererRotate rotate)
 {
-  struct Inst * this = (struct Inst *)opaque;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   this->window.x = width * scale;
   this->window.y = height * scale;
@@ -356,14 +305,16 @@ void opengl_on_resize(void * opaque, const int width, const int height, const do
       1.0f
     );
   }
+
+  // this is needed to refresh the font atlas texture
+  ImGui_ImplOpenGL2_Shutdown();
+  ImGui_ImplOpenGL2_NewFrame();
 }
 
-bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
+bool opengl_onMouseShape(LG_Renderer * renderer, const LG_RendererCursor cursor,
     const int width, const int height, const int pitch, const uint8_t * data)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return false;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   LG_LOCK(this->mouseLock);
   this->mouseCursor = cursor;
@@ -376,7 +327,7 @@ bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
   {
     if (this->mouseData)
       free(this->mouseData);
-    this->mouseData     = (uint8_t *)malloc(size);
+    this->mouseData     = malloc(size);
     this->mouseDataSize = size;
   }
 
@@ -387,11 +338,9 @@ bool opengl_on_mouse_shape(void * opaque, const LG_RendererCursor cursor,
   return true;
 }
 
-bool opengl_on_mouse_event(void * opaque, const bool visible, const int x, const int y)
+bool opengl_onMouseEvent(LG_Renderer * renderer, const bool visible, const int x, const int y)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return false;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   if (this->mousePos.x == x && this->mousePos.y == y && this->mouseVisible == visible)
     return true;
@@ -403,9 +352,9 @@ bool opengl_on_mouse_event(void * opaque, const bool visible, const int x, const
   return false;
 }
 
-bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format, bool useDMA)
+bool opengl_onFrameFormat(LG_Renderer * renderer, const LG_RendererFormat format)
 {
-  struct Inst * this = (struct Inst *)opaque;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   LG_LOCK(this->formatLock);
   memcpy(&this->format, &format, sizeof(LG_RendererFormat));
@@ -414,9 +363,10 @@ bool opengl_on_frame_format(void * opaque, const LG_RendererFormat format, bool 
   return true;
 }
 
-bool opengl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
+bool opengl_onFrame(LG_Renderer * renderer, const FrameBuffer * frame, int dmaFd,
+    const FrameDamageRect * damage, int damageCount)
 {
-  struct Inst * this = (struct Inst *)opaque;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   LG_LOCK(this->frameLock);
   this->frame = frame;
@@ -438,98 +388,9 @@ bool opengl_on_frame(void * opaque, const FrameBuffer * frame, int dmaFd)
   return true;
 }
 
-void opengl_on_alert(void * opaque, const LG_MsgAlert alert, const char * message, bool ** closeFlag)
+bool opengl_renderStartup(LG_Renderer * renderer, bool useDMA)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  struct Alert * a = malloc(sizeof(struct Alert));
-  memset(a, 0, sizeof(struct Alert));
-
-  switch(alert)
-  {
-    case LG_ALERT_INFO:
-      a->r = 0.0f;
-      a->g = 0.0f;
-      a->b = 0.8f;
-      a->a = 0.8f;
-      break;
-
-    case LG_ALERT_SUCCESS:
-      a->r = 0.0f;
-      a->g = 0.8f;
-      a->b = 0.0f;
-      a->a = 0.8f;
-      break;
-
-    case LG_ALERT_WARNING:
-      a->r = 0.8f;
-      a->g = 0.5f;
-      a->b = 0.0f;
-      a->a = 0.8f;
-      break;
-
-    case LG_ALERT_ERROR:
-      a->r = 1.0f;
-      a->g = 0.0f;
-      a->b = 0.0f;
-      a->a = 0.8f;
-      break;
-  }
-
-  if (!(a->text = this->font->render(this->alertFontObj, 0xffffff00, message)))
-  {
-    DEBUG_ERROR("Failed to render alert text");
-    free(a);
-    return;
-  }
-
-  if (closeFlag)
-  {
-    a->useCloseFlag = true;
-    *closeFlag = &a->closeFlag;
-  }
-
-  ll_push(this->alerts, a);
-}
-
-void opengl_on_help(void * opaque, const char * message)
-{
-  // TODO: Implement this.
-}
-
-void opengl_on_show_fps(void * opaque, bool showFPS)
-{
-  struct Inst * this = (struct Inst *)opaque;
-  this->showFPS = showFPS;
-}
-
-void bitmap_to_texture(LG_FontBitmap * bitmap, GLuint texture)
-{
-  glBindTexture(GL_TEXTURE_2D       , texture      );
-  glPixelStorei(GL_UNPACK_ALIGNMENT , 4            );
-  glPixelStorei(GL_UNPACK_ROW_LENGTH, bitmap->width);
-  glTexImage2D(
-    GL_TEXTURE_2D,
-    0,
-    bitmap->bpp,
-    bitmap->width,
-    bitmap->height,
-    0,
-    GL_BGRA,
-    GL_UNSIGNED_BYTE,
-    bitmap->pixels
-  );
-
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-
-  glBindTexture(GL_TEXTURE_2D, 0);
-}
-
-bool opengl_render_startup(void * opaque)
-{
-  struct Inst * this = (struct Inst *)opaque;
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   this->glContext = app_glCreateContext();
   if (!this->glContext)
@@ -541,22 +402,41 @@ bool opengl_render_startup(void * opaque)
   DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
   DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
 
-  GLint n;
-  glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-  for(GLint i = 0; i < n; ++i)
+  const char * exts = (const char *)glGetString(GL_EXTENSIONS);
+  if (util_hasGLExt(exts, "GL_AMD_pinned_memory"))
   {
-    const GLubyte *ext = glGetStringi(GL_EXTENSIONS, i);
-    if (strcmp((const char *)ext, "GL_AMD_pinned_memory") == 0)
+    if (this->opt.amdPinnedMem)
     {
-      if (this->opt.amdPinnedMem)
-      {
-        this->amdPinnedMemSupport = true;
-        DEBUG_INFO("Using GL_AMD_pinned_memory");
-      }
-      else
-        DEBUG_INFO("GL_AMD_pinned_memory is available but not in use");
-      break;
+      this->amdPinnedMemSupport = true;
+      DEBUG_INFO("Using GL_AMD_pinned_memory");
     }
+    else
+      DEBUG_INFO("GL_AMD_pinned_memory is available but not in use");
+  }
+
+  GLint maj, min;
+  glGetIntegerv(GL_MAJOR_VERSION, &maj);
+  glGetIntegerv(GL_MINOR_VERSION, &min);
+
+  if ((maj < 3 || (maj == 3 && min < 2)) && !util_hasGLExt(exts, "GL_ARB_sync"))
+  {
+    DEBUG_ERROR("Need OpenGL 3.2+ or GL_ARB_sync for sync objects");
+    return false;
+  }
+
+  if (maj < 2 && !util_hasGLExt(exts, "GL_ARB_pixel_buffer_object"))
+  {
+    DEBUG_ERROR("Need OpenGL 2.0+ or GL_ARB_pixel_buffer_object");
+    return false;
+  }
+
+  if (this->opt.mipmap && maj < 3 &&
+      !util_hasGLExt(exts, "GL_ARB_framebuffer_object") &&
+      !util_hasGLExt(exts, "GL_EXT_framebuffer_object"))
+  {
+    DEBUG_WARN("Need OpenGL 3.0+ or GL_ARB_framebuffer_object or "
+      "GL_EXT_framebuffer_object for glGenerateMipmap, disabling mipmaps");
+    this->opt.mipmap = false;
   }
 
   glEnable(GL_TEXTURE_2D);
@@ -568,8 +448,6 @@ bool opengl_render_startup(void * opaque)
   // generate lists for drawing
   this->texList   = glGenLists(BUFFER_COUNT);
   this->mouseList = glGenLists(1);
-  this->fpsList   = glGenLists(1);
-  this->alertList = glGenLists(1);
 
   // create the overlay textures
   glGenTextures(TEXTURE_COUNT, this->textures);
@@ -581,15 +459,27 @@ bool opengl_render_startup(void * opaque)
   this->hasTextures = true;
 
   app_glSetSwapInterval(this->opt.vsync ? 1 : 0);
+
+  if (!ImGui_ImplOpenGL2_Init())
+  {
+    DEBUG_ERROR("Failed to initialize ImGui");
+    return false;
+  }
+
   this->renderStarted = true;
   return true;
 }
 
-bool opengl_render(void * opaque, LG_RendererRotate rotate)
+static bool opengl_needsRender(LG_Renderer * renderer)
 {
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this)
-    return false;
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  return !this->waitDone;
+}
+
+bool opengl_render(LG_Renderer * renderer, LG_RendererRotate rotate, const bool newFrame,
+    const bool invalidateWindow, void (*preSwap)(void * udata), void * udata)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
 
   switch(configure(this))
   {
@@ -599,7 +489,7 @@ bool opengl_render(void * opaque, LG_RendererRotate rotate)
 
     case CONFIG_STATUS_NOOP :
     case CONFIG_STATUS_OK   :
-      if (!draw_frame(this))
+      if (!drawFrame(this))
         return false;
   }
 
@@ -607,89 +497,25 @@ bool opengl_render(void * opaque, LG_RendererRotate rotate)
   glClear(GL_COLOR_BUFFER_BIT);
 
   if (this->waiting)
-    render_wait(this);
+    renderWait(this);
   else
   {
     bool newShape;
-    update_mouse_shape(this, &newShape);
+    updateMouseShape(this, &newShape);
     glCallList(this->texList + this->texRIndex);
-    draw_mouse(this);
+    drawMouse(this);
 
     if (!this->waitDone)
-      render_wait(this);
+      renderWait(this);
   }
 
-  if (this->showFPS && this->fpsTexture)
-    glCallList(this->fpsList);
-
-  struct Alert * alert;
-  while(ll_peek_head(this->alerts, (void **)&alert))
+  if (app_renderOverlay(NULL, 0) != 0)
   {
-    if (!alert->ready)
-    {
-      bitmap_to_texture(alert->text, this->textures[ALERT_TEXTURE]);
-
-      glNewList(this->alertList, GL_COMPILE);
-        const int p = 4;
-        const int w = alert->text->width  + p * 2;
-        const int h = alert->text->height + p * 2;
-        glTranslatef(-(w / 2), -(h / 2), 0.0f);
-        glEnable(GL_BLEND);
-        glDisable(GL_TEXTURE_2D);
-        glColor4f(alert->r, alert->g, alert->b, alert->a);
-        glBegin(GL_TRIANGLE_STRIP);
-          glVertex2i(0, 0);
-          glVertex2i(w, 0);
-          glVertex2i(0, h);
-          glVertex2i(w, h);
-        glEnd();
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, this->textures[ALERT_TEXTURE]);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        glTranslatef(p, p, 0.0f);
-        glBegin(GL_TRIANGLE_STRIP);
-          glTexCoord2f(0.0f, 0.0f); glVertex2i(0                 , 0                  );
-          glTexCoord2f(1.0f, 0.0f); glVertex2i(alert->text->width, 0                  );
-          glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , alert->text->height);
-          glTexCoord2f(1.0f, 1.0f); glVertex2i(alert->text->width, alert->text->height);
-        glEnd();
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glDisable(GL_BLEND);
-      glEndList();
-
-      if (!alert->useCloseFlag)
-        alert->timeout = microtime() + 2*1000000;
-      alert->ready   = true;
-
-      this->font->release(this->fontObj, alert->text);
-      alert->text  = NULL;
-      alert->ready = true;
-    }
-    else
-    {
-      bool close = false;
-      if (alert->useCloseFlag)
-        close = alert->closeFlag;
-      else if (alert->timeout < microtime())
-        close = true;
-
-      if (close)
-      {
-        free(alert);
-        ll_shift(this->alerts, NULL);
-        continue;
-      }
-    }
-
-    glPushMatrix();
-      glLoadIdentity();
-      glTranslatef(this->window.x / 2, this->window.y / 2, 0.0f);
-      glScalef(this->uiScale, this->uiScale, 1.0f);
-      glCallList(this->alertList);
-    glPopMatrix();
-    break;
+    ImGui_ImplOpenGL2_NewFrame();
+    ImGui_ImplOpenGL2_RenderDrawData(igGetDrawData());
   }
 
+  preSwap(udata);
   if (this->opt.preventBuffer)
   {
     app_glSwapBuffers();
@@ -702,56 +528,7 @@ bool opengl_render(void * opaque, LG_RendererRotate rotate)
   return true;
 }
 
-void opengl_update_fps(void * opaque, const float avgUPS, const float avgFPS)
-{
-  struct Inst * this = (struct Inst *)opaque;
-  if (!this->showFPS)
-    return;
-
-  char str[128];
-  snprintf(str, sizeof(str), "UPS: %8.4f, FPS: %8.4f", avgUPS, avgFPS);
-
-  LG_FontBitmap *textSurface = NULL;
-  if (!(textSurface = this->font->render(this->fontObj, 0xffffff00, str)))
-    DEBUG_ERROR("Failed to render text");
-
-  bitmap_to_texture(textSurface, this->textures[FPS_TEXTURE]);
-
-  this->fpsRect.x = 5;
-  this->fpsRect.y = 5;
-  this->fpsRect.w = textSurface->width;
-  this->fpsRect.h = textSurface->height;
-
-  this->font->release(this->fontObj, textSurface);
-
-  this->fpsTexture  = true;
-
-  glNewList(this->fpsList, GL_COMPILE);
-    glEnable(GL_BLEND);
-    glDisable(GL_TEXTURE_2D);
-    glColor4f(0.0f, 0.0f, 1.0f, 0.5f);
-    glBegin(GL_TRIANGLE_STRIP);
-      glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
-      glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
-      glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
-      glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
-    glEnd();
-    glEnable(GL_TEXTURE_2D);
-
-    glBindTexture(GL_TEXTURE_2D, this->textures[FPS_TEXTURE]);
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-    glBegin(GL_TRIANGLE_STRIP);
-      glTexCoord2f(0.0f , 0.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y                  );
-      glTexCoord2f(1.0f , 0.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y                  );
-      glTexCoord2f(0.0f , 1.0f); glVertex2i(this->fpsRect.x                  , this->fpsRect.y + this->fpsRect.h);
-      glTexCoord2f(1.0f,  1.0f); glVertex2i(this->fpsRect.x + this->fpsRect.w, this->fpsRect.y + this->fpsRect.h);
-    glEnd();
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glDisable(GL_BLEND);
-  glEndList();
-}
-
-void draw_torus(float x, float y, float inner, float outer, unsigned int pts)
+void drawTorus(float x, float y, float inner, float outer, unsigned int pts)
 {
   glBegin(GL_QUAD_STRIP);
   for (unsigned int i = 0; i <= pts; ++i)
@@ -763,7 +540,7 @@ void draw_torus(float x, float y, float inner, float outer, unsigned int pts)
   glEnd();
 }
 
-void draw_torus_arc(float x, float y, float inner, float outer, unsigned int pts, float s, float e)
+void drawTorusArc(float x, float y, float inner, float outer, unsigned int pts, float s, float e)
 {
   glBegin(GL_QUAD_STRIP);
   for (unsigned int i = 0; i <= pts; ++i)
@@ -775,7 +552,7 @@ void draw_torus_arc(float x, float y, float inner, float outer, unsigned int pts
   glEnd();
 }
 
-static void render_wait(struct Inst * this)
+static void renderWait(struct Inst * this)
 {
   float a;
   if (this->waiting)
@@ -815,11 +592,11 @@ static void render_wait(struct Inst * this)
   glColor4f(1.0f, 1.0f, 1.0f, a);
   glScalef (2.0f, 2.0f, 1.0f);
 
-  draw_torus    (  0,  0, 40, 42, 60);
-  draw_torus    (  0,  0, 32, 34, 60);
-  draw_torus    (-50, -3,  2,  4, 30);
-  draw_torus    ( 50, -3,  2,  4, 30);
-  draw_torus_arc(  0,  0, 51, 49, 60, 0.0f, M_PI);
+  drawTorus   (  0,  0, 40, 42, 60);
+  drawTorus   (  0,  0, 32, 34, 60);
+  drawTorus   (-50, -3,  2,  4, 30);
+  drawTorus   ( 50, -3,  2,  4, 30);
+  drawTorusArc(  0,  0, 51, 49, 60, 0.0f, M_PI);
 
   glBegin(GL_QUADS);
     glVertex2f(-1 , 50);
@@ -836,8 +613,8 @@ static void render_wait(struct Inst * this)
     glVertex2f( 21, 83);
   glEnd();
 
-  draw_torus_arc(-14, 83, 5, 7, 10, M_PI       , M_PI / 2.0f);
-  draw_torus_arc( 14, 83, 5, 7, 10, M_PI * 1.5f, M_PI / 2.0f);
+  drawTorusArc(-14, 83, 5, 7, 10, M_PI       , M_PI / 2.0f);
+  drawTorusArc( 14, 83, 5, 7, 10, M_PI * 1.5f, M_PI / 2.0f);
 
   //FIXME: draw the diagnoal marks on the circle
 
@@ -845,29 +622,26 @@ static void render_wait(struct Inst * this)
   glDisable(GL_BLEND);
 }
 
-const LG_Renderer LGR_OpenGL =
+const LG_RendererOps LGR_OpenGL =
 {
-  .get_name        = opengl_get_name,
-  .setup           = opengl_setup,
+  .getName       = opengl_getName,
+  .setup         = opengl_setup,
 
-  .create          = opengl_create,
-  .initialize      = opengl_initialize,
-  .deinitialize    = opengl_deinitialize,
-  .on_restart      = opengl_on_restart,
-  .on_resize       = opengl_on_resize,
-  .on_mouse_shape  = opengl_on_mouse_shape,
-  .on_mouse_event  = opengl_on_mouse_event,
-  .on_frame_format = opengl_on_frame_format,
-  .on_frame        = opengl_on_frame,
-  .on_alert        = opengl_on_alert,
-  .on_help         = opengl_on_help,
-  .on_show_fps     = opengl_on_show_fps,
-  .render_startup  = opengl_render_startup,
-  .render          = opengl_render,
-  .update_fps      = opengl_update_fps
+  .create        = opengl_create,
+  .initialize    = opengl_initialize,
+  .deinitialize  = opengl_deinitialize,
+  .onRestart     = opengl_onRestart,
+  .onResize      = opengl_onResize,
+  .onMouseShape  = opengl_onMouseShape,
+  .onMouseEvent  = opengl_onMouseEvent,
+  .onFrameFormat = opengl_onFrameFormat,
+  .onFrame       = opengl_onFrame,
+  .renderStartup = opengl_renderStartup,
+  .needsRender   = opengl_needsRender,
+  .render        = opengl_render
 };
 
-static bool _check_gl_error(unsigned int line, const char * name)
+static bool _checkGLError(unsigned int line, const char * name)
 {
   GLenum error = glGetError();
   if (error == GL_NO_ERROR)
@@ -957,7 +731,7 @@ static enum ConfigStatus configure(struct Inst * this)
   this->texSize = this->format.height * this->format.pitch;
   this->texPos  = 0;
 
-  glGenBuffers(BUFFER_COUNT, this->vboID);
+  g_gl_dynProcs.glGenBuffers(BUFFER_COUNT, this->vboID);
   if (check_gl_error("glGenBuffers"))
   {
     LG_UNLOCK(this->formatLock);
@@ -980,14 +754,14 @@ static enum ConfigStatus configure(struct Inst * this)
 
       memset(this->texPixels[i], 0, this->texSize);
 
-      glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, this->vboID[i]);
+      g_gl_dynProcs.glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, this->vboID[i]);
       if (check_gl_error("glBindBuffer"))
       {
         LG_UNLOCK(this->formatLock);
         return CONFIG_STATUS_ERROR;
       }
 
-      glBufferData(
+      g_gl_dynProcs.glBufferData(
         GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD,
         this->texSize,
         this->texPixels[i],
@@ -1000,20 +774,20 @@ static enum ConfigStatus configure(struct Inst * this)
         return CONFIG_STATUS_ERROR;
       }
     }
-    glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0);
+    g_gl_dynProcs.glBindBuffer(GL_EXTERNAL_VIRTUAL_MEMORY_BUFFER_AMD, 0);
   }
   else
   {
     for(int i = 0; i < BUFFER_COUNT; ++i)
     {
-      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[i]);
+      g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[i]);
       if (check_gl_error("glBindBuffer"))
       {
         LG_UNLOCK(this->formatLock);
         return CONFIG_STATUS_ERROR;
       }
 
-      glBufferData(
+      g_gl_dynProcs.glBufferData(
         GL_PIXEL_UNPACK_BUFFER,
         this->texSize,
         NULL,
@@ -1025,7 +799,7 @@ static enum ConfigStatus configure(struct Inst * this)
         return CONFIG_STATUS_ERROR;
       }
     }
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
   }
 
   // create the frame textures
@@ -1085,7 +859,7 @@ static enum ConfigStatus configure(struct Inst * this)
   }
 
   glBindTexture(GL_TEXTURE_2D, 0);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   this->drawStart   = nanotime();
   this->configured  = true;
@@ -1105,7 +879,7 @@ static void deconfigure(struct Inst * this)
 
   if (this->hasBuffers)
   {
-    glDeleteBuffers(BUFFER_COUNT, this->vboID);
+    g_gl_dynProcs.glDeleteBuffers(BUFFER_COUNT, this->vboID);
     this->hasBuffers = false;
   }
 
@@ -1115,7 +889,7 @@ static void deconfigure(struct Inst * this)
     {
       if (this->fences[i])
       {
-        glDeleteSync(this->fences[i]);
+        g_gl_dynProcs.glDeleteSync(this->fences[i]);
         this->fences[i] = NULL;
       }
 
@@ -1130,7 +904,7 @@ static void deconfigure(struct Inst * this)
   this->configured = false;
 }
 
-static void update_mouse_shape(struct Inst * this, bool * newShape)
+static void updateMouseShape(struct Inst * this, bool * newShape)
 {
   LG_LOCK(this->mouseLock);
   *newShape = this->newShape;
@@ -1275,12 +1049,12 @@ static void update_mouse_shape(struct Inst * this, bool * newShape)
   LG_UNLOCK(this->mouseLock);
 }
 
-static bool opengl_buffer_fn(void * opaque, const void * data, size_t size)
+static bool opengl_bufferFn(void * opaque, const void * data, size_t size)
 {
   struct Inst * this = (struct Inst *)opaque;
 
   // update the buffer, this performs a DMA transfer if possible
-  glBufferSubData(
+  g_gl_dynProcs.glBufferSubData(
     GL_PIXEL_UNPACK_BUFFER,
     this->texPos,
     size,
@@ -1292,11 +1066,11 @@ static bool opengl_buffer_fn(void * opaque, const void * data, size_t size)
   return true;
 }
 
-static bool draw_frame(struct Inst * this)
+static bool drawFrame(struct Inst * this)
 {
-  if (glIsSync(this->fences[this->texWIndex]))
+  if (g_gl_dynProcs.glIsSync(this->fences[this->texWIndex]))
   {
-    switch(glClientWaitSync(this->fences[this->texWIndex], 0, GL_TIMEOUT_IGNORED))
+    switch(g_gl_dynProcs.glClientWaitSync(this->fences[this->texWIndex], 0, GL_TIMEOUT_IGNORED))
     {
       case GL_ALREADY_SIGNALED:
         break;
@@ -1314,7 +1088,7 @@ static bool draw_frame(struct Inst * this)
         break;
     }
 
-    glDeleteSync(this->fences[this->texWIndex]);
+    g_gl_dynProcs.glDeleteSync(this->fences[this->texWIndex]);
     this->fences[this->texWIndex] = NULL;
 
     this->texRIndex = this->texWIndex;
@@ -1331,7 +1105,7 @@ static bool draw_frame(struct Inst * this)
 
   LG_LOCK(this->formatLock);
   glBindTexture(GL_TEXTURE_2D, this->frames[this->texWIndex]);
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[this->texWIndex]);
+  g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, this->vboID[this->texWIndex]);
 
   const int bpp = this->format.bpp / 8;
   glPixelStorei(GL_UNPACK_ALIGNMENT , bpp);
@@ -1345,7 +1119,7 @@ static bool draw_frame(struct Inst * this)
     this->format.width,
     bpp,
     this->format.pitch,
-    opengl_buffer_fn,
+    opengl_bufferFn,
     this
   );
 
@@ -1371,7 +1145,7 @@ static bool draw_frame(struct Inst * this)
   }
 
   // unbind the buffer
-  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   const bool mipmap = this->opt.mipmap && (
     (this->format.width  > this->destRect.w) ||
@@ -1379,7 +1153,7 @@ static bool draw_frame(struct Inst * this)
 
   if (mipmap)
   {
-    glGenerateMipmap(GL_TEXTURE_2D);
+    g_gl_dynProcs.glGenerateMipmap(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
   }
@@ -1392,7 +1166,7 @@ static bool draw_frame(struct Inst * this)
 
   // set a fence so we don't overwrite a buffer in use
   this->fences[this->texWIndex] =
-    glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    g_gl_dynProcs.glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   glFlush();
 
   LG_UNLOCK(this->formatLock);
@@ -1400,7 +1174,7 @@ static bool draw_frame(struct Inst * this)
   return true;
 }
 
-static void draw_mouse(struct Inst * this)
+static void drawMouse(struct Inst * this)
 {
   if (!this->mouseVisible)
     return;

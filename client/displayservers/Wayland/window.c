@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,17 +27,18 @@
 
 #include "app.h"
 #include "common/debug.h"
+#include "common/event.h"
 
 // Surface-handling listeners.
 
 void waylandWindowUpdateScale(void)
 {
-  int32_t maxScale = 0;
+  wl_fixed_t maxScale = 0;
   struct SurfaceOutput * node;
 
   wl_list_for_each(node, &wlWm.surfaceOutputs, link)
   {
-    int32_t scale = waylandOutputGetScale(node->output);
+    wl_fixed_t scale = waylandOutputGetScale(node->output);
     if (scale > maxScale)
       maxScale = scale;
   }
@@ -45,13 +46,17 @@ void waylandWindowUpdateScale(void)
   if (maxScale)
   {
     wlWm.scale = maxScale;
+    wlWm.fractionalScale = wl_fixed_from_int(wl_fixed_to_int(maxScale)) != maxScale;
     wlWm.needsResize = true;
+    waylandCursorScaleChange();
+    app_invalidateWindow(true);
+    waylandStopWaitFrame();
   }
 }
 
 static void wlSurfaceEnterHandler(void * data, struct wl_surface * surface, struct wl_output * output)
 {
-  struct SurfaceOutput * node = malloc(sizeof(struct SurfaceOutput));
+  struct SurfaceOutput * node = malloc(sizeof(*node));
   node->output = output;
   wl_list_insert(&wlWm.surfaceOutputs, &node->link);
   waylandWindowUpdateScale();
@@ -74,9 +79,17 @@ static const struct wl_surface_listener wlSurfaceListener = {
   .leave = wlSurfaceLeaveHandler,
 };
 
-bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool borderless)
+bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool borderless, bool resizable)
 {
-  wlWm.scale = 1;
+  wlWm.scale = wl_fixed_from_int(1);
+
+  wlWm.frameEvent = lgCreateEvent(true, 0);
+  if (!wlWm.frameEvent)
+  {
+    DEBUG_ERROR("Failed to initialize event for waitFrame");
+    return false;
+  }
+  lgSignalEvent(wlWm.frameEvent);
 
   if (!wlWm.compositor)
   {
@@ -93,7 +106,7 @@ bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool 
 
   wl_surface_add_listener(wlWm.surface, &wlSurfaceListener, NULL);
 
-  if (!waylandShellInit(title, fullscreen, maximize, borderless))
+  if (!waylandShellInit(title, fullscreen, maximize, borderless, resizable))
     return false;
 
   wl_surface_commit(wlWm.surface);
@@ -103,14 +116,47 @@ bool waylandWindowInit(const char * title, bool fullscreen, bool maximize, bool 
 void waylandWindowFree(void)
 {
   wl_surface_destroy(wlWm.surface);
+  lgFreeEvent(wlWm.frameEvent);
 }
 
 void waylandSetWindowSize(int x, int y)
 {
-  // FIXME: implement.
+    waylandShellResize(x, y);
 }
 
 bool waylandIsValidPointerPos(int x, int y)
 {
   return x >= 0 && x < wlWm.width && y >= 0 && y < wlWm.height;
+}
+
+static void frameHandler(void * opaque, struct wl_callback * callback, unsigned int data)
+{
+  lgSignalEvent(wlWm.frameEvent);
+  wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_listener = {
+   .done = frameHandler,
+};
+
+bool waylandWaitFrame(void)
+{
+  lgWaitEvent(wlWm.frameEvent, TIMEOUT_INFINITE);
+
+  struct wl_callback * callback = wl_surface_frame(wlWm.surface);
+  if (callback)
+    wl_callback_add_listener(callback, &frame_listener, NULL);
+
+  return false;
+}
+
+void waylandSkipFrame(void)
+{
+  // If we decided to not render, we must commit the surface so that the callback is registered.
+  wl_surface_commit(wlWm.surface);
+}
+
+void waylandStopWaitFrame(void)
+{
+  lgSignalEvent(wlWm.frameEvent);
 }

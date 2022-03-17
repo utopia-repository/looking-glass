@@ -2,23 +2,22 @@ cmake_minimum_required(VERSION 3.0)
 project(displayserver_Wayland LANGUAGES C)
 
 find_package(PkgConfig)
-pkg_check_modules(DISPLAYSERVER_Wayland_PKGCONFIG REQUIRED
+pkg_check_modules(DISPLAYSERVER_Wayland REQUIRED IMPORTED_TARGET
 	wayland-client
+	wayland-cursor
+	xkbcommon
 )
 
-#pkg_check_modules(DISPLAYSERVER_Wayland_OPT_PKGCONFIG
-#)
-
+set(DISPLAYSERVER_Wayland_OPT_PKGCONFIG_LIBRARIES "")
 set(displayserver_Wayland_SHELL_SRC "")
 
 if (ENABLE_LIBDECOR)
-	pkg_check_modules(DISPLAYSERVER_Wayland_LIBDECOR REQUIRED
-		libdecor-0.1
+	pkg_check_modules(DISPLAYSERVER_Wayland_LIBDECOR REQUIRED IMPORTED_TARGET
+		libdecor-0
 	)
-	list(APPEND DISPLAYSERVER_Wayland_PKGCONFIG_LIBRARIES ${DISPLAYSERVER_Wayland_LIBDECOR_LIBRARIES})
-	list(APPEND DISPLAYSERVER_Wayland_PKGCONFIG_INCLUDE_DIRS ${DISPLAYSERVER_Wayland_LIBDECOR_INCLUDE_DIRS})
+	list(APPEND DISPLAYSERVER_Wayland_OPT_PKGCONFIG_LIBRARIES PkgConfig::DISPLAYSERVER_Wayland_LIBDECOR)
 	list(APPEND displayserver_Wayland_SHELL_SRC shell_libdecor.c)
-	add_definitions(-D ENABLE_LIBDECOR)
+	add_compile_definitions(ENABLE_LIBDECOR)
 else()
 	list(APPEND displayserver_Wayland_SHELL_SRC shell_xdg.c)
 endif()
@@ -31,6 +30,7 @@ add_library(displayserver_Wayland STATIC
 	input.c
 	output.c
 	poll.c
+	presentation.c
 	state.c
 	registry.c
 	wayland.c
@@ -39,7 +39,7 @@ add_library(displayserver_Wayland STATIC
 )
 
 target_link_libraries(displayserver_Wayland
-	${DISPLAYSERVER_Wayland_PKGCONFIG_LIBRARIES}
+	PkgConfig::DISPLAYSERVER_Wayland
 	${DISPLAYSERVER_Wayland_OPT_PKGCONFIG_LIBRARIES}
 	lg_common
 )
@@ -47,8 +47,6 @@ target_link_libraries(displayserver_Wayland
 target_include_directories(displayserver_Wayland
 	PRIVATE
 		src
-		${DISPLAYSERVER_Wayland_PKGCONFIG_INCLUDE_DIRS}
-		${DISPLAYSERVER_Wayland_OPT_PKGCONFIG_INCLUDE_DIRS}
 )
 
 find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
@@ -75,6 +73,12 @@ wayland_generate(
     "${WAYLAND_PROTOCOLS_BASE}/stable/xdg-shell/xdg-shell.xml"
     "${CMAKE_BINARY_DIR}/wayland/wayland-xdg-shell-client-protocol")
 wayland_generate(
+    "${WAYLAND_PROTOCOLS_BASE}/stable/presentation-time/presentation-time.xml"
+    "${CMAKE_BINARY_DIR}/wayland/wayland-presentation-time-client-protocol")
+wayland_generate(
+    "${WAYLAND_PROTOCOLS_BASE}/stable/viewporter/viewporter.xml"
+    "${CMAKE_BINARY_DIR}/wayland/wayland-viewporter-client-protocol")
+wayland_generate(
     "${WAYLAND_PROTOCOLS_BASE}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
     "${CMAKE_BINARY_DIR}/wayland/wayland-xdg-decoration-unstable-v1-client-protocol")
 wayland_generate(
@@ -89,4 +93,6 @@ wayland_generate(
 wayland_generate(
     "${WAYLAND_PROTOCOLS_BASE}/unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
     "${CMAKE_BINARY_DIR}/wayland/wayland-idle-inhibit-unstable-v1-client-protocol")
-
+wayland_generate(
+    "${WAYLAND_PROTOCOLS_BASE}/unstable/xdg-output/xdg-output-unstable-v1.xml"
+    "${CMAKE_BINARY_DIR}/wayland/wayland-xdg-output-unstable-v1-client-protocol")

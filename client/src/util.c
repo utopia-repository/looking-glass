@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,8 +27,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
 #include <math.h>
+#include <fontconfig/fontconfig.h>
+
+static FcConfig * FontConfig = NULL;
 
 bool util_fileGetContents(const char * filename, char ** buffer, size_t * length)
 {
@@ -179,7 +181,7 @@ void util_localCurToGuest(struct DoublePoint *guest)
       break;
 
     default:
-      assert(!"unreachable");
+      DEBUG_UNREACHABLE();
   }
 }
 
@@ -214,4 +216,65 @@ void util_rotatePoint(struct DoublePoint *point)
 bool util_hasGLExt(const char * exts, const char * ext)
 {
   return str_containsValue(exts, ' ', ext);
+}
+
+bool util_initUIFonts(void)
+{
+  if (FontConfig)
+    return true;
+
+  FontConfig = FcInitLoadConfigAndFonts();
+
+  if (!FontConfig)
+  {
+    DEBUG_ERROR("FcInitLoadConfigAndFonts Failed");
+    return false;
+  }
+
+  return true;
+}
+
+char * util_getUIFont(const char * fontName)
+{
+  char * ttf = NULL;
+
+  FcPattern * pat = FcNameParse((const FcChar8*) fontName);
+  if (!pat)
+  {
+    DEBUG_ERROR("FCNameParse failed");
+    return NULL;
+  }
+
+  FcConfigSubstitute(FontConfig, pat, FcMatchPattern);
+  FcDefaultSubstitute(pat);
+  FcResult result;
+  FcChar8 * file = NULL;
+  FcPattern * match = FcFontMatch(FontConfig, pat, &result);
+
+  if (!match)
+  {
+    DEBUG_ERROR("FcFontMatch Failed");
+    goto fail_parse;
+  }
+
+  if (FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch)
+    ttf = strdup((char *) file);
+  else
+    DEBUG_ERROR("Failed to locate the requested font: %s", fontName);
+
+  FcPatternDestroy(match);
+
+fail_parse:
+  FcPatternDestroy(pat);
+  return ttf;
+}
+
+void util_freeUIFonts(void)
+{
+  if (!FontConfig)
+    return;
+
+  FcConfigDestroy(FontConfig);
+  FontConfig = NULL;
+  FcFini();
 }

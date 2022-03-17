@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -99,7 +99,7 @@ bool framebuffer_read(const FrameBuffer * frame, void * restrict dst,
         return false;
 
       memcpy(d, frame->data + rp, dstpitch);
-      rp += linewidth;
+      rp += pitch;
       d  += dstpitch;
     }
   }
@@ -212,4 +212,19 @@ bool framebuffer_write(FrameBuffer * frame, const void * restrict src, size_t si
 #endif
 
   return true;
+}
+
+const uint8_t * framebuffer_get_buffer(const FrameBuffer * frame)
+{
+  return frame->data;
+}
+
+uint8_t * framebuffer_get_data(FrameBuffer * frame)
+{
+  return frame->data;
+}
+
+void framebuffer_set_write_ptr(FrameBuffer * frame, size_t size)
+{
+  atomic_store_explicit(&frame->wp, size, memory_order_release);
 }

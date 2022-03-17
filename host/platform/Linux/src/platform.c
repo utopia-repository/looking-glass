@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -85,4 +85,13 @@ bool os_blockScreensaver()
 void os_showMessage(const char * caption, const char * msg)
 {
   DEBUG_INFO("%s: %s", caption, msg);
+}
+
+bool os_hasSetCursorPos(void)
+{
+  return false;
+}
+
+void os_setCursorPos(int x, int y)
+{
 }

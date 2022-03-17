@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,7 +22,8 @@
 
 #include <stdbool.h>
 
-#include "interface/renderer.h"
+#include "egl.h"
+#include "desktop_rects.h"
 
 typedef struct EGL_Desktop EGL_Desktop;
 
@@ -34,13 +35,18 @@ enum EGL_DesktopScaleType
 };
 
 struct Option;
-bool egl_desktop_scale_validate(struct Option * opt, const char ** error);
+bool egl_desktopScaleValidate(struct Option * opt, const char ** error);
 
-bool egl_desktop_init(EGL_Desktop ** desktop, EGLDisplay * display);
-void egl_desktop_free(EGL_Desktop ** desktop);
+bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop, EGLDisplay * display,
+    bool useDMA, int maxRects);
+void egl_desktopFree(EGL_Desktop ** desktop);
 
-bool egl_desktop_setup (EGL_Desktop * desktop, const LG_RendererFormat format, bool useDMA);
-bool egl_desktop_update(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd);
-bool egl_desktop_render(EGL_Desktop * desktop, const float x, const float y,
+void egl_desktopConfigUI(EGL_Desktop * desktop);
+bool egl_desktopSetup (EGL_Desktop * desktop, const LG_RendererFormat format);
+bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dmaFd,
+    const FrameDamageRect * damageRects, int damageRectsCount);
+void egl_desktopResize(EGL_Desktop * desktop, int width, int height);
+bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
+    unsigned int outputHeight, const float x, const float y,
     const float scaleX, const float scaleY, enum EGL_DesktopScaleType scaleType,
-    LG_RendererRotate rotate);
+    LG_RendererRotate rotate, const struct DamageRects * rects);

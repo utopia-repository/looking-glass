@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -32,6 +32,7 @@
 
 #if defined(ENABLE_EGL) || defined(ENABLE_OPENGL)
 #include "egl_dynprocs.h"
+#include "eglutil.h"
 
 bool waylandEGLInit(int w, int h)
 {
@@ -71,61 +72,59 @@ EGLDisplay waylandGetEGLDisplay(void)
 
 void waylandEGLSwapBuffers(EGLDisplay display, EGLSurface surface, const struct Rect * damage, int count)
 {
-  if (!wlWm.eglSwapWithDamageInit)
+  if (!wlWm.swapWithDamage.init)
   {
-    const char *exts = eglQueryString(display, EGL_EXTENSIONS);
-    wlWm.eglSwapWithDamageInit = true;
     if (wl_proxy_get_version((struct wl_proxy *) wlWm.surface) < 4)
+    {
       DEBUG_INFO("Swapping buffers with damage: not supported, need wl_compositor v4");
-    else if (util_hasGLExt(exts, "EGL_KHR_swap_buffers_with_damage") && g_egl_dynProcs.eglSwapBuffersWithDamageKHR)
-    {
-      wlWm.eglSwapWithDamage = g_egl_dynProcs.eglSwapBuffersWithDamageKHR;
-      DEBUG_INFO("Using EGL_KHR_swap_buffers_with_damage");
-    }
-    else if (util_hasGLExt(exts, "EGL_EXT_swap_buffers_with_damage") && g_egl_dynProcs.eglSwapBuffersWithDamageEXT)
-    {
-      wlWm.eglSwapWithDamage = g_egl_dynProcs.eglSwapBuffersWithDamageEXT;
-      DEBUG_INFO("Using EGL_EXT_swap_buffers_with_damage");
+      swapWithDamageDisable(&wlWm.swapWithDamage);
     }
     else
-      DEBUG_INFO("Swapping buffers with damage: not supported");
+      swapWithDamageInit(&wlWm.swapWithDamage, display);
   }
 
-  if (wlWm.eglSwapWithDamage && count)
-  {
-    if (count * 4 > wlWm.eglDamageRectCount)
-    {
-      free(wlWm.eglDamageRects);
-      wlWm.eglDamageRects = malloc(sizeof(EGLint) * count * 4);
-      if (!wlWm.eglDamageRects)
-        DEBUG_FATAL("Out of memory");
-      wlWm.eglDamageRectCount = count * 4;
-    }
-
-    for (int i = 0; i < count; ++i)
-    {
-      wlWm.eglDamageRects[i*4+0] = damage[i].x;
-      wlWm.eglDamageRects[i*4+1] = damage[i].y;
-      wlWm.eglDamageRects[i*4+2] = damage[i].w;
-      wlWm.eglDamageRects[i*4+3] = damage[i].h;
-    }
-
-    wlWm.eglSwapWithDamage(display, surface, wlWm.eglDamageRects, count);
-  }
-  else
-    eglSwapBuffers(display, surface);
+  waylandPresentationFrame();
+  swapWithDamage(&wlWm.swapWithDamage, display, surface, damage, count);
 
   if (wlWm.needsResize)
   {
-    wl_egl_window_resize(wlWm.eglWindow, wlWm.width * wlWm.scale, wlWm.height * wlWm.scale, 0, 0);
-    wl_surface_set_buffer_scale(wlWm.surface, wlWm.scale);
+    wl_egl_window_resize(wlWm.eglWindow, wl_fixed_to_int(wlWm.width * wlWm.scale),
+        wl_fixed_to_int(wlWm.height * wlWm.scale), 0, 0);
+
+    if (wlWm.fractionalScale)
+    {
+      wl_surface_set_buffer_scale(wlWm.surface, 1);
+      if (!wlWm.viewport)
+        wlWm.viewport = wp_viewporter_get_viewport(wlWm.viewporter, wlWm.surface);
+      wp_viewport_set_source(wlWm.viewport, 0, 0, wlWm.width * wlWm.scale, wlWm.height * wlWm.scale);
+      wp_viewport_set_destination(wlWm.viewport, wlWm.width, wlWm.height);
+    }
+    else
+    {
+      if (wlWm.viewport)
+      {
+        // Clearing the source and destination rectangles should happen in wp_viewport_destroy.
+        // However, wlroots does not clear the rectangle until fixed in 456c6e22 (2021-08-02).
+        // This should be kept to work around old versions of wlroots.
+        wl_fixed_t clear = wl_fixed_from_int(-1);
+        wp_viewport_set_source(wlWm.viewport, clear, clear, clear, clear);
+        wp_viewport_set_destination(wlWm.viewport, -1, -1);
+
+        wp_viewport_destroy(wlWm.viewport);
+        wlWm.viewport = NULL;
+      }
+      wl_surface_set_buffer_scale(wlWm.surface, wl_fixed_to_int(wlWm.scale));
+    }
 
     struct wl_region * region = wl_compositor_create_region(wlWm.compositor);
     wl_region_add(region, 0, 0, wlWm.width, wlWm.height);
     wl_surface_set_opaque_region(wlWm.surface, region);
     wl_region_destroy(region);
 
-    app_handleResizeEvent(wlWm.width, wlWm.height, wlWm.scale, (struct Border) {0, 0, 0, 0});
+    app_handleResizeEvent(wlWm.width, wlWm.height, wl_fixed_to_double(wlWm.scale),
+        (struct Border) {0, 0, 0, 0});
+    app_invalidateWindow(true);
+    waylandStopWaitFrame();
     wlWm.needsResize = false;
   }
 
