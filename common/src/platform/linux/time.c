@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -49,7 +49,7 @@ static void TimerProc(union sigval arg)
 bool lgCreateTimer(const unsigned int intervalMS, LGTimerFn fn,
     void * udata, LGTimer ** result)
 {
-  LGTimer * ret = malloc(sizeof(LGTimer));
+  LGTimer * ret = malloc(sizeof(*ret));
 
   if (!ret)
   {
@@ -77,8 +77,8 @@ bool lgCreateTimer(const unsigned int intervalMS, LGTimerFn fn,
 
   struct timespec interval =
   {
-    .tv_sec = 0,
-    .tv_nsec = intervalMS * 1000 * 1000,
+    .tv_sec  = intervalMS / 1000,
+    .tv_nsec = (intervalMS % 1000) * 1000000,
   };
   struct itimerspec spec =
   {

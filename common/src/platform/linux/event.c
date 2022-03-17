@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,7 +24,6 @@
 
 #include <stdlib.h>
 #include <pthread.h>
-#include <assert.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -33,13 +32,14 @@ struct LGEvent
 {
   pthread_mutex_t mutex;
   pthread_cond_t  cond;
-  atomic_uint     count;
+  atomic_int      waiting;
+  atomic_bool     signaled;
   bool            autoReset;
 };
 
 LGEvent * lgCreateEvent(bool autoReset, unsigned int msSpinTime)
 {
-  LGEvent * handle = (LGEvent *)calloc(sizeof(LGEvent), 1);
+  LGEvent * handle = calloc(1, sizeof(*handle));
   if (!handle)
   {
     DEBUG_ERROR("Failed to allocate memory");
@@ -77,7 +77,10 @@ LGEvent * lgCreateEvent(bool autoReset, unsigned int msSpinTime)
 
 void lgFreeEvent(LGEvent * handle)
 {
-  assert(handle);
+  DEBUG_ASSERT(handle);
+
+  if (atomic_load_explicit(&handle->waiting, memory_order_acquire) != 0)
+    DEBUG_ERROR("BUG: Freeing an event that still has threads waiting on it");
 
   pthread_cond_destroy (&handle->cond );
   pthread_mutex_destroy(&handle->mutex);
@@ -86,20 +89,20 @@ void lgFreeEvent(LGEvent * handle)
 
 bool lgWaitEventAbs(LGEvent * handle, struct timespec * ts)
 {
-  assert(handle);
+  DEBUG_ASSERT(handle);
 
   bool ret   = true;
-  int  count = 0;
   int  res;
 
-  while(ret && (count = atomic_load(&handle->count)) == 0)
+  if (pthread_mutex_lock(&handle->mutex) != 0)
   {
-    if (pthread_mutex_lock(&handle->mutex) != 0)
-    {
-      DEBUG_ERROR("Failed to lock the mutex");
-      return false;
-    }
+    DEBUG_ERROR("Failed to lock the mutex");
+    return false;
+  }
 
+  atomic_fetch_add_explicit(&handle->waiting, 1, memory_order_release);
+  while(ret && !atomic_load_explicit(&handle->signaled, memory_order_acquire))
+  {
     if (!ts)
     {
       if ((res = pthread_cond_wait(&handle->cond, &handle->mutex)) != 0)
@@ -125,16 +128,17 @@ bool lgWaitEventAbs(LGEvent * handle, struct timespec * ts)
           break;
       }
     }
+  }
 
-    if (pthread_mutex_unlock(&handle->mutex) != 0)
-    {
-      DEBUG_ERROR("Failed to unlock the mutex");
-      return false;
-    }
+  atomic_fetch_sub_explicit(&handle->waiting, 1, memory_order_release);
+  if (pthread_mutex_unlock(&handle->mutex) != 0)
+  {
+    DEBUG_ERROR("Failed to unlock the mutex");
+    return false;
   }
 
   if (ret && handle->autoReset)
-    atomic_fetch_sub(&handle->count, count);
+    atomic_store_explicit(&handle->signaled, false, memory_order_release);
 
   return ret;
 }
@@ -168,17 +172,27 @@ bool lgWaitEvent(LGEvent * handle, unsigned int timeout)
 
 bool lgSignalEvent(LGEvent * handle)
 {
-  assert(handle);
+  DEBUG_ASSERT(handle);
 
-  const bool signalled = atomic_fetch_add_explicit(&handle->count, 1,
-      memory_order_acquire) > 0;
-
-  if (signalled)
-    return true;
-
-  if (pthread_cond_broadcast(&handle->cond) != 0)
+  if (pthread_mutex_lock(&handle->mutex) != 0)
   {
-    DEBUG_ERROR("Failed to signal the condition");
+    DEBUG_ERROR("Failed to lock the mutex");
+    return false;
+  }
+
+  const bool signaled = atomic_exchange_explicit(&handle->signaled, true,
+      memory_order_release);
+
+  if (!signaled)
+    if (pthread_cond_broadcast(&handle->cond) != 0)
+    {
+      DEBUG_ERROR("Failed to signal the condition");
+      return false;
+    }
+
+  if (pthread_mutex_unlock(&handle->mutex) != 0)
+  {
+    DEBUG_ERROR("Failed to unlock the mutex");
     return false;
   }
 
@@ -187,7 +201,6 @@ bool lgSignalEvent(LGEvent * handle)
 
 bool lgResetEvent(LGEvent * handle)
 {
-  assert(handle);
-  atomic_store(&handle->count, 0);
-  return true;
+  DEBUG_ASSERT(handle);
+  return atomic_exchange_explicit(&handle->signaled, false, memory_order_release);
 }

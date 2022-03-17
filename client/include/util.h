@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -25,6 +25,12 @@
 #include <stdbool.h>
 #include "common/types.h"
 
+#define min(a,b) ({ __typeof__ (a) _a = (a); __typeof__ (b) _b = (b); _a < _b ? _a : _b; })
+#define max(a,b) ({ __typeof__ (a) _a = (a); __typeof__ (b) _b = (b); _a > _b ? _a : _b; })
+
+#define UPCAST(type, x) \
+  (type *)((uintptr_t)(x) - offsetof(type, base))
+
 // reads the specified file into a new buffer
 // the callee must free the buffer
 bool util_fileGetContents(const char * filename, char ** buffer, size_t * length);
@@ -41,5 +47,9 @@ static inline double util_clamp(double x, double min, double max)
   if (x > max) return max;
   return x;
 }
+
+bool util_initUIFonts(void);
+void util_freeUIFonts(void);
+char * util_getUIFont(const char * fontName);
 
 #endif

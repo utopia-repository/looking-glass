@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -50,6 +50,8 @@ struct Service
   FILE * logFile;
   bool   running;
   HANDLE process;
+  HANDLE exitEvent;
+  char   exitEventName[64];
 };
 
 struct Service service = { 0 };
@@ -109,7 +111,7 @@ bool adjustPriv(const char * name, DWORD attributes)
   {
     doLog("failed to open the process\n");
     winerr();
-    return -1;
+    return false;
   }
 
   if (!LookupPrivilegeValueA(NULL, name, &luid))
@@ -156,73 +158,6 @@ bool disablePriv(const char * name)
   return adjustPriv(name, 0);
 }
 
-HANDLE dupeSystemProcessToken(void)
-{
-  DWORD count = 0;
-  DWORD returned;
-  do
-  {
-    count += 512;
-    DWORD pids[count];
-    EnumProcesses(pids, count * sizeof(DWORD), &returned);
-  }
-  while(returned / sizeof(DWORD) == count);
-
-  DWORD pids[count];
-  EnumProcesses(pids, count * sizeof(DWORD), &returned);
-  returned /= sizeof(DWORD);
-
-  char systemSidBuf[SECURITY_MAX_SID_SIZE];
-  PSID systemSid = (PSID) systemSidBuf;
-  DWORD cbSystemSid = sizeof systemSidBuf;
-
-  if (!CreateWellKnownSid(WinLocalSystemSid, NULL, systemSid, &cbSystemSid))
-  {
-    doLog("failed to create local system SID");
-    return NULL;
-  }
-
-  for(DWORD i = 0; i < returned; ++i)
-  {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pids[i]);
-    if (!hProcess)
-      continue;
-
-    HANDLE hToken;
-    if (!OpenProcessToken(hProcess,
-          TOKEN_QUERY | TOKEN_READ | TOKEN_IMPERSONATE | TOKEN_QUERY_SOURCE |
-          TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_EXECUTE, &hToken))
-      goto err_proc;
-
-    DWORD tmp;
-    char userBuf[1024];
-    TOKEN_USER * user = (TOKEN_USER *)userBuf;
-    if (!GetTokenInformation(hToken, TokenUser, user, sizeof(userBuf), &tmp))
-      goto err_token;
-
-    if (EqualSid(user->User.Sid, systemSid))
-    {
-      CloseHandle(hProcess);
-
-      // duplicate the token so we can use it
-      HANDLE hDupe = NULL;
-      if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation,
-            TokenPrimary, &hDupe))
-        hDupe = NULL;
-
-      CloseHandle(hToken);
-      return hDupe;
-    }
-
-err_token:
-    CloseHandle(hToken);
-err_proc:
-    CloseHandle(hProcess);
-  }
-
-  return NULL;
-}
-
 void Launch(void)
 {
   if (service.process)
@@ -237,31 +172,28 @@ void Launch(void)
     return;
   }
 
-  if (!enablePriv(SE_DEBUG_NAME))
-  {
-    doLog("failed to enable " SE_DEBUG_NAME);
-    return;
-  }
-
-  HANDLE hToken = dupeSystemProcessToken();
-  if (!hToken)
+  HANDLE hSystemToken;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE |
+        TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_SESSIONID | TOKEN_ADJUST_DEFAULT,
+        &hSystemToken))
   {
     doLog("failed to get the system process token\n");
     return;
   }
 
-  if (!disablePriv(SE_DEBUG_NAME))
-    doLog("failed to disable " SE_DEBUG_NAME);
+  HANDLE hToken;
+  if (!DuplicateTokenEx(hSystemToken, 0, NULL, SecurityAnonymous,
+        TokenPrimary, &hToken))
+  {
+    doLog("failed to duplicate the system process token\n");
+    CloseHandle(hSystemToken);
+    return;
+  }
+  CloseHandle(hSystemToken);
 
   DWORD origSessionID, targetSessionID, returnedLen;
   GetTokenInformation(hToken, TokenSessionId, &origSessionID,
       sizeof(origSessionID), &returnedLen);
-
-  if (!enablePriv(SE_TCB_NAME))
-  {
-    doLog("failed to enable " SE_TCB_NAME);
-    goto fail_token;
-  }
 
   targetSessionID = WTSGetActiveConsoleSessionId();
   if (origSessionID != targetSessionID)
@@ -275,20 +207,11 @@ void Launch(void)
     }
   }
 
-  if (!disablePriv(SE_TCB_NAME))
-    doLog("failed to disable " SE_TCB_NAME);
-
   LPVOID pEnvironment = NULL;
   if (!CreateEnvironmentBlock(&pEnvironment, hToken, TRUE))
   {
     doLog("fail_tokened to create the envionment block\n");
     winerr();
-    goto fail_token;
-  }
-
-  if (!enablePriv(SE_ASSIGNPRIMARYTOKEN_NAME))
-  {
-    doLog("failed to enable " SE_ASSIGNPRIMARYTOKEN_NAME);
     goto fail_token;
   }
 
@@ -298,9 +221,7 @@ void Launch(void)
     goto fail_token;
   }
 
-  DWORD flags = CREATE_NEW_CONSOLE | HIGH_PRIORITY_CLASS;
-  if (!pEnvironment)
-    flags |= CREATE_UNICODE_ENVIRONMENT;
+  DWORD flags = DETACHED_PROCESS | HIGH_PRIORITY_CLASS | CREATE_UNICODE_ENVIRONMENT;
 
   PROCESS_INFORMATION pi = {0};
   STARTUPINFO si =
@@ -311,10 +232,19 @@ void Launch(void)
     .lpDesktop   = "WinSta0\\Default"
   };
 
+  char * cmdline = NULL;
+  char cmdbuf[128];
+  if (service.exitEvent)
+  {
+    snprintf(cmdbuf, sizeof(cmdbuf), "looking-glass-host.exe os:exitEvent=%s",
+      service.exitEventName);
+    cmdline = cmdbuf;
+  }
+
   if (!f_CreateProcessAsUserA(
       hToken,
       os_getExecutable(),
-      NULL,
+      cmdline,
       NULL,
       NULL,
       FALSE,
@@ -333,9 +263,6 @@ void Launch(void)
 
   if (!disablePriv(SE_INCREASE_QUOTA_NAME))
     doLog("failed to disable " SE_INCREASE_QUOTA_NAME);
-
-  if (!disablePriv(SE_ASSIGNPRIMARYTOKEN_NAME))
-    doLog("failed to disable " SE_ASSIGNPRIMARYTOKEN_NAME);
 
   CloseHandle(pi.hThread);
   service.process = pi.hProcess;
@@ -613,6 +540,19 @@ VOID WINAPI SvcCtrlHandler(DWORD dwControl)
   ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
 }
 
+static bool sleepOrStop(DWORD ms)
+{
+  switch (WaitForSingleObject(ghSvcStopEvent, ms))
+  {
+    case WAIT_OBJECT_0:
+      return true;
+
+    case WAIT_FAILED:
+      doLog("Failed to WaitForSingleObject (0x%lx)\n", GetLastError());
+  }
+  return false;
+}
+
 VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
 {
   gSvcStatusHandle = RegisterServiceCtrlHandler(SVCNAME, SvcCtrlHandler);
@@ -642,6 +582,21 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
   ivshmemFree(&shmDev);
 
   ReportSvcStatus(SERVICE_RUNNING, NO_ERROR, 0);
+
+  UUID uuid;
+  RPC_CSTR uuidStr;
+  UuidCreate(&uuid);
+
+  if (UuidToString(&uuid, &uuidStr) == RPC_S_OK)
+  {
+    strcpy(service.exitEventName, "Global\\");
+    strcat(service.exitEventName, (const char*) uuidStr);
+    RpcStringFree(&uuidStr);
+
+    service.exitEvent = CreateEvent(NULL, FALSE, FALSE, service.exitEventName);
+    if (!service.exitEvent)
+      doLog("Failed to create exit event: 0x%lx\n", GetLastError());
+  }
 
   int failCount = 0;
   while(1)
@@ -708,7 +663,9 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
 
               DWORD backoff = FAIL_RETRY_INIT_INTERVAL << (failCount - 1);
               doLog("Host application failed to start %d times, waiting %u ms...\n", failCount, backoff);
-              Sleep(backoff);
+
+              if (sleepOrStop(backoff))
+                goto stopped;
               break;
             }
 
@@ -723,8 +680,8 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
         }
 
         // avoid restarting too often
-        if (GetTickCount64() - launchTime < 1000)
-          Sleep(1000);
+        if (GetTickCount64() - launchTime < 1000 && sleepOrStop(1000))
+          goto stopped;
         break;
       }
 
@@ -736,14 +693,35 @@ VOID WINAPI SvcMain(DWORD dwArgc, LPTSTR *lpszArgv)
   stopped:
   if (service.running)
   {
-    doLog("Terminating the host application\n");
-    if (TerminateProcess(service.process, LG_HOST_EXIT_KILLED))
+    SetEvent(service.exitEvent);
+    switch (WaitForSingleObject(service.process, 1000))
     {
-      while(WaitForSingleObject(service.process, INFINITE) != WAIT_OBJECT_0) {}
-      doLog("Host application terminated\n");
+      case WAIT_OBJECT_0:
+        service.running = false;
+        doLog("Host application exited gracefully\n");
+        break;
+      case WAIT_TIMEOUT:
+        doLog("Host application failed to exit in 1 second\n");
+        break;
+      case WAIT_FAILED:
+        doLog("WaitForSingleObject failed: 0x%lx\n", GetLastError());
+        break;
     }
-    else
-      doLog("Failed to terminate the host application\n");
+
+    if (service.running)
+    {
+      doLog("Terminating the host application\n");
+      if (TerminateProcess(service.process, LG_HOST_EXIT_KILLED))
+      {
+        if (WaitForSingleObject(service.process, INFINITE) == WAIT_OBJECT_0)
+          doLog("Host application terminated\n");
+        else
+          doLog("WaitForSingleObject failed: 0x%lx\n", GetLastError());
+      }
+      else
+        doLog("Failed to terminate the host application\n");
+    }
+
     CloseHandle(service.process);
     service.process = NULL;
   }

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -44,3 +44,5 @@ const char * os_getDataPath();
 void os_showMessage(const char * caption, const char * msg);
 
 bool os_blockScreensaver();
+bool os_hasSetCursorPos(void);
+void os_setCursorPos(int x, int y);

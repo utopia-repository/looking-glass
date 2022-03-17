@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,7 +24,7 @@
 
 typedef struct EGL_Splash EGL_Splash;
 
-bool egl_splash_init(EGL_Splash ** splash);
-void egl_splash_free(EGL_Splash ** splash);
+bool egl_splashInit(EGL_Splash ** splash);
+void egl_splashFree(EGL_Splash ** splash);
 
-void egl_splash_render(EGL_Splash * splash, float alpha, float scaleY);
+void egl_splashRender(EGL_Splash * splash, float alpha, float scaleY);

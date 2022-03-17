@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -60,5 +60,23 @@ void framebuffer_prepare(FrameBuffer * frame);
  * Write data from the src buffer into the KVMFRFrame
  */
 bool framebuffer_write(FrameBuffer * frame, const void * src, size_t size);
+
+/**
+ * Gets the underlying data buffer of the framebuffer.
+ * For custom read routines only.
+ */
+const uint8_t * framebuffer_get_buffer(const FrameBuffer * frame);
+
+/**
+ * Gets the underlying data buffer of the framebuffer.
+ * For custom write routines only.
+ */
+uint8_t * framebuffer_get_data(FrameBuffer * frame);
+
+/**
+ * Sets the write pointer of the framebuffer.
+ * For custom write routines only.
+ */
+void framebuffer_set_write_ptr(FrameBuffer * frame, size_t size);
 
 #endif

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,7 +20,6 @@
 
 #include "wayland.h"
 
-#include <assert.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -299,7 +298,7 @@ static void dataDeviceHandleEnter(void * data, struct wl_data_device * device,
     uint32_t serial, struct wl_surface * surface, wl_fixed_t sxW, wl_fixed_t syW,
     struct wl_data_offer * offer)
 {
-  assert(wlCb.dndOffer == NULL);
+  DEBUG_ASSERT(wlCb.dndOffer == NULL);
   wlCb.dndOffer = offer;
 
   struct DataOffer * extra = wl_data_offer_get_user_data(offer);
@@ -447,7 +446,7 @@ void waylandCBRequest(LG_ClipboardData type)
   wl_data_offer_receive(wlCb.offer, wlCb.mimetypes[type], fds[1]);
   close(fds[1]);
 
-  struct ClipboardRead * data = malloc(sizeof(struct ClipboardRead));
+  struct ClipboardRead * data = malloc(sizeof(*data));
   if (!data)
   {
     DEBUG_ERROR("Failed to allocate memory to read clipboard");
@@ -519,7 +518,7 @@ static void dataSourceHandleSend(void * data, struct wl_data_source * source,
   struct WCBTransfer * transfer = (struct WCBTransfer *) data;
   if (containsMimetype(transfer->mimetypes, mimetype))
   {
-    struct ClipboardWrite * data = malloc(sizeof(struct ClipboardWrite));
+    struct ClipboardWrite * data = malloc(sizeof(*data));
     if (!data)
     {
       DEBUG_ERROR("Out of memory trying to allocate ClipboardWrite");
@@ -555,7 +554,7 @@ static const struct wl_data_source_listener dataSourceListener = {
 static void waylandCBReplyFn(void * opaque, LG_ClipboardData type,
    	uint8_t * data, uint32_t size)
 {
-  struct WCBTransfer * transfer = malloc(sizeof(struct WCBTransfer));
+  struct WCBTransfer * transfer = malloc(sizeof(*transfer));
   if (!transfer)
   {
     DEBUG_ERROR("Out of memory when allocating WCBTransfer");

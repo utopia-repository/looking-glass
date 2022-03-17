@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -45,7 +45,7 @@ static void TimerProc(HWND Arg1, UINT Arg2, UINT_PTR Arg3, DWORD Arg4)
 bool lgCreateTimer(const unsigned int intervalMS, LGTimerFn fn,
     void * udata, LGTimer ** result)
 {
-  LGTimer * ret = malloc(sizeof(LGTimer));
+  LGTimer * ret = malloc(sizeof(*ret));
   if (!ret)
   {
     DEBUG_ERROR("failed to malloc LGTimer struct");
@@ -65,9 +65,22 @@ void lgTimerDestroy(LGTimer * timer)
 {
   if (timer->running)
   {
-    if (!KillTimer(MessageHWND, timer->handle))
+    if (MessageHWND && !KillTimer(MessageHWND, timer->handle))
       DEBUG_ERROR("failed to destroy the timer");
   }
 
   free(timer);
+}
+
+NTSYSCALLAPI NTSTATUS NTAPI NtSetTimerResolution(
+  _In_ ULONG DesiredTime,
+  _In_ BOOLEAN SetResolution,
+  _Out_ PULONG ActualTime
+);
+
+void windowsSetTimerResolution(void)
+{
+  ULONG actualResolution;
+  NtSetTimerResolution(1, true, &actualResolution);
+  DEBUG_INFO("System timer resolution: %.1f μs", actualResolution / 10.0);
 }

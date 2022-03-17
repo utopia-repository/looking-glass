@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,6 +21,8 @@
 #ifndef _LG_TYPES_H_
 #define _LG_TYPES_H_
 
+#include <stdint.h>
+
 struct Point
 {
   int x, y;
@@ -34,6 +36,11 @@ struct DoublePoint
 struct Rect
 {
   int x, y, w, h;
+};
+
+struct DoubleRect
+{
+  double x, y, w, h;
 };
 
 struct Border
@@ -61,6 +68,15 @@ typedef enum FrameRotation
 }
 FrameRotation;
 
+typedef struct FrameDamageRect
+{
+  uint32_t x;
+  uint32_t y;
+  uint32_t width;
+  uint32_t height;
+}
+FrameDamageRect;
+
 extern const char * FrameTypeStr[FRAME_TYPE_MAX];
 
 typedef enum CursorType
@@ -70,5 +86,12 @@ typedef enum CursorType
   CURSOR_TYPE_MASKED_COLOR
 }
 CursorType;
+
+typedef struct StringPair
+{
+  const char * name;
+  const char * value;
+}
+StringPair;
 
 #endif

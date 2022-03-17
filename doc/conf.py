@@ -36,6 +36,22 @@ rst_prolog = """
 extensions = [
 ]
 
+try:
+    from sphinxcontrib import spelling
+except ImportError:
+    pass
+else:
+    del spelling
+    extensions += ['sphinxcontrib.spelling']
+
+    import sys, os
+    sys.path.append(os.path.dirname(__file__))
+    spelling_filters = [
+        'lgspell.OptionFilter', 'lgspell.PackageFilter', 'lgspell.PathFilter',
+        'lgspell.CryptoAddressFilter'
+    ]
+    spelling_word_list_filename = [os.path.join(os.path.dirname(__file__), 'words.txt')]
+
 # Add any paths that contain templates here, relative to this directory.
 # templates_path = ['_templates']
 
@@ -55,8 +71,8 @@ master_doc = 'index'
 html_theme = 'alabaster'
 
 html_theme_options = {
-	'logo': 'icon-128x128.png',
-	'fixed_sidebar': 'true',
+    'logo': 'icon-128x128.png',
+    'fixed_sidebar': 'true',
 }
 
 html_sidebars = {

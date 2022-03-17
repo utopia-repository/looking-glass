@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,8 +20,10 @@
 
 #include "wayland.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <string.h>
+#include <sys/epoll.h>
 
 #include <libdecor.h>
 #include <wayland-client.h>
@@ -49,27 +51,32 @@ static void libdecorHandleError(struct libdecor * context, enum libdecor_error e
 static void libdecorFrameConfigure(struct libdecor_frame * frame,
     struct libdecor_configuration * configuration, void * opaque)
 {
+  if (!wlWm.configured)
+  {
+    xdg_surface_ack_configure(libdecor_frame_get_xdg_surface(frame), configuration->serial);
+    wlWm.configured = true;
+    return;
+  }
+
   int width, height;
-  if (libdecor_configuration_get_content_size(configuration, frame, &width, &height)) {
+  if (libdecor_configuration_get_content_size(configuration, frame, &width, &height))
+  {
     wlWm.width = width;
     wlWm.height = height;
+
+    struct libdecor_state * state = libdecor_state_new(wlWm.width, wlWm.height);
+    libdecor_frame_commit(wlWm.libdecorFrame, state, NULL);
+    libdecor_state_free(state);
   }
 
   enum libdecor_window_state windowState;
   if (libdecor_configuration_get_window_state(configuration, &windowState))
     wlWm.fullscreen = windowState & LIBDECOR_WINDOW_STATE_FULLSCREEN;
 
-  struct libdecor_state * state = libdecor_state_new(wlWm.width, wlWm.height);
-  libdecor_frame_commit(frame, state, wlWm.configured ? NULL : configuration);
-  libdecor_state_free(state);
-
-  if (wlWm.configured)
-  {
-    wlWm.needsResize = true;
-    wlWm.resizeSerial = configuration->serial;
-  }
-  else
-    wlWm.configured = true;
+  wlWm.needsResize = true;
+  wlWm.resizeSerial = configuration->serial;
+  app_invalidateWindow(true);
+  waylandStopWaitFrame();
 }
 
 static void libdecorFrameClose(struct libdecor_frame * frame, void * opaque)
@@ -94,7 +101,12 @@ static struct libdecor_frame_interface libdecorFrameListener = {
 };
 #pragma GCC diagnostic pop
 
-bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless)
+static void libdecorCallback(uint32_t events, void * opaque)
+{
+  libdecor_dispatch(wlWm.libdecor, 0);
+}
+
+bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool borderless, bool resizable)
 {
   wlWm.libdecor = libdecor_new(wlWm.display, &libdecorListener);
   wlWm.libdecorFrame = libdecor_decorate(wlWm.libdecor, wlWm.surface, &libdecorFrameListener, NULL);
@@ -103,9 +115,19 @@ bool waylandShellInit(const char * title, bool fullscreen, bool maximize, bool b
   libdecor_frame_set_title(wlWm.libdecorFrame, title);
   libdecor_frame_map(wlWm.libdecorFrame);
 
-  while (!wlWm.configured)
-    wl_display_roundtrip(wlWm.display);
+  if (resizable)
+    libdecor_frame_set_capabilities(wlWm.libdecorFrame, LIBDECOR_ACTION_RESIZE);
+  else
+    libdecor_frame_unset_capabilities(wlWm.libdecorFrame, LIBDECOR_ACTION_RESIZE);
 
+  while (!wlWm.configured)
+    libdecor_dispatch(wlWm.libdecor, 0);
+
+  if (!waylandPollRegister(libdecor_get_fd(wlWm.libdecor), libdecorCallback, NULL, EPOLLIN))
+  {
+    DEBUG_ERROR("Failed register display to epoll: %s", strerror(errno));
+    return false;
+  }
   return true;
 }
 
@@ -124,6 +146,8 @@ void waylandSetFullscreen(bool fs)
     libdecor_frame_set_fullscreen(wlWm.libdecorFrame, NULL);
   else
     libdecor_frame_unset_fullscreen(wlWm.libdecorFrame);
+
+  libdecor_frame_set_visibility(wlWm.libdecorFrame, !fs);
 }
 
 bool waylandGetFullscreen(void)
@@ -134,4 +158,21 @@ bool waylandGetFullscreen(void)
 void waylandMinimize(void)
 {
   libdecor_frame_set_minimized(wlWm.libdecorFrame);
+}
+
+void waylandShellResize(int w, int h)
+{
+  if (!libdecor_frame_is_floating(wlWm.libdecorFrame))
+    return;
+
+  wlWm.width = w;
+  wlWm.height = h;
+
+  struct libdecor_state * state = libdecor_state_new(w, h);
+  libdecor_frame_commit(wlWm.libdecorFrame, state, NULL);
+  libdecor_state_free(state);
+
+  wlWm.needsResize = true;
+  app_invalidateWindow(true);
+  waylandStopWaitFrame();
 }

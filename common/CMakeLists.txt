@@ -22,13 +22,18 @@ endif()
 add_subdirectory(src/platform)
 
 set(COMMON_SOURCES
+  src/appstrings.c
   src/stringutils.c
   src/stringlist.c
   src/option.c
   src/framebuffer.c
   src/KVMFR.c
   src/countedbuffer.c
+  src/rects.c
   src/runningavg.c
+  src/ringbuffer.c
+  src/vector.c
+  src/cpuinfo.c
 )
 
 add_library(lg_common STATIC ${COMMON_SOURCES})

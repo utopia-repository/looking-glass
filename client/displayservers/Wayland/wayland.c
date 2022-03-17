@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -37,6 +37,13 @@ static struct Option waylandOptions[] =
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = true,
   },
+  {
+    .module       = "wayland",
+    .name         = "fractionScale",
+    .description  = "Enable fractional scale",
+    .type         = OPTION_TYPE_BOOL,
+    .value.x_bool = true,
+  },
   {0}
 };
 
@@ -66,7 +73,8 @@ static bool waylandInit(const LG_DSInitParams params)
   memset(&wlWm, 0, sizeof(wlWm));
   wl_list_init(&wlWm.surfaceOutputs);
 
-  wlWm.warpSupport = option_get_bool("wayland", "warpSupport");
+  wlWm.warpSupport        = option_get_bool("wayland", "warpSupport");
+  wlWm.useFractionalScale = option_get_bool("wayland", "fractionScale");
 
   wlWm.display = wl_display_connect(NULL);
   wlWm.width = params.w;
@@ -84,16 +92,19 @@ static bool waylandInit(const LG_DSInitParams params)
   if (!waylandIdleInit())
     return false;
 
-  if (!waylandInputInit())
-    return false;
-
-  if (!waylandWindowInit(params.title, params.fullscreen, params.maximize, params.borderless))
-    return false;
-
-  if (!waylandEGLInit(params.w, params.h))
+  if (!waylandPresentationInit())
     return false;
 
   if (!waylandCursorInit())
+    return false;
+
+  if (!waylandInputInit())
+    return false;
+
+  if (!waylandWindowInit(params.title, params.fullscreen, params.maximize, params.borderless, params.resizable))
+    return false;
+
+  if (!waylandEGLInit(params.w, params.h))
     return false;
 
 #ifdef ENABLE_OPENGL
@@ -119,6 +130,7 @@ static void waylandFree(void)
 {
   waylandIdleFree();
   waylandWindowFree();
+  waylandPresentationFree();
   waylandInputFree();
   waylandOutputFree();
   waylandRegistryFree();
@@ -161,8 +173,11 @@ struct LG_DisplayServerOps LGDS_Wayland =
   .glSetSwapInterval   = waylandGLSetSwapInterval,
   .glSwapBuffers       = waylandGLSwapBuffers,
 #endif
+  .waitFrame           = waylandWaitFrame,
+  .skipFrame           = waylandSkipFrame,
+  .stopWaitFrame       = waylandStopWaitFrame,
   .guestPointerUpdated = waylandGuestPointerUpdated,
-  .showPointer         = waylandShowPointer,
+  .setPointer          = waylandSetPointer,
   .grabPointer         = waylandGrabPointer,
   .ungrabPointer       = waylandUngrabPointer,
   .capturePointer      = waylandCapturePointer,

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -43,7 +43,7 @@ static void * threadWrapper(void * opaque)
 
 bool lgCreateThread(const char * name, LGThreadFunction function, void * opaque, LGThread ** handle)
 {
-  *handle = (LGThread*)malloc(sizeof(LGThread));
+  *handle = malloc(sizeof(**handle));
   (*handle)->name     = name;
   (*handle)->function = function;
   (*handle)->opaque   = opaque;

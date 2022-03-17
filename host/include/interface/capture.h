@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,6 +23,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "common/framebuffer.h"
+#include "common/KVMFR.h"
 
 typedef enum CaptureResult
 {
@@ -69,6 +70,8 @@ typedef struct CaptureFrame
   unsigned int    stride;
   CaptureFormat   format;
   CaptureRotation rotation;
+  uint32_t        damageRectsCount;
+  FrameDamageRect damageRects[KVMFR_MAX_DAMAGE_RECTS];
 }
 CaptureFrame;
 
@@ -105,10 +108,9 @@ typedef struct CaptureInterface
   void          (*stop         )();
   bool          (*deinit       )();
   void          (*free         )();
-  unsigned int  (*getMouseScale)();
 
   CaptureResult (*capture   )();
   CaptureResult (*waitFrame )(CaptureFrame * frame, const size_t maxFrameSize);
-  CaptureResult (*getFrame  )(FrameBuffer  * frame, const unsigned int height);
+  CaptureResult (*getFrame  )(FrameBuffer  * frame, const unsigned int height, int frameIndex);
 }
 CaptureInterface;

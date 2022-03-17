@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -26,11 +26,14 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <errno.h>
 
-#include <X11/extensions/Xfixes.h>
 #include <X11/extensions/XInput2.h>
 #include <X11/extensions/scrnsaver.h>
 #include <X11/extensions/Xinerama.h>
+#include <X11/extensions/Xpresent.h>
+#include <X11/Xcursor/Xcursor.h>
 
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -38,11 +41,13 @@
 #ifdef ENABLE_EGL
 #include <EGL/eglext.h>
 #include "egl_dynprocs.h"
+#include "eglutil.h"
 #endif
 
 #include "app.h"
 #include "common/debug.h"
 #include "common/time.h"
+#include "common/event.h"
 #include "util.h"
 
 #define _NET_WM_STATE_REMOVE 0
@@ -75,7 +80,86 @@ enum {
 // forwards
 static void x11SetFullscreen(bool fs);
 static int  x11EventThread(void * unused);
-static void x11GenericEvent(XGenericEventCookie *cookie);
+static void x11XInputEvent(XGenericEventCookie *cookie);
+static void x11XPresentEvent(XGenericEventCookie *cookie);
+static void x11GrabPointer(void);
+
+static void x11DoPresent(uint64_t msc)
+{
+  static bool startup = true;
+  if (startup)
+  {
+    XPresentPixmap(
+      x11.display,
+      x11.window,
+      x11.presentPixmap,
+      x11.presentSerial++,
+      x11.presentRegion, // valid
+      x11.presentRegion, // update
+      0,                 // x_off,
+      0,                 // y_off,
+      None,              // target_crtc
+      None,              // wait_fence
+      None,              // idle_fence
+      PresentOptionNone, // options
+      0,                 // target_msc,
+      0,                 // divisor,
+      0,                 // remainder,
+      NULL,              // notifies
+      0                  // nnotifies
+    );
+    startup = false;
+    return;
+  }
+
+  static bool first   = true;
+  static uint64_t lastMsc = 0;
+
+  uint64_t refill;
+  if (!first)
+  {
+    const uint64_t delta = (lastMsc >= msc) ?
+      lastMsc - msc :
+      ~0ULL - msc + lastMsc;
+
+    if (delta > 50)
+      return;
+
+    refill = 50 - delta;
+  }
+  else
+  {
+    refill  = 50;
+    first   = false;
+    lastMsc = msc;
+  }
+
+  if (refill < 25)
+    return;
+
+  for(int i = 0; i < refill; ++i)
+  {
+    XPresentPixmap(
+      x11.display,
+      x11.window,
+      x11.presentPixmap,
+      x11.presentSerial++,
+      x11.presentRegion, // valid
+      x11.presentRegion, // update
+      0,                 // x_off,
+      0,                 // y_off,
+      None,              // target_crtc
+      None,              // wait_fence
+      None,              // idle_fence
+      PresentOptionNone, // options
+      ++lastMsc,         // target_msc,
+      0,                 // divisor,
+      0,                 // remainder,
+      NULL,              // notifies
+      0                  // nnotifies
+    );
+  }
+}
 
 static void x11Setup(void)
 {
@@ -92,6 +176,69 @@ static bool x11EarlyInit(void)
   return true;
 }
 
+static void x11CheckEWMHSupport(void)
+{
+  if (x11atoms._NET_SUPPORTING_WM_CHECK == None ||
+      x11atoms._NET_SUPPORTED == None)
+    return;
+
+  Atom type;
+  int fmt;
+  unsigned long num, bytes;
+  unsigned char *data;
+
+  if (XGetWindowProperty(x11.display, DefaultRootWindow(x11.display),
+      x11atoms._NET_SUPPORTING_WM_CHECK, 0, ~0L, False, XA_WINDOW,
+      &type, &fmt, &num, &bytes, &data) != Success)
+    goto out;
+
+  Window * windowFromRoot = (Window *)data;
+
+  if (XGetWindowProperty(x11.display, *windowFromRoot,
+      x11atoms._NET_SUPPORTING_WM_CHECK, 0, ~0L, False, XA_WINDOW,
+      &type, &fmt, &num, &bytes, &data) != Success)
+    goto out_root;
+
+  Window * windowFromChild = (Window *)data;
+  if (*windowFromChild != *windowFromRoot)
+    goto out_child;
+
+  if (XGetWindowProperty(x11.display, DefaultRootWindow(x11.display),
+      x11atoms._NET_SUPPORTED, 0, ~0L, False, AnyPropertyType,
+      &type, &fmt, &num, &bytes, &data) != Success)
+    goto out_child;
+
+  Atom * supported = (Atom *)data;
+  unsigned long supportedCount = num;
+
+  if (XGetWindowProperty(x11.display, *windowFromRoot,
+      x11atoms._NET_WM_NAME, 0, ~0L, False, AnyPropertyType,
+      &type, &fmt, &num, &bytes, &data) != Success)
+    goto out_supported;
+
+  char * wmName = (char *)data;
+
+  for(unsigned long i = 0; i < supportedCount; ++i)
+  {
+    if (supported[i] == x11atoms._NET_WM_STATE_FOCUSED)
+      x11.ewmhHasFocusEvent = true;
+  }
+
+  DEBUG_INFO("EWMH-complient window manager detected: %s", wmName);
+  x11.ewmhSupport = true;
+
+
+  XFree(wmName);
+out_supported:
+  XFree(supported);
+out_child:
+  XFree(windowFromChild);
+out_root:
+  XFree(windowFromRoot);
+out:
+  return;
+}
+
 static bool x11Init(const LG_DSInitParams params)
 {
   XIDeviceInfo *devinfo;
@@ -102,6 +249,7 @@ static bool x11Init(const LG_DSInitParams params)
   x11.xValuator = -1;
   x11.yValuator = -1;
   x11.display = XOpenDisplay(NULL);
+  x11.jitRender = params.jitRender;
 
   XSetWindowAttributes swa =
   {
@@ -195,6 +343,9 @@ static bool x11Init(const LG_DSInitParams params)
 
   X11AtomsInit();
   XSetWMProtocols(x11.display, x11.window, &x11atoms.WM_DELETE_WINDOW, 1);
+
+  // check for Extended Window Manager Hints support
+  x11CheckEWMHSupport();
 
   if (params.borderless)
   {
@@ -381,13 +532,19 @@ static bool x11Init(const LG_DSInitParams params)
   eventmask.mask_len = sizeof(mask);
   eventmask.mask     = mask;
 
-  XISetMask(mask, XI_FocusIn   );
-  XISetMask(mask, XI_FocusOut  );
-  XISetMask(mask, XI_Enter     );
-  XISetMask(mask, XI_Leave     );
-  XISetMask(mask, XI_Motion    );
-  XISetMask(mask, XI_KeyPress  );
-  XISetMask(mask, XI_KeyRelease);
+  if (!x11.ewmhHasFocusEvent)
+  {
+    XISetMask(mask, XI_FocusIn );
+    XISetMask(mask, XI_FocusOut);
+  }
+
+  XISetMask(mask, XI_Enter        );
+  XISetMask(mask, XI_Leave        );
+  XISetMask(mask, XI_Motion       );
+  XISetMask(mask, XI_KeyPress     );
+  XISetMask(mask, XI_KeyRelease   );
+  XISetMask(mask, XI_ButtonPress  );
+  XISetMask(mask, XI_ButtonRelease);
 
   if (XISelectEvents(x11.display, x11.window, &eventmask, 1) != Success)
   {
@@ -413,7 +570,7 @@ static bool x11Init(const LG_DSInitParams params)
     static char data[] = { 0x00 };
     XColor dummy;
     Pixmap temp = XCreateBitmapFromData(x11.display, x11.window, data, 1, 1);
-    x11.blankCursor = XCreatePixmapCursor(x11.display, temp, temp,
+    x11.cursors[LG_POINTER_NONE] = XCreatePixmapCursor(x11.display, temp, temp,
         &dummy, &dummy, 0, 0);
     XFreePixmap(x11.display, temp);
   }
@@ -435,24 +592,109 @@ static bool x11Init(const LG_DSInitParams params)
     Pixmap img = XCreateBitmapFromData(x11.display, x11.window, data, 3, 3);
     Pixmap msk = XCreateBitmapFromData(x11.display, x11.window, mask, 3, 3);
 
-    x11.squareCursor = XCreatePixmapCursor(x11.display, img, msk,
+    x11.cursors[LG_POINTER_SQUARE] = XCreatePixmapCursor(x11.display, img, msk,
         &colors[0], &colors[1], 1, 1);
 
     XFreePixmap(x11.display, img);
     XFreePixmap(x11.display, msk);
   }
 
+  /* initialize the rest of the cursors */
+  const char * cursorLookup[LG_POINTER_COUNT] = {
+    NULL               , // LG_POINTER_NONE
+    NULL               , // LG_POINTER_SQUARE
+    "left_ptr"         , // LG_POINTER_ARROW
+    "text"             , // LG_POINTER_INPUT
+    "move"             , // LG_POINTER_MOVE
+    "ns-resize"        , // LG_POINTER_RESIZE_NS
+    "ew-resize"        , // LG_POINTER_RESIZE_EW
+    "nesw-resize"      , // LG_POINTER_RESIZE_NESW
+    "nwse-resize"      , // LG_POINTER_RESIZE_NWSE
+    "hand"             , // LG_POINTER_HAND
+    "not-allowed"      , // LG_POINTER_NOT_ALLOWED
+  };
+
+  const char * fallbackLookup[LG_POINTER_COUNT] = {
+    NULL               , // LG_POINTER_NONE
+    NULL               , // LG_POINTER_SQUARE
+    "left_ptr"         , // LG_POINTER_ARROW
+    "xterm"            , // LG_POINTER_INPUT
+    "fluer"            , // LG_POINTER_MOVE
+    "sb_v_double_arrow", // LG_POINTER_RESIZE_NS
+    "sb_h_double_arrow", // LG_POINTER_RESIZE_EW
+    "sizing"           , // LG_POINTER_RESIZE_NESW
+    "sizing"           , // LG_POINTER_RESIZE_NWSE
+    "hand2"            , // LG_POINTER_HAND
+    "X_cursor"         , // LG_POINTER_NOT_ALLOWED
+  };
+
+  for(int i = 0; i < LG_POINTER_COUNT; ++i)
+  {
+    if (!cursorLookup[i])
+      continue;
+    x11.cursors[i] = XcursorLibraryLoadCursor(x11.display, cursorLookup[i]);
+    if (!x11.cursors[i])
+      x11.cursors[i] = XcursorLibraryLoadCursor(x11.display, fallbackLookup[i]);
+  }
+
   /* default to the square cursor */
-  XDefineCursor(x11.display, x11.window, x11.squareCursor);
+  XDefineCursor(x11.display, x11.window, x11.cursors[LG_POINTER_SQUARE]);
+
+  if (x11.jitRender)
+  {
+    x11.frameEvent = lgCreateEvent(true, 0);
+    XPresentQueryExtension(x11.display, &x11.xpresentOp, &event, &error);
+    XPresentSelectInput(x11.display, x11.window, PresentCompleteNotifyMask);
+    x11.presentPixmap = XCreatePixmap(x11.display, x11.window, 1, 1, 24);
+    x11.presentRegion = XFixesCreateRegion(x11.display, &(XRectangle){0}, 1);
+  }
 
   XMapWindow(x11.display, x11.window);
   XFlush(x11.display);
 
+  if (!params.center)
+    XMoveWindow(x11.display, x11.window, params.x, params.y);
+
+  XSetLocaleModifiers(""); // Load XMODIFIERS
+  x11.xim = XOpenIM(x11.display, 0, 0, 0);
+
+  if (!x11.xim)
+  {
+    // disable IME
+    XSetLocaleModifiers("@im=none");
+    x11.xim = XOpenIM(x11.display, 0, 0, 0);
+  }
+
+  if (x11.xim)
+  {
+    x11.xic = XCreateIC(
+      x11.xim,
+      XNInputStyle,   XIMPreeditNothing | XIMStatusNothing,
+      XNClientWindow, x11.window,
+      XNFocusWindow,  x11.window,
+      NULL
+    );
+  }
+  else
+    DEBUG_WARN("Failed to initialize X Input Method");
+
+  if (x11.xic)
+  {
+    XSetICFocus(x11.xic);
+    XSelectInput(x11.display, x11.window, StructureNotifyMask | ExposureMask |
+        PropertyChangeMask | KeyPressMask);
+  }
+  else
+    DEBUG_WARN("Failed to initialize X Input Context, typing will not work");
+
   if (!lgCreateThread("X11EventThread", x11EventThread, NULL, &x11.eventThread))
   {
     DEBUG_ERROR("Failed to create the x11 event thread");
-    return false;
+    goto fail_window;
   }
+
+  if (x11.jitRender)
+    x11DoPresent(0);
 
   return true;
 
@@ -471,17 +713,28 @@ static void x11Startup(void)
 
 static void x11Shutdown(void)
 {
+  if (x11.jitRender)
+    lgSignalEvent(x11.frameEvent);
 }
 
 static void x11Free(void)
 {
   lgJoinThread(x11.eventThread, NULL);
 
+  if (x11.jitRender)
+  {
+    lgFreeEvent(x11.frameEvent);
+    XFreePixmap(x11.display, x11.presentPixmap);
+    XFixesDestroyRegion(x11.display, x11.presentRegion);
+  }
+
   if (x11.window)
     XDestroyWindow(x11.display, x11.window);
 
-  XFreeCursor(x11.display, x11.squareCursor);
-  XFreeCursor(x11.display, x11.blankCursor);
+  for(int i = 0; i < LG_POINTER_COUNT; ++i)
+    if (x11.cursors[i])
+      XFreeCursor(x11.display, x11.cursors[i]);
+
   XCloseDisplay(x11.display);
 }
 
@@ -547,23 +800,46 @@ static bool x11GetProp(LG_DSProperty prop, void *ret)
 
 static int x11EventThread(void * unused)
 {
-  fd_set in_fds;
+  int epollfd = epoll_create1(0);
+  if (epollfd == -1)
+  {
+    DEBUG_ERROR("epolld_create1 failure");
+    return 0;
+  }
+
+  struct epoll_event ev = { .events = EPOLLIN };
   const int fd = ConnectionNumber(x11.display);
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev) == -1)
+  {
+    close(epollfd);
+    DEBUG_ERROR("epoll_ctl failed");
+    return 0;
+  }
 
   while(app_isRunning())
   {
+    const uint64_t lastWMEvent = atomic_load(&x11.lastWMEvent);
+    if (x11.invalidateAll && microtime() - lastWMEvent > 100000UL)
+    {
+      x11.invalidateAll = false;
+      app_invalidateWindow(true);
+    }
+
     if (!XPending(x11.display))
     {
-      FD_ZERO(&in_fds);
-      FD_SET(fd, &in_fds);
-      struct timeval tv =
+      struct epoll_event events[1];
+      int nfds = epoll_wait(epollfd, events, 1, 100);
+      if (nfds == -1)
       {
-        .tv_usec = 250000,
-        .tv_sec  = 0
-      };
+        if (errno == EINTR)
+          continue;
 
-      int ret = select(fd + 1, &in_fds, NULL, NULL, &tv);
-      if (ret == 0 || !XPending(x11.display))
+        close(epollfd);
+        DEBUG_ERROR("epoll_wait failure");
+        return 0;
+      }
+
+      if (nfds == 0 || !XPending(x11.display))
         continue;
     }
 
@@ -583,6 +859,8 @@ static int x11EventThread(void * unused)
 
       case ConfigureNotify:
       {
+        atomic_store(&x11.lastWMEvent, microtime());
+
         int x, y;
 
         /* the window may have been re-parented so we need to translate to
@@ -614,16 +892,33 @@ static int x11EventThread(void * unused)
         break;
       }
 
+      case Expose:
+      {
+        atomic_store(&x11.lastWMEvent, microtime());
+        x11.invalidateAll = true;
+        break;
+      }
+
       case GenericEvent:
       {
         XGenericEventCookie *cookie = (XGenericEventCookie*)&xe.xcookie;
-        XGetEventData(x11.display, cookie);
-        x11GenericEvent(cookie);
-        XFreeEventData(x11.display, cookie);
+        if (cookie->extension == x11.xinputOp)
+        {
+          XGetEventData(x11.display, cookie);
+          x11XInputEvent(cookie);
+          XFreeEventData(x11.display, cookie);
+        }
+        else if (cookie->extension == x11.xpresentOp)
+        {
+          XGetEventData(x11.display, cookie);
+          x11XPresentEvent(cookie);
+          XFreeEventData(x11.display, cookie);
+        }
         break;
       }
 
       case PropertyNotify:
+
         // ignore property events that are not for us
         if (xe.xproperty.display != x11.display      ||
             xe.xproperty.window  != x11.window       ||
@@ -632,6 +927,8 @@ static int x11EventThread(void * unused)
 
         if (xe.xproperty.atom == x11atoms._NET_WM_STATE)
         {
+          atomic_store(&x11.lastWMEvent, microtime());
+
           Atom type;
           int fmt;
           unsigned long num, bytes;
@@ -643,11 +940,20 @@ static int x11EventThread(void * unused)
             break;
 
           bool fullscreen = false;
-          for(int i = 0; i < num; ++i)
+          bool focused    = false;
+          for(unsigned long i = 0; i < num; ++i)
           {
             Atom prop = ((Atom *)data)[i];
             if (prop == x11atoms._NET_WM_STATE_FULLSCREEN)
               fullscreen = true;
+            else if (prop == x11atoms._NET_WM_STATE_FOCUSED)
+              focused = true;
+          }
+
+          if (x11.ewmhHasFocusEvent && x11.focused != focused)
+          {
+            x11.focused = focused;
+            app_handleFocusEvent(focused);
           }
 
           x11.fullscreen = fullscreen;
@@ -657,6 +963,8 @@ static int x11EventThread(void * unused)
 
         if (xe.xproperty.atom == x11atoms._NET_FRAME_EXTENTS)
         {
+          atomic_store(&x11.lastWMEvent, microtime());
+
           Atom type;
           int fmt;
           unsigned long num, bytes;
@@ -684,20 +992,48 @@ static int x11EventThread(void * unused)
     }
   }
 
+  close(epollfd);
   return 0;
 }
 
-static void x11GenericEvent(XGenericEventCookie *cookie)
+static enum Modifiers keySymToModifier(KeySym sym)
+{
+  switch (sym)
+  {
+    case XK_Control_L: return MOD_CTRL_LEFT;
+    case XK_Control_R: return MOD_CTRL_RIGHT;
+    case XK_Shift_L:   return MOD_SHIFT_LEFT;
+    case XK_Shift_R:   return MOD_SHIFT_RIGHT;
+    case XK_Alt_L:     return MOD_ALT_LEFT;
+    case XK_Alt_R:     return MOD_ALT_RIGHT;
+    case XK_Super_L:   return MOD_SUPER_LEFT;
+    case XK_Super_R:   return MOD_SUPER_RIGHT;
+    default:           return -1;
+  }
+}
+
+static void updateModifiers(void)
+{
+  app_handleKeyboardModifiers(
+    x11.modifiers[MOD_CTRL_LEFT] || x11.modifiers[MOD_CTRL_RIGHT],
+    x11.modifiers[MOD_SHIFT_LEFT] || x11.modifiers[MOD_SHIFT_RIGHT],
+    x11.modifiers[MOD_ALT_LEFT] || x11.modifiers[MOD_ALT_RIGHT],
+    x11.modifiers[MOD_SUPER_LEFT] || x11.modifiers[MOD_SUPER_RIGHT]
+  );
+}
+
+static void x11XInputEvent(XGenericEventCookie *cookie)
 {
   static int button_state = 0;
-
-  if (cookie->extension != x11.xinputOp)
-    return;
 
   switch(cookie->evtype)
   {
     case XI_FocusIn:
     {
+      if (x11.ewmhHasFocusEvent)
+        return;
+
+      atomic_store(&x11.lastWMEvent, microtime());
       if (x11.focused)
         return;
 
@@ -715,6 +1051,10 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
     case XI_FocusOut:
     {
+      if (x11.ewmhHasFocusEvent)
+        return;
+
+      atomic_store(&x11.lastWMEvent, microtime());
       if (!x11.focused)
         return;
 
@@ -732,8 +1072,10 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
     case XI_Enter:
     {
+      atomic_store(&x11.lastWMEvent, microtime());
       XIEnterEvent *xie = cookie->data;
-      if (x11.entered || xie->event != x11.window)
+      if (x11.entered || xie->event != x11.window ||
+          xie->mode != XINotifyNormal)
         return;
 
       app_updateCursorPos(xie->event_x, xie->event_y);
@@ -744,9 +1086,12 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
     case XI_Leave:
     {
+      atomic_store(&x11.lastWMEvent, microtime());
       XILeaveEvent *xie = cookie->data;
+
       if (!x11.entered || xie->event != x11.window ||
-          button_state != 0 || app_isCaptureMode())
+          button_state != 0 || app_isCaptureMode() ||
+          xie->mode == NotifyGrab)
         return;
 
       app_updateCursorPos(xie->event_x, xie->event_y);
@@ -762,6 +1107,46 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
       XIDeviceEvent *device = cookie->data;
       app_handleKeyPress(device->detail - 8);
+
+      if (!x11.xic || !app_isOverlayMode())
+        return;
+
+      char buffer[128];
+      KeySym sym;
+      Status status;
+      int count;
+      XKeyPressedEvent ev = {
+        .display = x11.display,
+        .window  = x11.window,
+        .type    = KeyPress,
+        .keycode = device->detail,
+        .state   = device->mods.effective,
+      };
+
+      count = Xutf8LookupString(x11.xic, &ev, buffer, sizeof(buffer),
+        &sym, &status);
+
+      if (status == XBufferOverflow || count >= sizeof(buffer))
+      {
+        DEBUG_WARN("Typing too many characters at once, ignoring");
+        return;
+      }
+
+      if (status == XLookupChars || status == XLookupBoth)
+      {
+        buffer[count] = '\0';
+        app_handleKeyboardTyped(buffer);
+      }
+
+      if (status == XLookupKeySym || status == XLookupBoth)
+      {
+        int modifier = keySymToModifier(sym);
+        if (modifier >= 0)
+        {
+          x11.modifiers[modifier] = true;
+          updateModifiers();
+        }
+      }
       return;
     }
 
@@ -772,6 +1157,25 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
       XIDeviceEvent *device = cookie->data;
       app_handleKeyRelease(device->detail - 8);
+
+      if (!x11.xic || !app_isOverlayMode())
+        return;
+
+      XKeyPressedEvent ev = {
+        .display = x11.display,
+        .window  = x11.window,
+        .type    = KeyRelease,
+        .keycode = device->detail,
+        .state   = device->mods.effective,
+      };
+      KeySym sym = XLookupKeysym(&ev, 0);
+      int modifier = keySymToModifier(sym);
+
+      if (modifier >= 0)
+      {
+        x11.modifiers[modifier] = false;
+        updateModifiers();
+      }
       return;
     }
 
@@ -792,6 +1196,33 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
 
       XIRawEvent *raw = cookie->data;
       app_handleKeyRelease(raw->detail - 8);
+      return;
+    }
+
+    case XI_ButtonPress:
+    {
+      if (!x11.focused || !x11.entered)
+        return;
+
+      XIDeviceEvent *device = cookie->data;
+      if (device->detail == 4)
+        app_handleWheelMotion(-0.5);
+      else if (device->detail == 5)
+        app_handleWheelMotion(0.5);
+      else
+        app_handleButtonPress(
+            device->detail > 5 ? device->detail - 2 : device->detail);
+
+      return;
+    }
+
+    case XI_ButtonRelease:
+    {
+      if (!x11.focused || !x11.entered)
+        return;
+
+      XIDeviceEvent *device = cookie->data;
+      app_handleButtonRelease(device->detail);
       return;
     }
 
@@ -906,6 +1337,24 @@ static void x11GenericEvent(XGenericEventCookie *cookie)
   }
 }
 
+#include <math.h>
+
+static void x11XPresentEvent(XGenericEventCookie *cookie)
+{
+  switch(cookie->evtype)
+  {
+    case PresentCompleteNotify:
+    {
+      XPresentCompleteNotifyEvent * e = cookie->data;
+      x11DoPresent(e->msc);
+      atomic_store(&x11.presentMsc, e->msc);
+      atomic_store(&x11.presentUst, e->ust);
+      lgSignalEvent(x11.frameEvent);
+      break;
+    }
+  }
+}
+
 #ifdef ENABLE_EGL
 static EGLDisplay x11GetEGLDisplay(void)
 {
@@ -943,7 +1392,11 @@ static EGLNativeWindowType x11GetEGLNativeWindow(void)
 static void x11EGLSwapBuffers(EGLDisplay display, EGLSurface surface,
     const struct Rect * damage, int count)
 {
-  eglSwapBuffers(display, surface);
+  static struct SwapWithDamageData data = {0};
+  if (!data.init)
+    swapWithDamageInit(&data, display);
+
+  swapWithDamage(&data, display, surface, damage, count);
 }
 #endif
 
@@ -966,6 +1419,14 @@ static void x11GLMakeCurrent(LG_DSGLContext context)
 
 static void x11GLSetSwapInterval(int interval)
 {
+  static PFNGLXSWAPINTERVALEXTPROC glXSwapIntervalEXT = NULL;
+  if (!glXSwapIntervalEXT)
+  {
+    glXSwapIntervalEXT = (PFNGLXSWAPINTERVALEXTPROC) glXGetProcAddressARB(
+        (const GLubyte *) "glXSwapIntervalEXT");
+    if (!glXSwapIntervalEXT)
+      DEBUG_FATAL("Failed to load glXSwapIntervalEXT");
+  }
   glXSwapIntervalEXT(x11.display, x11.window, interval);
 }
 
@@ -974,6 +1435,155 @@ static void x11GLSwapBuffers(void)
   glXSwapBuffers(x11.display, x11.window);
 }
 #endif
+
+static bool x11WaitFrame(void)
+{
+  /* wait until we are woken up by the present event */
+  lgWaitEvent(x11.frameEvent, TIMEOUT_INFINITE);
+
+#define WARMUP_TIME 3000000 //2s
+#define CALIBRATION_COUNT 400
+  const uint64_t ust = atomic_load(&x11.presentUst);
+  const uint64_t msc = atomic_load(&x11.presentMsc);
+
+  static bool warmup = true;
+  if (warmup)
+  {
+    static uint64_t expire = 0;
+    if (!expire)
+    {
+      DEBUG_INFO("Warming up...");
+      expire = ust + WARMUP_TIME;
+    }
+
+    if (ust < expire)
+      return false;
+
+    warmup = false;
+    DEBUG_INFO("Warmup done, doing calibration...");
+  }
+
+  /* calibrate a delay to push our presentation time forward as far as
+   * possible without skipping frames */
+  static int      calibrate = 0;
+  static uint64_t lastts    = 0;
+  static uint64_t lastmsc   = 0;
+  static uint64_t delay     = 0;
+
+  uint64_t deltamsc = 0;
+  if (lastts)
+  {
+    uint64_t deltats = ust - lastts;
+    deltamsc = msc - lastmsc;
+
+    if (calibrate == 0)
+    {
+      if (!delay)
+        delay = deltats / 2;
+      else
+      {
+        /* increase the delay until we see a skip */
+        if (deltamsc < 2)
+          delay += 100;
+        else
+        {
+          delay -= 100;
+          ++calibrate;
+          deltamsc = 0;
+        }
+      }
+    }
+    else
+    {
+      if (calibrate < CALIBRATION_COUNT)
+      {
+        /* every skip we back off the delay */
+        if (deltamsc > 1)
+        {
+          /* prevent underflow */
+          if (delay - 100 < delay)
+          {
+            delay -= 100;
+            calibrate = 1;
+            deltamsc = 0;
+          }
+          else
+          {
+            /* if underflow, we are simply too slow, no delay */
+            delay = 0;
+            calibrate = CALIBRATION_COUNT;
+          }
+        }
+
+        /* if we have finished, print out the delay */
+        if (++calibrate == CALIBRATION_COUNT)
+        {
+          /* delays shorter then 1ms are unmaintainable */
+          if (delay < 1000)
+          {
+            delay = 0;
+            DEBUG_INFO("Calibration done, no delay required");
+          }
+          else
+            DEBUG_INFO("Calibration done, delay = %lu us", delay);
+        }
+      }
+    }
+  }
+
+  lastts  = ust;
+  lastmsc = msc;
+
+  /* adjustments if we are still seeing odd skips */
+  const uint64_t lastWMEvent = atomic_load(&x11.lastWMEvent);
+  const uint64_t eventDelta = ust > lastWMEvent ? ust - lastWMEvent : 0;
+
+  static int      skipCount = 0;
+  static uint64_t lastSkipTime = 0;
+
+  if (skipCount > 0 && ust - lastSkipTime > 1000000UL)
+    skipCount = 0;
+
+  if (delay > 0 && deltamsc > 1 && eventDelta > 1000000UL)
+  {
+    /* only adjust if the last skip was less then 1s ago */
+    const bool flag = ust - lastSkipTime < 1000000UL;
+    lastSkipTime = ust;
+
+    if (flag && ++skipCount > 10)
+    {
+      if (delay - 500 < delay)
+      {
+        delay -= 500;
+        DEBUG_INFO("Excessing skipping detected, reduced calibration delay to %lu us", delay);
+        skipCount = 0;
+      }
+      else
+      {
+        delay = 0;
+        DEBUG_WARN("Excessive skipping detected, calibration delay disabled");
+      }
+    }
+  }
+
+  if (delay)
+  {
+    struct timespec ts = { .tv_nsec = delay * 1000 };
+    while(nanosleep(&ts, &ts)) {};
+  }
+
+  /* force rendering until we have finished calibration so we can take into
+   * account how long it takes for the scene to render */
+  if (calibrate < CALIBRATION_COUNT)
+    return true;
+
+  return false;
+}
+
+static void x11StopWaitFrame(void)
+{
+  lgSignalEvent(x11.frameEvent);
+}
 
 static void x11GuestPointerUpdated(double x, double y, double localX, double localY)
 {
@@ -998,12 +1608,9 @@ static void x11GuestPointerUpdated(double x, double y, double localX, double loc
   XSync(x11.display, False);
 }
 
-static void x11ShowPointer(bool show)
+static void x11SetPointer(LG_DSPointer pointer)
 {
-  if (show)
-    XDefineCursor(x11.display, x11.window, x11.squareCursor);
-  else
-    XDefineCursor(x11.display, x11.window, x11.blankCursor);
+  XDefineCursor(x11.display, x11.window, x11.cursors[pointer]);
 }
 
 static void x11PrintGrabError(const char * type, int dev, Status ret)
@@ -1044,7 +1651,10 @@ static void x11GrabPointer(void)
   XISetMask(mask.mask, XI_Enter           );
   XISetMask(mask.mask, XI_Leave           );
 
-  Status ret = XIGrabDevice(
+  Status ret;
+  for(int retry = 0; retry < 10; ++retry)
+  {
+    ret = XIGrabDevice(
       x11.display,
       x11.pointerDev,
       x11.window,
@@ -1054,6 +1664,18 @@ static void x11GrabPointer(void)
       XIGrabModeAsync,
       XINoOwnerEvents,
       &mask);
+
+    // on some WMs (i3) for an unknown reason the first grab attempt when
+    // switching to a desktop that has LG on it fails with GrabFrozen, however
+    // adding as short delay seems to resolve the issue.
+    if (ret == GrabFrozen && retry < 9)
+    {
+      usleep(100000);
+      continue;
+    }
+
+    break;
+  }
 
   if (ret != Success)
   {
@@ -1254,8 +1876,10 @@ struct LG_DisplayServerOps LGDS_X11 =
   .glSetSwapInterval  = x11GLSetSwapInterval,
   .glSwapBuffers      = x11GLSwapBuffers,
 #endif
+  .waitFrame           = x11WaitFrame,
+  .stopWaitFrame       = x11StopWaitFrame,
   .guestPointerUpdated = x11GuestPointerUpdated,
-  .showPointer         = x11ShowPointer,
+  .setPointer          = x11SetPointer,
   .grabPointer         = x11GrabPointer,
   .ungrabPointer       = x11UngrabPointer,
   .capturePointer      = x11CapturePointer,

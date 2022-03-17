@@ -1,21 +1,31 @@
 cmake_minimum_required(VERSION 3.0)
-project(looking-glass-client C)
+project(looking-glass-client C CXX)
 
-list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/")
+get_filename_component(PROJECT_TOP "${PROJECT_SOURCE_DIR}/.." ABSOLUTE)
 
+if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
+	message(FATAL_ERROR
+		"\n"
+		"In-source builds are not supported\n"
+		"See build instructions provided in: "
+		"${PROJECT_TOP}/doc/build.rst\n"
+		"Refusing to continue"
+	)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_TOP}/cmake/" "${PROJECT_SOURCE_DIR}/cmake/")
+
+include(CheckSubmodule)
 include(GNUInstallDirs)
 include(CheckCCompilerFlag)
 include(FeatureSummary)
 
-option(OPTIMIZE_FOR_NATIVE "Build with -march=native" ON)
-if(OPTIMIZE_FOR_NATIVE)
-  CHECK_C_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-  if(COMPILER_SUPPORTS_MARCH_NATIVE)
-    add_compile_options("-march=native")
-  endif()
-else()
-  add_compile_options("-march=nehalem" "-mtune=generic")
-endif()
+set(OPTIMIZE_FOR_NATIVE_DEFAULT ON)
+include(OptimizeForNative) # option(OPTIMIZE_FOR_NATIVE)
+include(UninstallTarget)
+
+find_package(PkgConfig)
+pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
 
 option(ENABLE_OPENGL "Enable the OpenGL renderer"       ON)
 add_feature_info(ENABLE_OPENGL ENABLE_OPENGL "Legacy OpenGL renderer.")
@@ -32,9 +42,6 @@ add_feature_info(ENABLE_ASAN ENABLE_ASAN "AddressSanitizer support.")
 option(ENABLE_UBSAN "Build with UndefinedBehaviorSanitizer" OFF)
 add_feature_info(ENABLE_UBSAN ENABLE_UBSAN "UndefinedBehaviorSanitizer support.")
 
-option(ENABLE_SDL "Build with SDL support" OFF)
-add_feature_info(ENABLE_SDL ENABLE_SDL "SDL support.")
-
 option(ENABLE_X11 "Build with X11 support" ON)
 add_feature_info(ENABLE_X11 ENABLE_X11 "X11 support.")
 
@@ -44,8 +51,8 @@ add_feature_info(ENABLE_WAYLAND ENABLE_WAYLAND "Wayland support.")
 option(ENABLE_LIBDECOR "Build with libdecor support" OFF)
 add_feature_info(ENABLE_LIBDECOR ENABLE_LIBDECOR "libdecor support.")
 
-if (NOT ENABLE_SDL AND NOT ENABLE_X11 AND NOT ENABLE_WAYLAND)
-  message(FATAL_ERROR "One of ENABLE_SDL, ENABLE_X11, or ENABLE_WAYLAND must be on")
+if (NOT ENABLE_X11 AND NOT ENABLE_WAYLAND)
+  message(FATAL_ERROR "Either ENABLE_X11 or ENABLE_WAYLAND must be on")
 endif()
 
 add_compile_options(
@@ -83,11 +90,8 @@ if(ENABLE_UBSAN)
   set(EXE_FLAGS "${EXE_FLAGS} -fsanitize=undefined")
 endif()
 
-find_package(GMP)
-
 add_definitions(-D ATOMIC_LOCKING)
 add_definitions(-D GL_GLEXT_PROTOTYPES)
-get_filename_component(PROJECT_TOP "${PROJECT_SOURCE_DIR}/.." ABSOLUTE)
 
 add_custom_command(
 	OUTPUT	${CMAKE_BINARY_DIR}/version.c
@@ -99,11 +103,9 @@ add_custom_command(
 include_directories(
 	${PROJECT_SOURCE_DIR}/include
 	${CMAKE_BINARY_DIR}/include
-	${GMP_INCLUDE_DIR}
 )
 
 link_libraries(
-	${GMP_LIBRARIES}
 	${CMAKE_DL_LIBS}
 	rt
 	m
@@ -116,31 +118,46 @@ set(SOURCES
 	src/app.c
 	src/config.c
 	src/keybind.c
-	src/lg-renderer.c
 	src/ll.c
 	src/util.c
 	src/clipboard.c
 	src/kb.c
+	src/gl_dynprocs.c
 	src/egl_dynprocs.c
+	src/eglutil.c
+	src/overlay_utils.c
+
+	src/overlay/alert.c
+	src/overlay/fps.c
+	src/overlay/graphs.c
+	src/overlay/help.c
+	src/overlay/config.c
 )
+
+# Force cimgui to build as a static library.
+set(IMGUI_STATIC "yes" CACHE STRING "Build as a static library")
 
 add_subdirectory("${PROJECT_TOP}/common"          "${CMAKE_BINARY_DIR}/common"   )
 add_subdirectory("${PROJECT_TOP}/repos/LGMP/lgmp" "${CMAKE_BINARY_DIR}/LGMP"     )
 add_subdirectory("${PROJECT_TOP}/repos/PureSpice" "${CMAKE_BINARY_DIR}/PureSpice")
+add_subdirectory("${PROJECT_TOP}/repos/cimgui"    "${CMAKE_BINARY_DIR}/cimgui" EXCLUDE_FROM_ALL)
 
 add_subdirectory(displayservers)
 add_subdirectory(renderers)
-add_subdirectory(fonts)
 
 add_executable(looking-glass-client ${SOURCES})
+
+target_compile_definitions(looking-glass-client PRIVATE CIMGUI_DEFINE_ENUMS_AND_STRUCTS=1)
+
 target_link_libraries(looking-glass-client
 	${EXE_FLAGS}
+	PkgConfig::FONTCONFIG
 	lg_common
 	displayservers
 	lgmp
 	purespice
 	renderers
-	fonts
+	cimgui
 )
 
 install(TARGETS looking-glass-client

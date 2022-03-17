@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,9 +22,10 @@
 #include <stdlib.h>
 #include <math.h>
 
-void egl_draw_torus(EGL_Model * model, unsigned int pts, float x, float y, float inner, float outer)
+void egl_drawTorus(EGL_Model * model, unsigned int pts, float x, float y,
+    float inner, float outer)
 {
-  GLfloat * v   = (GLfloat *)malloc(sizeof(GLfloat) * (pts + 1) * 6);
+  GLfloat * v   = malloc(sizeof(*v) * (pts + 1) * 6);
   GLfloat * dst = v;
 
   for(unsigned int i = 0; i <= pts; ++i)
@@ -40,13 +41,14 @@ void egl_draw_torus(EGL_Model * model, unsigned int pts, float x, float y, float
     *dst = 0.0f; ++dst;
   }
 
-  egl_model_add_verticies(model, v, NULL, (pts + 1) * 2);
+  egl_modelAddVerts(model, v, NULL, (pts + 1) * 2);
   free(v);
 }
 
-void egl_draw_torus_arc(EGL_Model * model, unsigned int pts, float x, float y, float inner, float outer, float s, float e)
+void egl_drawTorusArc(EGL_Model * model, unsigned int pts, float x, float y,
+    float inner, float outer, float s, float e)
 {
-  GLfloat * v   = (GLfloat *)malloc(sizeof(GLfloat) * (pts + 1) * 6);
+  GLfloat * v   = malloc(sizeof(*v) * (pts + 1) * 6);
   GLfloat * dst = v;
 
   for(unsigned int i = 0; i <= pts; ++i)
@@ -62,6 +64,6 @@ void egl_draw_torus_arc(EGL_Model * model, unsigned int pts, float x, float y, f
     *dst = 0.0f; ++dst;
   }
 
-  egl_model_add_verticies(model, v, NULL, (pts + 1) * 2);
+  egl_modelAddVerts(model, v, NULL, (pts + 1) * 2);
   free(v);
 }

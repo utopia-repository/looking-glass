@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -33,11 +33,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <assert.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <linux/input.h>
 
+#include "common/array.h"
 #include "common/debug.h"
 #include "common/crash.h"
 #include "common/KVMFR.h"
@@ -48,25 +48,29 @@
 #include "common/ivshmem.h"
 #include "common/time.h"
 #include "common/version.h"
+#include "common/paths.h"
+#include "common/cpuinfo.h"
 
 #include "core.h"
 #include "app.h"
 #include "keybind.h"
 #include "clipboard.h"
+#include "kb.h"
 #include "ll.h"
 #include "egl_dynprocs.h"
+#include "gl_dynprocs.h"
+#include "overlays.h"
+#include "overlay_utils.h"
+#include "util.h"
 
 // forwards
-static int cursorThread(void * unused);
 static int renderThread(void * unused);
 
 static LGEvent  *e_startup = NULL;
-static LGEvent  *e_frame   = NULL;
 static LGThread *t_spice   = NULL;
 static LGThread *t_render  = NULL;
-static LGThread *t_cursor  = NULL;
 
-struct AppState g_state;
+struct AppState g_state = { 0 };
 struct CursorState g_cursor;
 
 // this structure is initialized in config.c
@@ -89,16 +93,63 @@ static void lgInit(void)
   g_cursor.guest.valid   = false;
 
   // if spice is not in use, hide the local cursor
-  if (!core_inputEnabled() && g_params.hideMouse)
-    g_state.ds->showPointer(false);
+  if ((!g_params.useSpiceInput && g_params.hideMouse) || !g_params.showCursorDot)
+    g_state.ds->setPointer(LG_POINTER_NONE);
   else
-    g_state.ds->showPointer(true);
+    g_state.ds->setPointer(LG_POINTER_SQUARE);
+}
+
+static bool fpsTimerFn(void * unused)
+{
+  static uint64_t last;
+  if (!last)
+  {
+    last = nanotime();
+    return true;
+  }
+
+  const uint64_t renderCount = atomic_exchange_explicit(&g_state.renderCount, 0,
+      memory_order_acquire);
+
+  float fps, ups;
+  if (renderCount > 0)
+  {
+    const uint64_t frameCount = atomic_exchange_explicit(&g_state.frameCount, 0,
+        memory_order_acquire);
+
+    const uint64_t time      = nanotime();
+    const uint64_t elapsedNs = time - last;
+    const float    elapsedMs = (float)elapsedNs / 1e6f;
+
+    last = time;
+    fps  = 1e3f / (elapsedMs / (float)renderCount);
+    ups  = 1e3f / (elapsedMs / (float)frameCount);
+  }
+  else
+  {
+    last = nanotime();
+    fps  = 0.0f;
+    ups  = 0.0f;
+  }
+
+  atomic_store_explicit(&g_state.fps, fps, memory_order_relaxed);
+  atomic_store_explicit(&g_state.ups, ups, memory_order_relaxed);
+
+  return true;
+}
+
+static void preSwapCallback(void * udata)
+{
+  const uint64_t * renderStart = (const uint64_t *)udata;
+  ringbuffer_push(g_state.renderDuration,
+      &(float) {(nanotime() - *renderStart) * 1e-6f});
 }
 
 static int renderThread(void * unused)
 {
-  if (!g_state.lgr->render_startup(g_state.lgrData))
+  if (!RENDERER(renderStartup, g_state.useDMA))
   {
+    DEBUG_ERROR("EGL render failed to start");
     g_state.state = APP_STATE_SHUTDOWN;
 
     /* unblock threads waiting on the condition */
@@ -106,9 +157,18 @@ static int renderThread(void * unused)
     return 1;
   }
 
-  LG_LOCK_INIT(g_state.lgrLock);
+  if (g_state.lgr->ops.supports && !RENDERER(supports, LG_SUPPORTS_DMABUF))
+    g_state.useDMA = false;
 
-  g_state.lgr->on_show_fps(g_state.lgrData, g_state.showFPS);
+  /* start up the fps timer */
+  LGTimer * fpsTimer;
+  if (!lgCreateTimer(500, fpsTimerFn, NULL, &fpsTimer))
+  {
+    DEBUG_ERROR("Failed to create the fps timer");
+    return 1;
+  }
+
+  LG_LOCK_INIT(g_state.lgrLock);
 
   /* signal to other threads that the renderer is ready */
   lgSignalEvent(e_startup);
@@ -118,53 +178,99 @@ static int renderThread(void * unused)
 
   while(g_state.state != APP_STATE_SHUTDOWN)
   {
-    if (g_params.fpsMin != 0)
+    bool forceRender = false;
+    if (g_state.jitRender)
+      forceRender = g_state.ds->waitFrame();
+
+    app_handleRenderEvent(microtime());
+    if (g_state.jitRender)
     {
-      lgWaitEventAbs(e_frame, &time);
-      clock_gettime(CLOCK_MONOTONIC, &time);
-      tsAdd(&time, g_state.frameTime);
+      const uint64_t pending =
+        atomic_load_explicit(&g_state.pendingCount, memory_order_acquire);
+      if (!lgResetEvent(g_state.frameEvent)
+          && !forceRender
+          && !pending
+          && !app_overlayNeedsRender()
+          && !RENDERER(needsRender))
+      {
+        if (g_state.ds->skipFrame)
+          g_state.ds->skipFrame();
+        continue;
+      }
+
+      if (pending > 0)
+        atomic_fetch_sub(&g_state.pendingCount, 1);
+    }
+    else if (g_params.fpsMin != 0)
+    {
+      float ups = atomic_load_explicit(&g_state.ups, memory_order_relaxed);
+
+      if (!lgWaitEventAbs(g_state.frameEvent, &time) || ups > g_params.fpsMin)
+      {
+        /* only update the time if we woke up early */
+        clock_gettime(CLOCK_MONOTONIC, &time);
+        tsAdd(&time, g_state.overlayInput ?
+            g_state.overlayFrameTime : g_state.frameTime);
+      }
     }
 
     int resize = atomic_load(&g_state.lgrResize);
     if (resize)
     {
+      g_state.io->DisplaySize = (ImVec2) {
+        .x = g_state.windowW,
+        .y = g_state.windowH,
+      };
+      g_state.io->DisplayFramebufferScale = (ImVec2) {
+        .x = g_state.windowScale,
+        .y = g_state.windowScale,
+      };
+      g_state.io->FontGlobalScale = 1.0f / g_state.windowScale;
+
+      ImFontAtlas_Clear(g_state.io->Fonts);
+      ImFontAtlas_AddFontFromFileTTF(g_state.io->Fonts, g_state.fontName,
+        g_params.uiSize * g_state.windowScale, NULL, NULL);
+      g_state.fontLarge = ImFontAtlas_AddFontFromFileTTF(g_state.io->Fonts,
+        g_state.fontName, 1.3f * g_params.uiSize * g_state.windowScale, NULL, NULL);
+      if (!ImFontAtlas_Build(g_state.io->Fonts))
+        DEBUG_FATAL("Failed to build font atlas: %s (%s)", g_params.uiFont, g_state.fontName);
+
       if (g_state.lgr)
-        g_state.lgr->on_resize(g_state.lgrData, g_state.windowW, g_state.windowH,
+        RENDERER(onResize, g_state.windowW, g_state.windowH,
             g_state.windowScale, g_state.dstRect, g_params.winRotate);
       atomic_compare_exchange_weak(&g_state.lgrResize, &resize, 0);
     }
 
+    static uint64_t lastFrameCount = 0;
+    const uint64_t frameCount =
+      atomic_load_explicit(&g_state.frameCount, memory_order_relaxed);
+    const bool newFrame = frameCount != lastFrameCount;
+    lastFrameCount = frameCount;
+
+    const bool invalidate = atomic_exchange(&g_state.invalidateWindow, false);
+
+    const uint64_t renderStart = nanotime();
     LG_LOCK(g_state.lgrLock);
-    if (!g_state.lgr->render(g_state.lgrData, g_params.winRotate))
+    if (!RENDERER(render, g_params.winRotate, newFrame, invalidate,
+          preSwapCallback, (void *)&renderStart))
     {
       LG_UNLOCK(g_state.lgrLock);
       break;
     }
     LG_UNLOCK(g_state.lgrLock);
 
-    if (g_state.showFPS)
+    const uint64_t t     = nanotime();
+    const uint64_t delta = t - g_state.lastRenderTime;
+
+    g_state.lastRenderTime = t;
+    atomic_fetch_add_explicit(&g_state.renderCount, 1, memory_order_relaxed);
+
+    if (g_state.lastRenderTimeValid)
     {
-      const uint64_t t    = nanotime();
-      g_state.renderTime   += t - g_state.lastFrameTime;
-      g_state.lastFrameTime = t;
-      ++g_state.renderCount;
-
-      if (g_state.renderTime > 1e9)
-      {
-        const float avgUPS = 1000.0f / (((float)g_state.renderTime /
-          atomic_exchange_explicit(&g_state.frameCount, 0, memory_order_acquire)) /
-          1e6f);
-
-        const float avgFPS = 1000.0f / (((float)g_state.renderTime /
-          g_state.renderCount) /
-          1e6f);
-
-        g_state.lgr->update_fps(g_state.lgrData, avgUPS, avgFPS);
-
-        g_state.renderTime  = 0;
-        g_state.renderCount = 0;
-      }
+      const float fdelta = (float)delta / 1e6f;
+      ringbuffer_push(g_state.renderTimings, &fdelta);
     }
+    g_state.lastRenderTimeValid = true;
 
     const uint64_t now = microtime();
     if (!g_state.resizeDone && g_state.resizeTimeout < now)
@@ -178,36 +284,36 @@ static int renderThread(void * unused)
       }
       g_state.resizeDone = true;
     }
-
-    app_handleRenderEvent(now);
   }
 
   g_state.state = APP_STATE_SHUTDOWN;
 
-  if (t_cursor)
-    lgJoinThread(t_cursor, NULL);
+  lgTimerDestroy(fpsTimer);
 
+  core_stopCursorThread();
   core_stopFrameThread();
 
-  g_state.lgr->deinitialize(g_state.lgrData);
+  RENDERER(deinitialize);
   g_state.lgr = NULL;
   LG_LOCK_FREE(g_state.lgrLock);
 
   return 0;
 }
 
-static int cursorThread(void * unused)
+int main_cursorThread(void * unused)
 {
   LGMP_STATUS         status;
-  PLGMPClientQueue    queue;
-  LG_RendererCursor   cursorType     = LG_CURSOR_COLOR;
+  LG_RendererCursor   cursorType = LG_CURSOR_COLOR;
+  KVMFRCursor *       cursor     = NULL;
+  int                 cursorSize = 0;
 
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
 
   // subscribe to the pointer queue
   while(g_state.state == APP_STATE_RUNNING)
   {
-    status = lgmpClientSubscribe(g_state.lgmp, LGMP_Q_POINTER, &queue);
+    status = lgmpClientSubscribe(g_state.lgmp, LGMP_Q_POINTER,
+        &g_state.pointerQueue);
     if (status == LGMP_OK)
       break;
 
@@ -222,28 +328,27 @@ static int cursorThread(void * unused)
     break;
   }
 
-  while(g_state.state == APP_STATE_RUNNING)
+  while(g_state.state == APP_STATE_RUNNING && !g_state.stopVideo)
   {
     LGMPMessage msg;
-    if ((status = lgmpClientProcess(queue, &msg)) != LGMP_OK)
+    if ((status = lgmpClientProcess(g_state.pointerQueue, &msg)) != LGMP_OK)
     {
       if (status == LGMP_ERR_QUEUE_EMPTY)
       {
         if (g_cursor.redraw && g_cursor.guest.valid)
         {
           g_cursor.redraw = false;
-          g_state.lgr->on_mouse_event
-          (
-            g_state.lgrData,
+          RENDERER(onMouseEvent,
             g_cursor.guest.visible && (g_cursor.draw || !g_params.useSpiceInput),
             g_cursor.guest.x,
             g_cursor.guest.y
           );
 
-          lgSignalEvent(e_frame);
+          if (!g_state.stopVideo)
+            lgSignalEvent(g_state.frameEvent);
         }
 
-        const struct timespec req =
+        struct timespec req =
         {
           .tv_sec  = 0,
           .tv_nsec = g_params.cursorPollInterval * 1000L
@@ -251,11 +356,14 @@ static int cursorThread(void * unused)
 
         struct timespec rem;
         while(nanosleep(&req, &rem) < 0)
+        {
           if (errno != -EINTR)
           {
             DEBUG_ERROR("nanosleep failed");
             break;
           }
+          req = rem;
+        }
 
         continue;
       }
@@ -270,7 +378,27 @@ static int cursorThread(void * unused)
       break;
     }
 
-    KVMFRCursor * cursor = (KVMFRCursor *)msg.mem;
+    if (cursor && msg.size > cursorSize)
+    {
+      free(cursor);
+      cursor = NULL;
+    }
+
+    /* copy and release the message ASAP */
+    if (!cursor)
+    {
+      cursor = malloc(msg.size);
+      if (!cursor)
+      {
+        DEBUG_ERROR("failed to allocate %d bytes for cursor", msg.size);
+        g_state.state = APP_STATE_SHUTDOWN;
+        break;
+      }
+      cursorSize = msg.size;
+    }
+
+    memcpy(cursor, msg.mem, msg.size);
+    lgmpClientMessageDone(g_state.pointerQueue);
 
     g_cursor.guest.visible =
       msg.udata & CURSOR_FLAG_VISIBLE;
@@ -284,7 +412,7 @@ static int cursorThread(void * unused)
         case CURSOR_TYPE_MASKED_COLOR: cursorType = LG_CURSOR_MASKED_COLOR; break;
         default:
           DEBUG_ERROR("Invalid cursor type");
-          lgmpClientMessageDone(queue);
+          lgmpClientMessageDone(g_state.pointerQueue);
           continue;
       }
 
@@ -292,8 +420,7 @@ static int cursorThread(void * unused)
       g_cursor.guest.hy = cursor->hy;
 
       const uint8_t * data = (const uint8_t *)(cursor + 1);
-      if (!g_state.lgr->on_mouse_shape(
-        g_state.lgrData,
+      if (!RENDERER(onMouseShape,
         cursorType,
         cursor->width,
         cursor->height,
@@ -302,7 +429,6 @@ static int cursorThread(void * unused)
       )
       {
         DEBUG_ERROR("Failed to update mouse shape");
-        lgmpClientMessageDone(queue);
         continue;
       }
     }
@@ -325,22 +451,27 @@ static int cursorThread(void * unused)
       core_handleGuestMouseUpdate();
     }
 
-    lgmpClientMessageDone(queue);
     g_cursor.redraw = false;
 
-    g_state.lgr->on_mouse_event
-    (
-      g_state.lgrData,
+    RENDERER(onMouseEvent,
       g_cursor.guest.visible && (g_cursor.draw || !g_params.useSpiceInput),
       g_cursor.guest.x,
       g_cursor.guest.y
     );
 
-    if (g_params.mouseRedraw && g_cursor.guest.visible)
-      lgSignalEvent(e_frame);
+    if (g_params.mouseRedraw && g_cursor.guest.visible && !g_state.stopVideo)
+      lgSignalEvent(g_state.frameEvent);
   }
 
-  lgmpClientUnsubscribe(&queue);
+  lgmpClientUnsubscribe(&g_state.pointerQueue);
+
+
+  if (cursor)
+  {
+    free(cursor);
+    cursor = NULL;
+  }
+
   return 0;
 }
 
@@ -356,18 +487,13 @@ int main_frameThread(void * unused)
   LGMP_STATUS      status;
   PLGMPClientQueue queue;
 
-  uint32_t          formatVer = 0;
-  size_t            dataSize  = 0;
+  uint32_t          frameSerial = 0;
+  uint32_t          formatVer   = 0;
+  size_t            dataSize    = 0;
   LG_RendererFormat lgrFormat;
 
   struct DMAFrameInfo dmaInfo[LGMP_Q_FRAME_LEN] = {0};
-  const bool useDMA =
-    g_params.allowDMA &&
-    ivshmemHasDMA(&g_state.shm) &&
-    g_state.lgr->supports &&
-    g_state.lgr->supports(g_state.lgrData, LG_SUPPORTS_DMABUF);
-
-  if (useDMA)
+  if (g_state.useDMA)
     DEBUG_INFO("Using DMA buffer support");
 
   lgWaitEvent(e_startup, TIMEOUT_INFINITE);
@@ -399,7 +525,7 @@ int main_frameThread(void * unused)
     {
       if (status == LGMP_ERR_QUEUE_EMPTY)
       {
-        const struct timespec req =
+        struct timespec req =
         {
           .tv_sec  = 0,
           .tv_nsec = g_params.framePollInterval * 1000L
@@ -407,11 +533,14 @@ int main_frameThread(void * unused)
 
         struct timespec rem;
         while(nanosleep(&req, &rem) < 0)
+        {
           if (errno != -EINTR)
           {
             DEBUG_ERROR("nanosleep failed");
             break;
           }
+          req = rem;
+        }
 
         continue;
       }
@@ -427,6 +556,16 @@ int main_frameThread(void * unused)
     }
 
     KVMFRFrame * frame = (KVMFRFrame *)msg.mem;
+
+    // ignore any repeated frames, this happens when a new client connects to
+    // the same host application.
+    if (frame->frameSerial == frameSerial && g_state.formatValid)
+    {
+      lgmpClientMessageDone(queue);
+      continue;
+    }
+    frameSerial = frame->frameSerial;
+
     struct DMAFrameInfo *dma = NULL;
 
     if (!g_state.formatValid || frame->formatVer != formatVer)
@@ -502,7 +641,7 @@ int main_frameThread(void * unused)
           frame->rotation);
 
       LG_LOCK(g_state.lgrLock);
-      if (!g_state.lgr->on_frame_format(g_state.lgrData, lgrFormat, useDMA))
+      if (!RENDERER(onFrameFormat, lgrFormat))
       {
         DEBUG_ERROR("renderer failed to configure format");
         g_state.state = APP_STATE_SHUTDOWN;
@@ -517,14 +656,13 @@ int main_frameThread(void * unused)
       if (g_params.autoResize)
         g_state.ds->setWindowSize(lgrFormat.width, lgrFormat.height);
 
-      g_cursor.guest.dpiScale = frame->mouseScalePercent;
       core_updatePositionInfo();
     }
 
-    if (useDMA)
+    if (g_state.useDMA)
     {
       /* find the existing dma buffer if it exists */
-      for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+      for(int i = 0; i < ARRAY_LENGTH(dmaInfo); ++i)
       {
         if (dmaInfo[i].frame == frame)
         {
@@ -541,7 +679,7 @@ int main_frameThread(void * unused)
 
       /* otherwise find a free buffer for use */
       if (!dma)
-        for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+        for(int i = 0; i < ARRAY_LENGTH(dmaInfo); ++i)
         {
           if (!dmaInfo[i].frame)
           {
@@ -570,7 +708,8 @@ int main_frameThread(void * unused)
     }
 
     FrameBuffer * fb = (FrameBuffer *)(((uint8_t*)frame) + frame->offset);
-    if (!g_state.lgr->on_frame(g_state.lgrData, fb, useDMA ? dma->fd : -1))
+    if (!RENDERER(onFrame, fb, g_state.useDMA ? dma->fd : -1,
+          frame->damageRects, frame->damageRectsCount))
     {
       lgmpClientMessageDone(queue);
       DEBUG_ERROR("renderer on frame returned failure");
@@ -587,17 +726,33 @@ int main_frameThread(void * unused)
       g_state.autoIdleInhibitState = frame->blockScreensaver;
     }
 
+    const uint64_t t      = nanotime();
+    const uint64_t delta  = t - g_state.lastFrameTime;
+    g_state.lastFrameTime = t;
+
+    if (g_state.lastFrameTimeValid)
+      ringbuffer_push(g_state.uploadTimings, &(float) { delta * 1e-6f });
+    g_state.lastFrameTimeValid = true;
+
     atomic_fetch_add_explicit(&g_state.frameCount, 1, memory_order_relaxed);
-    lgSignalEvent(e_frame);
+    if (g_state.jitRender)
+    {
+      if (atomic_load_explicit(&g_state.pendingCount, memory_order_acquire) < 10)
+        atomic_fetch_add_explicit(&g_state.pendingCount, 1,
+            memory_order_release);
+    }
+    else
+      lgSignalEvent(g_state.frameEvent);
+
     lgmpClientMessageDone(queue);
   }
 
   lgmpClientUnsubscribe(&queue);
-  g_state.lgr->on_restart(g_state.lgrData);
+  RENDERER(onRestart);
 
-  if (useDMA)
+  if (g_state.useDMA)
   {
-    for(int i = 0; i < sizeof(dmaInfo) / sizeof(struct DMAFrameInfo); ++i)
+    for(int i = 0; i < ARRAY_LENGTH(dmaInfo); ++i)
       if (dmaInfo[i].fd >= 0)
         close(dmaInfo[i].fd);
   }
@@ -609,7 +764,7 @@ int main_frameThread(void * unused)
 int spiceThread(void * arg)
 {
   while(g_state.state != APP_STATE_SHUTDOWN)
-    if (!spice_process(1000))
+    if (!spice_process(100))
     {
       if (g_state.state != APP_STATE_SHUTDOWN)
       {
@@ -647,7 +802,7 @@ void intHandler(int sig)
 static bool tryRenderer(const int index, const LG_RendererParams lgrParams,
     bool * needsOpenGL)
 {
-  const LG_Renderer *r = LG_Renderers[index];
+  const LG_RendererOps *r = LG_Renderers[index];
 
   if (!IS_LG_RENDERER_VALID(r))
   {
@@ -656,31 +811,72 @@ static bool tryRenderer(const int index, const LG_RendererParams lgrParams,
   }
 
   // create the renderer
-  g_state.lgrData = NULL;
-  *needsOpenGL    = false;
-  if (!r->create(&g_state.lgrData, lgrParams, needsOpenGL))
-    return false;
-
-  // initialize the renderer
-  if (!r->initialize(g_state.lgrData))
+  g_state.lgr  = NULL;
+  *needsOpenGL = false;
+  if (!r->create(&g_state.lgr, lgrParams, needsOpenGL))
   {
-    r->deinitialize(g_state.lgrData);
+    g_state.lgr = NULL;
     return false;
   }
 
-  DEBUG_INFO("Using Renderer: %s", r->get_name());
+  // init the ops member
+  memcpy(&g_state.lgr->ops, r, sizeof(*r));
+
+  // initialize the renderer
+  if (!r->initialize(g_state.lgr))
+  {
+    r->deinitialize(g_state.lgr);
+    g_state.lgr = NULL;
+    return false;
+  }
+
+  DEBUG_INFO("Using Renderer: %s", r->getName());
   return true;
+}
+
+static void reportBadVersion()
+{
+  DEBUG_BREAK();
+  DEBUG_ERROR("The host application is not compatible with this client");
+  DEBUG_ERROR("This is not a Looking Glass error, do not report this");
+  DEBUG_ERROR("Please install the matching host application for this client");
 }
 
 static int lg_run(void)
 {
-  memset(&g_state, 0, sizeof(g_state));
-
   g_cursor.sens = g_params.mouseSens;
        if (g_cursor.sens < -9) g_cursor.sens = -9;
   else if (g_cursor.sens >  9) g_cursor.sens =  9;
 
-  g_state.showFPS = g_params.showFPS;
+  /* setup imgui */
+  igCreateContext(NULL);
+  g_state.io    = igGetIO();
+  g_state.style = igGetStyle();
+
+  g_state.style->Colors[ImGuiCol_ModalWindowDimBg] = (ImVec4) { 0.0f, 0.0f, 0.0f, 0.4f };
+
+  alloc_sprintf(&g_state.imGuiIni, "%s/imgui.ini", lgConfigDir());
+  g_state.io->IniFilename   = g_state.imGuiIni;
+  g_state.io->BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+
+  g_state.windowScale = 1.0;
+  if (util_initUIFonts())
+  {
+    g_state.fontName = util_getUIFont(g_params.uiFont);
+    DEBUG_INFO("Using font: %s", g_state.fontName);
+  }
+
+  app_initOverlays();
+
+  // initialize metrics ringbuffers
+  g_state.renderTimings  = ringbuffer_new(256, sizeof(float));
+  g_state.uploadTimings  = ringbuffer_new(256, sizeof(float));
+  g_state.renderDuration = ringbuffer_new(256, sizeof(float));
+  overlayGraph_register("FRAME" , g_state.renderTimings , 0.0f, 50.0f);
+  overlayGraph_register("UPLOAD", g_state.uploadTimings , 0.0f, 50.0f);
+  overlayGraph_register("RENDER", g_state.renderDuration, 0.0f, 10.0f);
+
+  initImGuiKeyMap(g_state.io->KeyMap);
 
   // search for the best displayserver ops to use
   for(int i = 0; i < LG_DISPLAYSERVER_COUNT; ++i)
@@ -690,8 +886,16 @@ static int lg_run(void)
       break;
     }
 
-  assert(g_state.ds);
+  DEBUG_ASSERT(g_state.ds);
   ASSERT_LG_DS_VALID(g_state.ds);
+
+  if (g_params.jitRender)
+  {
+    if (g_state.ds->waitFrame)
+      g_state.jitRender = true;
+    else
+      DEBUG_WARN("JIT render not supported on display server backend, disabled");
+  }
 
   // init the subsystem
   if (!g_state.ds->earlyInit())
@@ -757,7 +961,6 @@ static int lg_run(void)
       DEBUG_ERROR("Forced renderer failed to iniailize");
       return -1;
     }
-    g_state.lgr = LG_Renderers[g_params.forceRendererIndex];
   }
   else
   {
@@ -765,10 +968,7 @@ static int lg_run(void)
     for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
     {
       if (tryRenderer(i, lgrParams, &needsOpenGL))
-      {
-        g_state.lgr = LG_Renderers[i];
         break;
-      }
     }
   }
 
@@ -777,6 +977,10 @@ static int lg_run(void)
     DEBUG_INFO("Unable to find a suitable renderer");
     return -1;
   }
+
+  g_state.useDMA =
+    g_params.allowDMA &&
+    ivshmemHasDMA(&g_state.shm);
 
   // initialize the window dimensions at init for renderers
   g_state.windowW  = g_params.w;
@@ -797,7 +1001,8 @@ static int lg_run(void)
     .resizable           = g_params.allowResize,
     .borderless          = g_params.borderless,
     .maximize            = g_params.maximize,
-    .opengl              = needsOpenGL
+    .opengl              = needsOpenGL,
+    .jitRender           = g_params.jitRender
   };
 
   g_state.dsInitialized = g_state.ds->init(params);
@@ -824,6 +1029,10 @@ static int lg_run(void)
     g_state.frameTime = 1000000000ULL / (unsigned long long)g_params.fpsMin;
   }
 
+  // when the overlay is shown we should run at a minimum of 60 fps for
+  // interactivity.
+  g_state.overlayFrameTime = min(g_state.frameTime, 1000000000ULL / 60ULL);
+
   keybind_register();
 
   // setup the startup condition
@@ -834,11 +1043,14 @@ static int lg_run(void)
   }
 
   // setup the new frame event
-  if (!(e_frame = lgCreateEvent(true, 0)))
+  if (!(g_state.frameEvent = lgCreateEvent(!g_state.jitRender, 0)))
   {
     DEBUG_ERROR("failed to create the frame event");
     return -1;
   }
+
+  if (g_state.jitRender)
+    DEBUG_INFO("Using JIT render mode");
 
   lgInit();
 
@@ -886,6 +1098,20 @@ restart:
     if ((status = lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata)) == LGMP_OK)
       break;
 
+    if (status == LGMP_ERR_INVALID_VERSION)
+    {
+      reportBadVersion();
+      DEBUG_INFO("Waiting for you to upgrade the host application");
+      while (g_state.state == APP_STATE_RUNNING &&
+          lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata) != LGMP_OK)
+        g_state.ds->wait(1000);
+
+      if (g_state.state != APP_STATE_RUNNING)
+        return -1;
+
+      break;
+    }
+
     if (status != LGMP_ERR_INVALID_SESSION && status != LGMP_ERR_INVALID_MAGIC)
     {
       DEBUG_ERROR("lgmpClientSessionInit Failed: %s", lgmpStatusString(status));
@@ -919,11 +1145,7 @@ restart:
   const bool magicMatches = memcmp(udata->magic, KVMFR_MAGIC, sizeof(udata->magic)) == 0;
   if (udataSize != sizeof(KVMFR) || !magicMatches || udata->version != KVMFR_VERSION)
   {
-    DEBUG_BREAK();
-    DEBUG_ERROR("The host application is not compatible with this client");
-    DEBUG_ERROR("This is not a Looking Glass error, do not report this");
-    DEBUG_ERROR("Please install the matching host application for this client");
-
+    reportBadVersion();
     if (magicMatches)
     {
       DEBUG_ERROR("Expected KVMFR version %d, got %d", KVMFR_VERSION, udata->version);
@@ -954,13 +1176,9 @@ restart:
   DEBUG_INFO("Host ready, reported version: %s", udata->hostver);
   DEBUG_INFO("Starting session");
 
-  if (!lgCreateThread("cursorThread", cursorThread, NULL, &t_cursor))
-  {
-    DEBUG_ERROR("cursor create thread failed");
-    return 1;
-  }
+  g_state.kvmfrFeatures = udata->features;
 
-  if (!core_startFrameThread())
+  if (!core_startCursorThread() || !core_startFrameThread())
     return -1;
 
   while(g_state.state == APP_STATE_RUNNING)
@@ -976,16 +1194,14 @@ restart:
   if (g_state.state == APP_STATE_RESTART)
   {
     lgSignalEvent(e_startup);
-    lgSignalEvent(e_frame);
+    lgSignalEvent(g_state.frameEvent);
 
     core_stopFrameThread();
-
-    lgJoinThread(t_cursor, NULL);
-    t_cursor = NULL;
+    core_stopCursorThread();
 
     lgInit();
 
-    g_state.lgr->on_restart(g_state.lgrData);
+    RENDERER(onRestart);
 
     DEBUG_INFO("Waiting for the host to restart...");
     goto restart;
@@ -999,17 +1215,19 @@ static void lg_shutdown(void)
   g_state.state = APP_STATE_SHUTDOWN;
   if (t_render)
   {
+    if (g_state.jitRender && g_state.ds->stopWaitFrame)
+      g_state.ds->stopWaitFrame();
     lgSignalEvent(e_startup);
-    lgSignalEvent(e_frame);
+    lgSignalEvent(g_state.frameEvent);
     lgJoinThread(t_render, NULL);
   }
 
   lgmpClientFree(&g_state.lgmp);
 
-  if (e_frame)
+  if (g_state.frameEvent)
   {
-    lgFreeEvent(e_frame);
-    e_frame = NULL;
+    lgFreeEvent(g_state.frameEvent);
+    g_state.frameEvent = NULL;
   }
 
   if (e_startup)
@@ -1047,7 +1265,23 @@ static void lg_shutdown(void)
   if (g_state.dsInitialized)
     g_state.ds->free();
 
+  if (g_state.overlays)
+  {
+    app_freeOverlays();
+    ll_free(g_state.overlays);
+    g_state.overlays = NULL;
+  }
+
   ivshmemClose(&g_state.shm);
+
+  // free metrics ringbuffers
+  ringbuffer_free(&g_state.renderTimings);
+  ringbuffer_free(&g_state.uploadTimings);
+  ringbuffer_free(&g_state.renderDuration);
+
+  free(g_state.fontName);
+  igDestroyContext(NULL);
+  free(g_state.imGuiIni);
 }
 
 int main(int argc, char * argv[])
@@ -1061,15 +1295,31 @@ int main(int argc, char * argv[])
     return -1;
   }
 
+  if (getuid() != geteuid())
+  {
+    DEBUG_ERROR("Do not run looking glass as setuid!");
+    return -1;
+  }
+
   DEBUG_INFO("Looking Glass (%s)", BUILD_VERSION);
   DEBUG_INFO("Locking Method: " LG_LOCK_MODE);
+  lgDebugCPU();
 
   if (!installCrashHandler("/proc/self/exe"))
     DEBUG_WARN("Failed to install the crash handler");
 
+  lgPathsInit("looking-glass");
   config_init();
   ivshmemOptionsInit();
   egl_dynProcsInit();
+  gl_dynProcsInit();
+
+  g_state.overlays = ll_new();
+  app_registerOverlay(&LGOverlayConfig, NULL);
+  app_registerOverlay(&LGOverlayAlert , NULL);
+  app_registerOverlay(&LGOverlayFPS   , NULL);
+  app_registerOverlay(&LGOverlayGraphs, NULL);
+  app_registerOverlay(&LGOverlayHelp  , NULL);
 
   // early renderer setup for option registration
   for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
@@ -1086,6 +1336,7 @@ int main(int argc, char * argv[])
 
   config_free();
 
+  util_freeUIFonts();
   cleanupCrashHandler();
   return ret;
 }

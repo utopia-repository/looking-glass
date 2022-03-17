@@ -1,27 +1,30 @@
 cmake_minimum_required(VERSION 3.0)
 project(looking-glass-host C)
 
+get_filename_component(PROJECT_TOP "${PROJECT_SOURCE_DIR}/.." ABSOLUTE)
+
+if(PROJECT_SOURCE_DIR STREQUAL PROJECT_BINARY_DIR)
+	message(FATAL_ERROR
+		"\n"
+		"In-source builds are not supported\n"
+		"See build instructions provided in: "
+		"${PROJECT_TOP}/doc/build.rst\n"
+		"Refusing to continue"
+	)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_TOP}/cmake/" "${PROJECT_SOURCE_DIR}/cmake/")
+
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG" CACHE STRING "compiler flags" FORCE)
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g -DNDEBUG" CACHE STRING "compiler flags" FORCE)
 
-set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/")
-
+include(CheckSubmodule)
 include(GNUInstallDirs)
 include(CheckCCompilerFlag)
 include(FeatureSummary)
 
-option(OPTIMIZE_FOR_NATIVE "Build with -march=native" OFF)
-if(OPTIMIZE_FOR_NATIVE)
-  CHECK_C_COMPILER_FLAG("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-  if(COMPILER_SUPPORTS_MARCH_NATIVE)
-    add_compile_options("-march=native")
-  endif()
-else()
-  CHECK_C_COMPILER_FLAG("-march=nehalem" COMPILER_SUPPORTS_MARCH_NEHALEM)
-  if(COMPILER_SUPPORTS_MARCH_NEHALEM)
-    add_compile_options("-march=nehalem")
-  endif()
-endif()
+include(OptimizeForNative) # option(OPTIMIZE_FOR_NATIVE)
+include(UninstallTarget)
 
 option(ENABLE_BACKTRACE "Enable backtrace support on crash" ON)
 add_feature_info(ENABLE_BACKTRACE ENABLE_BACKTRACE "Backtrace support.")
@@ -37,10 +40,13 @@ add_compile_options(
 )
 set(CMAKE_C_STANDARD  11)
 
-get_filename_component(PROJECT_TOP "${PROJECT_SOURCE_DIR}/.." ABSOLUTE)
+if(WIN32)
+  add_compile_options("-fdebug-prefix-map=${PROJECT_TOP}/=")
+endif()
 
 add_custom_command(
 	OUTPUT	${CMAKE_BINARY_DIR}/version.c
+    ${CMAKE_BINARY_DIR}/include/version.h
 		${CMAKE_BINARY_DIR}/_version.c
 	COMMAND ${CMAKE_COMMAND} -D PROJECT_TOP=${PROJECT_TOP} -P
 		${PROJECT_TOP}/version.cmake
@@ -49,8 +55,6 @@ add_custom_command(
 include_directories(
 	${PROJECT_SOURCE_DIR}/include
 	${CMAKE_BINARY_DIR}/include
-	${PKGCONFIG_INCLUDE_DIRS}
-	${GMP_INCLUDE_DIR}
 )
 
 #link_libraries(
@@ -66,7 +70,13 @@ add_subdirectory("${PROJECT_TOP}/repos/LGMP/lgmp" "${CMAKE_BINARY_DIR}/lgmp"  )
 add_subdirectory(platform)
 
 if(WIN32)
-  add_executable(looking-glass-host WIN32 ${SOURCES})
+  set_source_files_properties(platform/Windows/resource.rc PROPERTIES
+    OBJECT_DEPENDS "${PROJECT_SOURCE_DIR}/platform/Windows/app.manifest;${PROJECT_TOP}/resources/icon.ico;${CMAKE_BINARY_DIR}/include/version.h"
+  )
+  add_executable(looking-glass-host WIN32
+    platform/Windows/resource.rc
+    ${SOURCES}
+  )
 else()
   add_executable(looking-glass-host ${SOURCES})
 endif()

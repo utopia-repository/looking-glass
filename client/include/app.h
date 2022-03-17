@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,8 +24,10 @@
 #include <stdbool.h>
 #include <linux/input.h>
 
+#include "common/ringbuffer.h"
 #include "common/types.h"
 #include "interface/displayserver.h"
+#include "interface/overlay.h"
 
 typedef enum LG_MsgAlert
 {
@@ -41,9 +43,11 @@ bool app_inputEnabled(void);
 bool app_isCaptureMode(void);
 bool app_isCaptureOnlyMode(void);
 bool app_isFormatValid(void);
+bool app_isOverlayMode(void);
 void app_updateCursorPos(double x, double y);
 void app_updateWindowPos(int x, int y);
 void app_handleResizeEvent(int w, int h, double scale, const struct Border border);
+void app_invalidateWindow(bool full);
 
 void app_handleMouseRelative(double normx, double normy,
     double rawx, double rawy);
@@ -53,8 +57,12 @@ void app_resyncMouseBasic(void);
 
 void app_handleButtonPress(int button);
 void app_handleButtonRelease(int button);
+void app_handleWheelMotion(double motion);
 void app_handleKeyPress(int scancode);
 void app_handleKeyRelease(int scancode);
+void app_handleKeyboardTyped(const char * typed);
+void app_handleKeyboardModifiers(bool ctrl, bool shift, bool alt, bool super);
+void app_handleKeyboardLEDs(bool numLock, bool capsLock, bool scrollLock);
 void app_handleEnterEvent(bool entered);
 void app_handleFocusEvent(bool focused);
 void app_handleCloseEvent(void);
@@ -77,6 +85,34 @@ void app_glMakeCurrent(LG_DSGLContext context);
 void app_glSetSwapInterval(int interval);
 void app_glSwapBuffers(void);
 #endif
+
+#define MAX_OVERLAY_RECTS 10
+void app_registerOverlay(const struct LG_OverlayOps * ops, const void * params);
+void app_initOverlays(void);
+void app_setOverlay(bool enable);
+bool app_overlayNeedsRender(void);
+/**
+ * render the overlay
+ * returns:
+ *   -1 for full output damage
+ *    0 for no overlay
+ *   >0 number of rects written into rects
+ */
+int app_renderOverlay(struct Rect * rects, int maxRects);
+
+void app_freeOverlays(void);
+
+struct OverlayGraph;
+typedef struct OverlayGraph * GraphHandle;
+
+GraphHandle app_registerGraph(const char * name, RingBuffer buffer, float min, float max);
+void app_unregisterGraph(GraphHandle handle);
+
+void app_overlayConfigRegister(const char * title,
+    void (*callback)(void * udata, int * id), void * udata);
+
+void app_overlayConfigRegisterTab(const char * title,
+    void (*callback)(void * udata, int * id), void * udata);
 
 void app_clipboardRelease(void);
 void app_clipboardNotifyTypes(const LG_ClipboardData types[], int count);
@@ -115,15 +151,5 @@ void app_releaseKeybind(KeybindHandle * handle);
  * Release all keybindings
  */
 void app_releaseAllKeybinds(void);
-
-/**
- * Changes whether the help message is displayed or not.
- */
-void app_showHelp(bool show);
-
-/**
- * Changes whether the FPS is displayed or not.
- */
-void app_showFPS(bool showFPS);
 
 #endif

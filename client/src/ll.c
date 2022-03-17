@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,9 +20,9 @@
 
 #include "ll.h"
 
+#include "common/debug.h"
 #include "common/locking.h"
 #include <stdlib.h>
-#include <assert.h>
 
 struct ll_item
 {
@@ -41,7 +41,7 @@ struct ll
 
 struct ll * ll_new(void)
 {
-  struct ll * list = malloc(sizeof(struct ll));
+  struct ll * list = malloc(sizeof(*list));
   list->head  = NULL;
   list->tail  = NULL;
   list->pos   = NULL;
@@ -53,7 +53,7 @@ struct ll * ll_new(void)
 void ll_free(struct ll * list)
 {
   // never free a list with items in it!
-  assert(!list->head);
+  DEBUG_ASSERT(!list->head);
 
   LG_LOCK_FREE(list->lock);
   free(list);
@@ -61,7 +61,7 @@ void ll_free(struct ll * list)
 
 void ll_push(struct ll * list, void * data)
 {
-  struct ll_item * item = malloc(sizeof(struct ll_item));
+  struct ll_item * item = malloc(sizeof(*item));
   item->data = data;
   item->next = NULL;
 

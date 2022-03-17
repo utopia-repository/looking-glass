@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,7 +20,6 @@
 
 #include "platform.h"
 #include "service.h"
-#include "windows/delay.h"
 #include "windows/mousehook.h"
 
 #include <windows.h>
@@ -31,6 +30,7 @@
 #include <ntstatus.h>
 #include <wtsapi32.h>
 #include <userenv.h>
+#include <winternl.h>
 
 #include "interface/platform.h"
 #include "common/debug.h"
@@ -38,6 +38,7 @@
 #include "common/option.h"
 #include "common/locking.h"
 #include "common/thread.h"
+#include "common/time.h"
 
 #define ID_MENU_SHOW_LOG 3000
 #define ID_MENU_EXIT     3001
@@ -57,19 +58,11 @@ struct AppState
   NOTIFYICONDATA iconData;
   UINT           trayRestartMsg;
   HMENU          trayMenu;
+  HANDLE         exitWait;
 };
 
 static struct AppState app = {0};
 HWND MessageHWND;
-
-// linux mingw64 is missing this
-#ifndef MSGFLT_RESET
-  #define MSGFLT_RESET (0)
-  #define MSGFLT_ALLOW (1)
-  #define MSGFLT_DISALLOW (2)
-#endif
-typedef WINBOOL WINAPI (*PChangeWindowMessageFilterEx)(HWND hwnd, UINT message, DWORD action, void * pChangeFilterStruct);
-PChangeWindowMessageFilterEx _ChangeWindowMessageFilterEx = NULL;
 
 CreateProcessAsUserA_t f_CreateProcessAsUserA = NULL;
 
@@ -212,6 +205,8 @@ LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
   switch(msg)
   {
     case WM_DESTROY:
+      Shell_NotifyIcon(NIM_DELETE, &app.iconData);
+      MessageHWND = NULL;
       PostQuitMessage(0);
       break;
 
@@ -264,9 +259,7 @@ static int appThread(void * opaque)
 {
   RegisterTrayIcon();
   int result = app_main(app.argc, app.argv);
-
-  Shell_NotifyIcon(NIM_DELETE, &app.iconData);
-  SendMessage(app.messageWnd, WM_DESTROY, 0, 0);
+  SendMessage(app.messageWnd, WM_CLOSE, 0, 0);
   return result;
 }
 
@@ -362,6 +355,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
       .type           = OPTION_TYPE_STRING,
       .value.x_string = logFilePath
     },
+    {
+      .module         = "os",
+      .name           = "exitEvent",
+      .description    = "Exit when the specified event is signaled",
+      .type           = OPTION_TYPE_STRING,
+      .value.x_string = ""
+    },
     {0}
   };
 
@@ -369,18 +369,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
   // setup a handler for ctrl+c
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
-
-  // enable high DPI awareness
-  // this is required for DXGI 1.5 support to function and also capturing desktops with high DPI
-  DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-  #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2  ((DPI_AWARENESS_CONTEXT)-4)
-  typedef BOOL (*User32_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT value);
-
-  HMODULE user32 = GetModuleHandle("user32.dll");
-  User32_SetProcessDpiAwarenessContext fn;
-  fn = (User32_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-  if (fn)
-    fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
   // create a message window so that our message pump works
   WNDCLASSEX wx    = {};
@@ -405,9 +393,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   app.messageWnd = CreateWindowEx(0, MAKEINTATOM(class), NULL, 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
   // this is needed so that unprivileged processes can send us this message
-  _ChangeWindowMessageFilterEx = (PChangeWindowMessageFilterEx)GetProcAddress(user32, "ChangeWindowMessageFilterEx");
-  if (_ChangeWindowMessageFilterEx)
-    _ChangeWindowMessageFilterEx(app.messageWnd, app.trayRestartMsg, MSGFLT_ALLOW, NULL);
+  ChangeWindowMessageFilterEx(app.messageWnd, app.trayRestartMsg, MSGFLT_ALLOW, NULL);
 
   // set the global
   MessageHWND = app.messageWnd;
@@ -449,6 +435,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 shutdown:
   DestroyMenu(app.trayMenu);
   app_shutdown();
+  UnregisterWait(app.exitWait);
+
   if (!lgJoinThread(thread, &result))
   {
     DEBUG_ERROR("Failed to join the main application thread");
@@ -464,39 +452,37 @@ finish:
   return result;
 }
 
+typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
+{
+  D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE         = 0,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL = 1,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL       = 2,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL = 3,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH         = 4,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME     = 5,
+}
+D3DKMT_SCHEDULINGPRIORITYCLASS;
+
+NTSTATUS APIENTRY D3DKMTSetProcessSchedulingPriorityClass(
+  _In_ HANDLE, _In_ D3DKMT_SCHEDULINGPRIORITYCLASS
+);
+
 void boostPriority(void)
 {
-  typedef enum _D3DKMT_SCHEDULINGPRIORITYCLASS
-  {
-    D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE,
-    D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL,
-    D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL,
-    D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL,
-    D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH,
-    D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME
-  }
-  D3DKMT_SCHEDULINGPRIORITYCLASS;
-  typedef NTSTATUS WINAPI (*PD3DKMTSetProcessSchedulingPriorityClass)
-    (HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
-
-  HMODULE gdi32 = GetModuleHandleA("GDI32");
-  if (!gdi32)
-    return;
-
-  PD3DKMTSetProcessSchedulingPriorityClass fn =
-    (PD3DKMTSetProcessSchedulingPriorityClass)
-    GetProcAddress(gdi32, "D3DKMTSetProcessSchedulingPriorityClass");
-
-  if (!fn)
-    return;
-
-  if (FAILED(fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME)))
+  if (FAILED(D3DKMTSetProcessSchedulingPriorityClass(GetCurrentProcess(),
+        D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME)))
   {
     DEBUG_WARN("Failed to set realtime GPU priority.");
     DEBUG_INFO("This is not a failure, please do not report this as an issue.");
     DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
     DEBUG_INFO("looking-glass-host.exe InstallService");
   }
+}
+
+void CALLBACK exitEventCallback(PVOID opaque, BOOLEAN timedOut)
+{
+  DEBUG_INFO("Received exit event");
+  SendMessage(app.messageWnd, WM_CLOSE, 0, 0);
 }
 
 bool app_init(void)
@@ -510,13 +496,31 @@ bool app_init(void)
   // always flush stderr
   setbuf(stderr, NULL);
 
-  delayInit();
+  windowsSetTimerResolution();
 
   // get the performance frequency for spinlocks
   QueryPerformanceFrequency(&app.perfFreq);
 
   // try to boost the scheduler priority
   boostPriority();
+
+  // open exit signaling event
+  HANDLE exitEvent = NULL;
+  const char * exitEventName = option_get_string("os", "exitEvent");
+  if (exitEventName && exitEventName[0])
+  {
+    exitEvent = OpenEvent(SYNCHRONIZE, FALSE, exitEventName);
+    if (!exitEvent)
+    {
+      DEBUG_WINERROR("Failed to open exitEvent", GetLastError());
+      DEBUG_INFO("Exit event name: %s", exitEventName);
+    }
+  }
+
+  if (exitEvent &&
+      !RegisterWaitForSingleObject(&app.exitWait, exitEvent, exitEventCallback, NULL,
+        INFINITE, WT_EXECUTEONLYONCE))
+    DEBUG_WINERROR("Failed to register wait for exit event", GetLastError());
 
   return true;
 }
@@ -564,7 +568,8 @@ bool os_blockScreensaver()
     if (status == STATUS_SUCCESS)
       lastResult = executionState & ES_DISPLAY_REQUIRED;
     else
-      DEBUG_ERROR("Failed to call CallNtPowerInformation(SystemExecutionState): %ld", status);
+      DEBUG_WINERROR("Failed to call CallNtPowerInformation(SystemExecutionState)",
+        RtlNtStatusToDosError(status));
     lastCheck = now;
   }
   return lastResult;
@@ -573,4 +578,14 @@ bool os_blockScreensaver()
 void os_showMessage(const char * caption, const char * msg)
 {
   MessageBoxA(NULL, msg, caption, MB_OK | MB_ICONINFORMATION);
+}
+
+bool os_hasSetCursorPos(void)
+{
+  return true;
+}
+
+void os_setCursorPos(int x, int y)
+{
+  SetCursorPos(x, y);
 }

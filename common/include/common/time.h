@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,12 +22,16 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <windows.h>
-#else
-#include <time.h>
-#include <stdint.h>
+
+void windowsSetTimerResolution(void);
+NTSYSCALLAPI NTSTATUS NTAPI NtDelayExecution(
+  _In_ BOOLEAN Alertable,
+  _In_opt_ PLARGE_INTEGER DelayInterval
+);
 #endif
 
 typedef struct LGTimer LGTimer;
@@ -49,23 +53,40 @@ static inline uint64_t microtime(void)
 #endif
 }
 
-#if !defined(_WIN32)
-//FIXME: make win32 versions
+static inline void nsleep(uint64_t ns)
+{
+#if defined(_WIN32)
+  LARGE_INTEGER interval = { .QuadPart = -(int64_t)(ns / 100LL) };
+  NtDelayExecution(FALSE, &interval);
+#else
+  const struct timespec ts =
+  {
+    .tv_sec  = ns / 1000000000,
+    .tv_nsec = ns % 1000000000,
+  };
+  nanosleep(&ts, NULL);
+#endif
+}
+
 static inline uint64_t nanotime(void)
 {
+#if defined(_WIN32)
+  static double multiplier = 0.0;
+  if (!multiplier)
+  {
+    LARGE_INTEGER freq = { 0 };
+    QueryPerformanceFrequency(&freq);
+    multiplier = 1e9 / freq.QuadPart;
+  }
+
+  LARGE_INTEGER time;
+  QueryPerformanceCounter(&time);
+  return (uint64_t) (time.QuadPart * multiplier);
+#else
   struct timespec time;
   clock_gettime(CLOCK_MONOTONIC_RAW, &time);
   return ((uint64_t)time.tv_sec * 1000000000LL) + time.tv_nsec;
-}
-
-static inline void nsleep(uint64_t ns)
-{
-  const struct timespec ts =
-  {
-    .tv_sec  = ns / 1e9,
-    .tv_nsec = ns - ((ns / 1e9) * 1e9)
-  };
-  nanosleep(&ts, NULL);
+#endif
 }
 
 static inline void tsDiff(struct timespec *diff, const struct timespec *left,
@@ -103,7 +124,6 @@ static inline void tsAdd(struct timespec *a, uint64_t ns)
   a->tv_sec  += __iter_div_u64_rem(a->tv_nsec + ns, 1000000000L, &ns);
   a->tv_nsec = ns;
 }
-#endif
 
 typedef bool (*LGTimerFn)(void * udata);
 

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,11 +22,12 @@
 #include "common/debug.h"
 #include "common/stringutils.h"
 
+#include <ctype.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
 
 struct OptionGroup
 {
@@ -63,10 +64,16 @@ static bool int_parser(struct Option * opt, const char * str)
 static bool bool_parser(struct Option * opt, const char * str)
 {
   opt->value.x_bool =
-    strcmp(str, "1"   ) == 0 ||
-    strcmp(str, "on"  ) == 0 ||
-    strcmp(str, "yes" ) == 0 ||
-    strcmp(str, "true") == 0;
+    strcasecmp(str, "1"   ) == 0 ||
+    strcasecmp(str, "on"  ) == 0 ||
+    strcasecmp(str, "yes" ) == 0 ||
+    strcasecmp(str, "true") == 0;
+  return true;
+}
+
+static bool float_parser(struct Option * opt, const char * str)
+{
+  opt->value.x_float = atof(str);
   return true;
 }
 
@@ -90,6 +97,14 @@ static char * bool_toString(struct Option * opt)
   return strdup(opt->value.x_bool ? "yes" : "no");
 }
 
+static char * float_toString(struct Option * opt)
+{
+  int len = snprintf(NULL, 0, "%f", opt->value.x_float);
+  char * ret = malloc(len + 1);
+  sprintf(ret, "%f", opt->value.x_float);
+  return ret;
+}
+
 static char * string_toString(struct Option * opt)
 {
   if (!opt->value.x_string)
@@ -106,14 +121,14 @@ bool option_register(struct Option options[])
 
   state.options = realloc(
     state.options,
-    sizeof(struct Option *) * (state.oCount + new)
+    sizeof(*state.options) * (state.oCount + new)
   );
 
   for(int i = 0; options[i].type != OPTION_TYPE_NONE; ++i)
   {
-    state.options[state.oCount + i] = (struct Option *)malloc(sizeof(struct Option));
+    state.options[state.oCount + i] = malloc(sizeof(**state.options));
     struct Option * o = state.options[state.oCount + i];
-    memcpy(o, &options[i], sizeof(struct Option));
+    memcpy(o, &options[i], sizeof(*o));
 
     if (!o->parser)
     {
@@ -129,6 +144,10 @@ bool option_register(struct Option options[])
 
         case OPTION_TYPE_BOOL:
           o->parser = bool_parser;
+          break;
+
+        case OPTION_TYPE_FLOAT:
+          o->parser = float_parser;
           break;
 
         default:
@@ -151,6 +170,10 @@ bool option_register(struct Option options[])
 
         case OPTION_TYPE_BOOL:
           o->toString = bool_toString;
+          break;
+
+        case OPTION_TYPE_FLOAT:
+          o->toString = float_toString;
           break;
 
         default:
@@ -177,7 +200,7 @@ bool option_register(struct Option options[])
       found = true;
       group->options = realloc(
         group->options,
-        sizeof(struct Option *) * (group->count + 1)
+        sizeof(*group->options) * (group->count + 1)
       );
       group->options[group->count] = o;
 
@@ -193,14 +216,14 @@ bool option_register(struct Option options[])
     {
       state.groups = realloc(
         state.groups,
-        sizeof(struct OptionGroup) * (state.gCount + 1)
+        sizeof(*state.groups) * (state.gCount + 1)
       );
 
       struct OptionGroup * group = &state.groups[state.gCount];
       ++state.gCount;
 
       group->module     = o->module;
-      group->options    = malloc(sizeof(struct Option *));
+      group->options    = malloc(sizeof(*group->options));
       group->options[0] = o;
       group->count      = 1;
       group->pad        = strlen(o->name);
@@ -257,13 +280,13 @@ bool option_parse(int argc, char * argv[])
     // emulate getopt for backwards compatability
     if (argv[a][0] == '-')
     {
-      if (strcmp(argv[a], "-h") == 0 || strcmp(argv[a], "--help") == 0)
+      if (strcasecmp(argv[a], "-h") == 0 || strcasecmp(argv[a], "--help") == 0)
       {
         state.doHelp = DOHELP_MODE_YES;
         continue;
       }
 
-      if (strcmp(argv[a], "--rst-help") == 0)
+      if (strcasecmp(argv[a], "--rst-help") == 0)
       {
         state.doHelp = DOHELP_MODE_RST;
         continue;
@@ -271,7 +294,7 @@ bool option_parse(int argc, char * argv[])
 
       if (strlen(argv[a]) != 2)
       {
-        DEBUG_WARN("Ignored invalid argvument: %s", argv[a]);
+        DEBUG_WARN("Ignored invalid argument: %s", argv[a]);
         continue;
       }
 
@@ -359,7 +382,16 @@ static char * file_parse_module(FILE * fp)
 
       default:
         if (len % 32 == 0)
-          module = realloc(module, len + 32 + 1);
+        {
+          char * p = realloc(module, len + 32 + 1);
+          if (!p)
+          {
+            DEBUG_ERROR("out of memory");
+            free(module);
+            return NULL;
+          }
+          module = p;
+        }
         module[len++] = c;
     }
   }
@@ -446,7 +478,16 @@ bool option_load(const char * filename)
         }
 
         if (*len % 32 == 0)
-          *p = realloc(*p, *len + 32 + 1);
+        {
+          char * tmp = realloc(*p, *len + 32 + 1);
+          if (!tmp)
+          {
+            DEBUG_ERROR("out of memory");
+            result = false;
+            goto exit;
+          }
+          *p = tmp;
+        }
         (*p)[(*len)++] = c;
         break;
 
@@ -487,7 +528,7 @@ bool option_load(const char * filename)
           }
 
           //rtrim
-          while(nameLen > 1 && (name[nameLen-1] == ' ' || name[nameLen-1] == '\t'))
+          while (nameLen > 1 && isspace(name[nameLen-1]))
             --nameLen;
           name[nameLen] = '\0';
           expectValue   = true;
@@ -498,7 +539,16 @@ bool option_load(const char * filename)
         }
 
         if (*len % 32 == 0)
-          *p = realloc(*p, *len + 32 + 1);
+        {
+          char * tmp = realloc(*p, *len + 32 + 1);
+          if (!tmp)
+          {
+            DEBUG_ERROR("out of memory");
+            result = false;
+            goto exit;
+          }
+          *p = tmp;
+        }
         (*p)[(*len)++] = c;
         break;
 
@@ -524,11 +574,20 @@ bool option_load(const char * filename)
         line = false;
 
         //ltrim
-        if (*len == 0 && (c == ' ' || c == '\t'))
+        if (*len == 0 && isspace(c))
           break;
 
         if (*len % 32 == 0)
-          *p = realloc(*p, *len + 32 + 1);
+        {
+          char * tmp = realloc(*p, *len + 32 + 1);
+          if (!tmp)
+          {
+            DEBUG_ERROR("out of memory");
+            result = false;
+            goto exit;
+          }
+          *p = tmp;
+        }
         (*p)[(*len)++] = c;
         break;
     }
@@ -640,6 +699,8 @@ void option_print(void)
     for(int i = 0; i < state.groups[g].count; ++i)
     {
       struct Option * o = state.groups[g].options[i];
+      if (o->preset)
+        continue;
       char * value = o->toString(o);
       if (!value)
       {
@@ -665,15 +726,17 @@ void option_print(void)
       "Value"
     );
 
-    assert(maxLen > 0);
+    DEBUG_ASSERT(maxLen > 0);
     headerLine = line;
     stringlist_push(lines, line);
 
     for(int i = 0; i < state.groups[g].count; ++i)
     {
       struct Option * o = state.groups[g].options[i];
-      char * value = stringlist_at(values, i);
+      if (o->preset)
+        continue;
 
+      char * value = stringlist_at(values, i);
       len = alloc_sprintf(
         &line,
         "%s:%-*s | %c%c    | %-*s | %s",
@@ -687,13 +750,19 @@ void option_print(void)
         o->description
       );
 
-      assert(len > 0);
+      DEBUG_ASSERT(len > 0);
       stringlist_push(lines, line);
       if (len > maxLen)
         maxLen = len;
     }
 
     stringlist_free(&values);
+
+    if (stringlist_count(lines) <= 1)
+    {
+      stringlist_free(&lines);
+      continue;
+    }
 
     // print out the lines
     for(int i = 0; i < stringlist_count(lines); ++i)
@@ -724,12 +793,41 @@ void option_print(void)
   }
 }
 
+// dump the options in ini format into the file
+bool option_dump_preset(FILE * file)
+{
+  for (int g = 0; g < state.gCount; ++g)
+  {
+    bool hasPreset = false;
+    for (int i = 0; i < state.groups[g].count; ++i)
+      hasPreset |= state.groups[g].options[i]->preset;
+    if (!hasPreset)
+      continue;
+
+    fprintf(file, "[%s]\n", state.groups[g].module);
+
+    for (int i = 0; i < state.groups[g].count; ++i)
+    {
+      struct Option * o = state.groups[g].options[i];
+      if (!o->preset)
+        continue;
+
+      char * value = o->toString(o);
+      fprintf(file, "%s=%s\n", o->name, value);
+      free(value);
+    }
+    fputc('\n', file);
+  }
+
+  return true;
+}
+
 struct Option * option_get(const char * module, const char * name)
 {
   for(int i = 0; i < state.oCount; ++i)
   {
     struct Option * o = state.options[i];
-    if ((strcmp(o->module, module) == 0) && (strcmp(o->name, name) == 0))
+    if ((strcasecmp(o->module, module) == 0) && (strcasecmp(o->name, name) == 0))
       return o;
   }
   return NULL;
@@ -743,7 +841,7 @@ int option_get_int(const char * module, const char * name)
     DEBUG_ERROR("BUG: Failed to get the value for option %s:%s", module, name);
     return -1;
   }
-  assert(o->type == OPTION_TYPE_INT);
+  DEBUG_ASSERT(o->type == OPTION_TYPE_INT);
   return o->value.x_int;
 }
 
@@ -755,7 +853,7 @@ const char * option_get_string(const char * module, const char * name)
     DEBUG_ERROR("BUG: Failed to get the value for option %s:%s", module, name);
     return NULL;
   }
-  assert(o->type == OPTION_TYPE_STRING);
+  DEBUG_ASSERT(o->type == OPTION_TYPE_STRING);
   return o->value.x_string;
 }
 
@@ -767,6 +865,67 @@ bool option_get_bool(const char * module, const char * name)
     DEBUG_ERROR("BUG: Failed to get the value for option %s:%s", module, name);
     return false;
   }
-  assert(o->type == OPTION_TYPE_BOOL);
+  DEBUG_ASSERT(o->type == OPTION_TYPE_BOOL);
   return o->value.x_bool;
+}
+
+float option_get_float(const char * module, const char * name)
+{
+  struct Option * o = option_get(module, name);
+  if (!o)
+  {
+    DEBUG_ERROR("BUG: Failed to get the value for option %s:%s", module, name);
+    return NAN;
+  }
+  DEBUG_ASSERT(o->type == OPTION_TYPE_FLOAT);
+  return o->value.x_float;
+}
+
+void option_set_int(const char * module, const char * name, int value)
+{
+  struct Option * o = option_get(module, name);
+  if (!o)
+  {
+    DEBUG_ERROR("BUG: Failed to set the value for option %s:%s", module, name);
+    return;
+  }
+  DEBUG_ASSERT(o->type == OPTION_TYPE_INT);
+  o->value.x_int = value;
+}
+
+void option_set_string(const char * module, const char * name, const char * value)
+{
+  struct Option * o = option_get(module, name);
+  if (!o)
+  {
+    DEBUG_ERROR("BUG: Failed to set the value for option %s:%s", module, name);
+    return;
+  }
+  DEBUG_ASSERT(o->type == OPTION_TYPE_STRING);
+  free(o->value.x_string);
+  o->value.x_string = strdup(value);
+}
+
+void option_set_bool(const char * module, const char * name, bool value)
+{
+  struct Option * o = option_get(module, name);
+  if (!o)
+  {
+    DEBUG_ERROR("BUG: Failed to set the value for option %s:%s", module, name);
+    return;
+  }
+  DEBUG_ASSERT(o->type == OPTION_TYPE_BOOL);
+  o->value.x_bool = value;
+}
+
+void option_set_float(const char * module, const char * name, float value)
+{
+  struct Option * o = option_get(module, name);
+  if (!o)
+  {
+    DEBUG_ERROR("BUG: Failed to set the value for option %s:%s", module, name);
+    return;
+  }
+  DEBUG_ASSERT(o->type == OPTION_TYPE_FLOAT);
+  o->value.x_float = value;
 }

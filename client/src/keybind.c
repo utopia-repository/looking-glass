@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -43,15 +43,15 @@ static void bind_video(int sc, void * opaque)
   );
 
   if (g_state.stopVideo)
+  {
+    core_stopCursorThread();
     core_stopFrameThread();
+  }
   else
+  {
+    core_startCursorThread();
     core_startFrameThread();
-}
-
-static void bind_showFPS(int sc, void * opaque)
-{
-  g_state.showFPS = !g_state.showFPS;
-  app_showFPS(g_state.showFPS);
+  }
 }
 
 static void bind_rotate(int sc, void * opaque)
@@ -110,9 +110,9 @@ static void bind_mouseSens(int sc, void * opaque)
 
 static void bind_ctrlAltFn(int sc, void * opaque)
 {
-  const uint32_t ctrl = xfree86_to_ps2[KEY_LEFTCTRL];
-  const uint32_t alt  = xfree86_to_ps2[KEY_LEFTALT ];
-  const uint32_t fn   = xfree86_to_ps2[sc];
+  const uint32_t ctrl = linux_to_ps2[KEY_LEFTCTRL];
+  const uint32_t alt  = linux_to_ps2[KEY_LEFTALT ];
+  const uint32_t fn   = linux_to_ps2[sc];
   spice_key_down(ctrl);
   spice_key_down(alt );
   spice_key_down(fn  );
@@ -124,18 +124,23 @@ static void bind_ctrlAltFn(int sc, void * opaque)
 
 static void bind_passthrough(int sc, void * opaque)
 {
-  sc = xfree86_to_ps2[sc];
+  sc = linux_to_ps2[sc];
   spice_key_down(sc);
   spice_key_up  (sc);
 }
 
+static void bind_toggleOverlay(int sc, void * opaque)
+{
+  app_setOverlay(!g_state.overlayInput);
+}
+
 void keybind_register(void)
 {
-  app_registerKeybind(KEY_F, bind_fullscreen, NULL, "Full screen toggle");
-  app_registerKeybind(KEY_V, bind_video     , NULL, "Video stream toggle");
-  app_registerKeybind(KEY_D, bind_showFPS   , NULL, "FPS display toggle");
-  app_registerKeybind(KEY_R, bind_rotate    , NULL, "Rotate the output clockwise by 90° increments");
-  app_registerKeybind(KEY_Q, bind_quit      , NULL, "Quit");
+  app_registerKeybind(KEY_F, bind_fullscreen   , NULL, "Full screen toggle");
+  app_registerKeybind(KEY_V, bind_video        , NULL, "Video stream toggle");
+  app_registerKeybind(KEY_R, bind_rotate       , NULL, "Rotate the output clockwise by 90° increments");
+  app_registerKeybind(KEY_Q, bind_quit         , NULL, "Quit");
+  app_registerKeybind(KEY_O, bind_toggleOverlay, NULL, "Toggle overlay");
 
   if (g_params.useSpiceInput)
   {

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -29,9 +29,13 @@
 #include "common/types.h"
 #include "common/ivshmem.h"
 #include "common/locking.h"
+#include "common/ringbuffer.h"
+#include "common/event.h"
 
 #include "spice/spice.h"
 #include <lgmp/client.h>
+
+#include "cimgui.h"
 
 enum RunState
 {
@@ -44,12 +48,31 @@ struct AppState
 {
   enum RunState state;
 
+  ImGuiIO        * io;
+  ImGuiStyle     * style;
+  struct ll      * overlays;
+  char           * fontName;
+  ImFont         * fontLarge;
+  bool             overlayInput;
+  ImGuiMouseCursor cursorLast;
+  char           * imGuiIni;
+  bool             modCtrl;
+  bool             modShift;
+  bool             modAlt;
+  bool             modSuper;
+  uint64_t         lastImGuiFrame;
+
+  bool        alertShow;
+  char      * alertMessage;
+  LG_MsgAlert alertType;
+  uint64_t    alertTimeout;
+
   struct LG_DisplayServerOps * ds;
   bool                         dsInitialized;
+  bool                         jitRender;
 
   bool                 stopVideo;
   bool                 ignoreInput;
-  bool                 showFPS;
   bool                 escapeActive;
   uint64_t             escapeTime;
   int                  escapeAction;
@@ -71,10 +94,10 @@ struct AppState
   bool                 posInfoValid;
   bool                 alignToGuest;
 
-  const LG_Renderer  * lgr;
-  void               * lgrData;
+  LG_Renderer        * lgr;
   atomic_int           lgrResize;
   LG_Lock              lgrLock;
+  bool                 useDMA;
 
   bool                 cbAvailable;
   SpiceDataType        cbType;
@@ -84,17 +107,27 @@ struct AppState
 
   struct IVSHMEM       shm;
   PLGMPClient          lgmp;
-  PLGMPClientQueue     frameQueue;
   PLGMPClientQueue     pointerQueue;
+  KVMFRFeatureFlags    kvmfrFeatures;
 
+  LGThread            * cursorThread;
   LGThread            * frameThread;
+  LGEvent             * frameEvent;
+  atomic_bool           invalidateWindow;
   bool                  formatValid;
-  atomic_uint_least64_t frameTime;
+  uint64_t              frameTime;
+  uint64_t              overlayFrameTime;
   uint64_t              lastFrameTime;
-  uint64_t              renderTime;
-  atomic_uint_least64_t frameCount;
-  uint64_t              renderCount;
+  bool                  lastFrameTimeValid;
+  uint64_t              lastRenderTime;
+  bool                  lastRenderTimeValid;
+  RingBuffer            renderTimings;
+  RingBuffer            renderDuration;
+  RingBuffer            uploadTimings;
 
+  atomic_uint_least64_t pendingCount;
+  atomic_uint_least64_t renderCount, frameCount;
+  _Atomic(float)        fps, ups;
 
   uint64_t resizeTimeout;
   bool     resizeDone;
@@ -118,7 +151,6 @@ struct AppParams
   int               x, y;
   unsigned int      w, h;
   int               fpsMin;
-  bool              showFPS;
   LG_RendererRotate winRotate;
   bool              useSpiceInput;
   bool              useSpiceClipboard;
@@ -141,6 +173,9 @@ struct AppParams
   bool              quickSplash;
   bool              alwaysShowCursor;
   uint64_t          helpMenuDelayUs;
+  const char *      uiFont;
+  int               uiSize;
+  bool              jitRender;
 
   unsigned int      cursorPollInterval;
   unsigned int      framePollInterval;
@@ -192,9 +227,6 @@ struct CursorInfo
 
   /* true if the details in this struct are valid */
   bool valid;
-
-  /* the DPI scaling of the guest */
-  uint32_t dpiScale;
 };
 
 struct CursorState
@@ -222,9 +254,6 @@ struct CursorState
 
   /* the amount to scale the X & Y movements by */
   struct DoublePoint scale;
-
-  /* the dpi scale factor from the guest as a fraction */
-  double dpiScale;
 
   /* the error accumulator */
   struct DoublePoint acc;
@@ -259,4 +288,7 @@ extern struct AppState    g_state;
 extern struct CursorState g_cursor;
 extern struct AppParams   g_params;
 
+int main_cursorThread(void * unused);
 int main_frameThread(void * unused);
+
+#define RENDERER(fn, ...) g_state.lgr->ops.fn(g_state.lgr, ##__VA_ARGS__)

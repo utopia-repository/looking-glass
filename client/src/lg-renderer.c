@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,31 +20,3 @@
 
 #include <stdbool.h>
 #include <string.h>
-
-bool LG_RendererValidatorBool(const char * value)
-{
-  if (!value)
-    return false;
-
-  return
-    (strcasecmp(value, "1"      ) == 0) ||
-    (strcasecmp(value, "0"      ) == 0) ||
-    (strcasecmp(value, "true"   ) == 0) ||
-    (strcasecmp(value, "false"  ) == 0) ||
-    (strcasecmp(value, "yes"    ) == 0) ||
-    (strcasecmp(value, "no"     ) == 0) ||
-    (strcasecmp(value, "on"     ) == 0) ||
-    (strcasecmp(value, "off"    ) == 0) ||
-    (strcasecmp(value, "enable" ) == 0) ||
-    (strcasecmp(value, "disable") == 0);
-}
-
-bool LG_RendererValueToBool(const char * value)
-{
-  return
-    (strcasecmp(value, "1"      ) == 0) ||
-    (strcasecmp(value, "true"   ) == 0) ||
-    (strcasecmp(value, "yes"    ) == 0) ||
-    (strcasecmp(value, "on"     ) == 0) ||
-    (strcasecmp(value, "enable" ) == 0);
-}

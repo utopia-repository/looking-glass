@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright (C) 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2021 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,7 +23,6 @@
 #include "common/debug.h"
 #include "common/event.h"
 #include <string.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <xcb/shm.h>
@@ -49,7 +48,7 @@ struct xcb
   xcb_xfixes_get_cursor_image_cookie_t curC;
 };
 
-struct xcb * this = NULL;
+static struct xcb * this = NULL;
 
 // forwards
 
@@ -64,8 +63,8 @@ static const char * xcb_getName(void)
 
 static bool xcb_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostPointerBuffer postPointerBufferFn)
 {
-  assert(!this);
-  this             = (struct xcb *)calloc(sizeof(struct xcb), 1);
+  DEBUG_ASSERT(!this);
+  this             = calloc(1, sizeof(*this));
   this->shmID      = -1;
   this->data       = (void *)-1;
   this->frameEvent = lgCreateEvent(true, 20);
@@ -82,8 +81,8 @@ static bool xcb_create(CaptureGetPointerBuffer getPointerBufferFn, CapturePostPo
 
 static bool xcb_init(void)
 {
-  assert(this);
-  assert(!this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(!this->initialized);
 
   lgResetEvent(this->frameEvent);
 
@@ -134,7 +133,7 @@ fail:
 
 static bool xcb_deinit(void)
 {
-  assert(this);
+  DEBUG_ASSERT(this);
 
   if ((uintptr_t)this->data != -1)
   {
@@ -165,15 +164,10 @@ static void xcb_free(void)
   this = NULL;
 }
 
-static unsigned int xcb_getMouseScale(void)
-{
-  return 100;
-}
-
 static CaptureResult xcb_capture(void)
 {
-  assert(this);
-  assert(this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(this->initialized);
 
   if (!this->hasFrame)
   {
@@ -213,10 +207,11 @@ static CaptureResult xcb_waitFrame(CaptureFrame * frame,
   return CAPTURE_RESULT_OK;
 }
 
-static CaptureResult xcb_getFrame(FrameBuffer * frame, const unsigned int height)
+static CaptureResult xcb_getFrame(FrameBuffer * frame,
+    const unsigned int height, int frameIndex)
 {
-  assert(this);
-  assert(this->initialized);
+  DEBUG_ASSERT(this);
+  DEBUG_ASSERT(this->initialized);
 
   xcb_shm_get_image_reply_t * img;
   img = xcb_shm_get_image_reply(this->xcb, this->imgC, NULL);
@@ -242,7 +237,6 @@ struct CaptureInterface Capture_XCB =
   .init            = xcb_init,
   .deinit          = xcb_deinit,
   .free            = xcb_free,
-  .getMouseScale   = xcb_getMouseScale,
   .capture         = xcb_capture,
   .waitFrame       = xcb_waitFrame,
   .getFrame        = xcb_getFrame
