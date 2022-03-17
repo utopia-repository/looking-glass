@@ -10,10 +10,20 @@ include  /usr/share/dpkg/pkg-info.mk
 export DEB_VERSION
 
 %:
-	dh $@ --sourcedirectory=client
+	dh $@
 
 override_dh_auto_configure:
-	dh_auto_configure -- -DOPTIMIZE_FOR_NATIVE=OFF -DENABLE_BACKTRACE=OFF
+	dh_auto_configure --sourcedir client --builddirectory .build/client -- -DOPTIMIZE_FOR_NATIVE=OFF -DENABLE_BACKTRACE=OFF
+	dh_auto_configure --sourcedir obs --builddirectory .build/obs -- -DOPTIMIZE_FOR_NATIVE=OFF -DENABLE_BACKTRACE=OFF
 
-override_dh_install:
-	dh_install --sourcedir=client
+override_dh_auto_build:
+	dh_auto_build --sourcedir client --builddirectory .build/client
+	dh_auto_build --sourcedir obs --builddirectory .build/obs
+
+override_dh_auto_install:
+	dh_auto_install --sourcedir client --builddirectory .build/client
+	dh_auto_install --sourcedir obs --builddirectory .build/obs
+
+override_dh_auto_clean:
+	dh_auto_clean --sourcedir client --builddirectory .build/client
+	dh_auto_clean --sourcedir obs --builddirectory .build/obs

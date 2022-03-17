@@ -1,0 +1,2 @@
+#!/usr/bin/dh-exec
+.build/obs/liblooking-glass-obs.so usr/lib/${DEB_HOST_MULTIARCH}/obs-plugins/

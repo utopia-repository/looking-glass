@@ -8,10 +8,10 @@ Subject: Makefile changes for debian packaging
  1 file changed, 3 insertions(+), 1 deletion(-)
 
 diff --git a/client/CMakeLists.txt b/client/CMakeLists.txt
-index bc13a44..b846b54 100644
+index bdd4f1c..6be5a7d 100644
 --- a/client/CMakeLists.txt
 +++ b/client/CMakeLists.txt
-@@ -47,9 +47,11 @@ add_compile_options(
+@@ -66,9 +66,11 @@ add_compile_options(
    "-ffast-math"
    "-fdata-sections"
    "-ffunction-sections"

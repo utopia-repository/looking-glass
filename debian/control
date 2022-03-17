@@ -5,8 +5,10 @@ Maintainer: Lennart Weller <lhw@ring0.de>
 Build-Depends: cmake,
                debhelper (>= 12),
                debhelper-compat (= 12),
+               dh-exec (>= 0.3),
                fonts-freefont-ttf,
                libfontconfig1-dev,
+               libobs-dev,
                libsdl2-dev,
                libsdl2-ttf-dev,
                libspice-protocol-dev,
@@ -32,3 +34,15 @@ Description: Low latency KVM FrameRelay implementation for VGA Passthrough
  A LookingGlass Host implementation is required to run on the guest virtual
  machine. It is recommended that the client and host versions match. See the
  README.Debian for more information.
+
+Package: obs-plugin-looking-glass
+Architecture: amd64
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Enhances: obs-studio
+Description: Looking Glass KVM FrameRelay plugin for OBS-Studio
+ LookingGlass enables you to use shared memory to pass rendered frames from a
+ virtual machine back to the host system.
+ .
+ This package adds a source plugin for OBS Studio which allows recording the
+ looking-glass host session directly from the shared memory.

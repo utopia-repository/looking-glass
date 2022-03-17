@@ -1,1 +1,1 @@
-../obj-*/looking-glass-client usr/bin/
+.build/client/looking-glass-client usr/bin/
