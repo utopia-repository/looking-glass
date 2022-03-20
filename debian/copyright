@@ -7,11 +7,11 @@ Comment:
  ease the packaging.
 
 Files: *
-Copyright: 2017-2020 Geoffrey McRae <geoff@hostfission.com>
+Copyright: 2017-2022 Geoffrey McRae <geoff@hostfission.com>
 License: GPL-2+
 
 Files: debian/*
-Copyright: 2018 Lennart Weller <lhw@ring0.de>
+Copyright: 2018-2022 Lennart Weller <lhw@ring0.de>
 License: GPL-2+
 
 License: GPL-2+
