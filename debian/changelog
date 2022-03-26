@@ -1,5 +1,6 @@
 looking-glass (0+b5.0.1-2) unstable; urgency=medium
 
+  * Added new binary package obs-plugin-looking-glass
   * Fix broken build
     * Added xpresenter build dependency
   * Fixed file watch
