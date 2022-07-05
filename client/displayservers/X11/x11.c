@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,6 +23,7 @@
 #include "x11.h"
 #include "atoms.h"
 #include "clipboard.h"
+#include "resources/icondata.h"
 
 #include <string.h>
 #include <unistd.h>
@@ -34,6 +35,8 @@
 #include <X11/extensions/Xinerama.h>
 #include <X11/extensions/Xpresent.h>
 #include <X11/Xcursor/Xcursor.h>
+
+#include <xkbcommon/xkbcommon.h>
 
 #include <GL/glx.h>
 #include <GL/glxext.h>
@@ -189,14 +192,14 @@ static void x11CheckEWMHSupport(void)
 
   if (XGetWindowProperty(x11.display, DefaultRootWindow(x11.display),
       x11atoms._NET_SUPPORTING_WM_CHECK, 0, ~0L, False, XA_WINDOW,
-      &type, &fmt, &num, &bytes, &data) != Success)
+      &type, &fmt, &num, &bytes, &data) != Success || !data)
     goto out;
 
   Window * windowFromRoot = (Window *)data;
 
   if (XGetWindowProperty(x11.display, *windowFromRoot,
       x11atoms._NET_SUPPORTING_WM_CHECK, 0, ~0L, False, XA_WINDOW,
-      &type, &fmt, &num, &bytes, &data) != Success)
+      &type, &fmt, &num, &bytes, &data) != Success || !data)
     goto out_root;
 
   Window * windowFromChild = (Window *)data;
@@ -205,7 +208,7 @@ static void x11CheckEWMHSupport(void)
 
   if (XGetWindowProperty(x11.display, DefaultRootWindow(x11.display),
       x11atoms._NET_SUPPORTED, 0, ~0L, False, AnyPropertyType,
-      &type, &fmt, &num, &bytes, &data) != Success)
+      &type, &fmt, &num, &bytes, &data) != Success || !data)
     goto out_child;
 
   Atom * supported = (Atom *)data;
@@ -213,7 +216,7 @@ static void x11CheckEWMHSupport(void)
 
   if (XGetWindowProperty(x11.display, *windowFromRoot,
       x11atoms._NET_WM_NAME, 0, ~0L, False, AnyPropertyType,
-      &type, &fmt, &num, &bytes, &data) != Success)
+      &type, &fmt, &num, &bytes, &data) != Success || !data)
     goto out_supported;
 
   char * wmName = (char *)data;
@@ -397,23 +400,14 @@ static bool x11Init(const LG_DSInitParams params)
     );
   }
 
-  Atom wmState[3] = {0};
-  int wmStateCount = 0;
-
-  if (params.fullscreen)
-  {
-    x11.fullscreen = true;
-    wmState[wmStateCount++] = x11atoms._NET_WM_STATE_FULLSCREEN;
-  }
-
   if (params.maximize)
   {
-    wmState[wmStateCount++] = x11atoms._NET_WM_STATE_MAXIMIZED_HORZ;
-    wmState[wmStateCount++] = x11atoms._NET_WM_STATE_MAXIMIZED_VERT;
-  }
+    Atom wmState[2] =
+    {
+      x11atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+      x11atoms._NET_WM_STATE_MAXIMIZED_VERT
+    };
 
-  if (wmStateCount)
-  {
     XChangeProperty(
       x11.display,
       x11.window,
@@ -422,7 +416,7 @@ static bool x11Init(const LG_DSInitParams params)
       32,
       PropModeReplace,
       (unsigned char *)&wmState,
-      wmStateCount
+      2
     );
   }
 
@@ -522,6 +516,10 @@ static bool x11Init(const LG_DSInitParams params)
     goto fail_window;
   }
 
+  XDisplayKeycodes(x11.display, &x11.minKeycode, &x11.maxKeycode);
+  x11.keysyms = XGetKeyboardMapping(x11.display, x11.minKeycode,
+      x11.maxKeycode - x11.minKeycode, &x11.symsPerKeycode);
+
   XIFreeDeviceInfo(devinfo);
 
   XQueryExtension(x11.display, "XInputExtension", &x11.xinputOp, &event, &error);
@@ -532,11 +530,8 @@ static bool x11Init(const LG_DSInitParams params)
   eventmask.mask_len = sizeof(mask);
   eventmask.mask     = mask;
 
-  if (!x11.ewmhHasFocusEvent)
-  {
-    XISetMask(mask, XI_FocusIn );
-    XISetMask(mask, XI_FocusOut);
-  }
+  XISetMask(mask, XI_FocusIn );
+  XISetMask(mask, XI_FocusOut);
 
   XISetMask(mask, XI_Enter        );
   XISetMask(mask, XI_Leave        );
@@ -563,6 +558,17 @@ static bool x11Init(const LG_DSInitParams params)
     PropModeReplace,
     (unsigned char *)&value,
     1
+  );
+
+  XChangeProperty(
+    x11.display,
+    x11.window,
+    x11atoms._NET_WM_ICON,
+    XA_CARDINAL,
+    32,
+    PropModeReplace,
+    (unsigned char *)icondata,
+    sizeof(icondata) / sizeof(icondata[0])
   );
 
   /* create the blank cursor */
@@ -655,6 +661,9 @@ static bool x11Init(const LG_DSInitParams params)
   if (!params.center)
     XMoveWindow(x11.display, x11.window, params.x, params.y);
 
+  if (params.fullscreen)
+    x11SetFullscreen(true);
+
   XSetLocaleModifiers(""); // Load XMODIFIERS
   x11.xim = XOpenIM(x11.display, 0, 0, 0);
 
@@ -734,6 +743,9 @@ static void x11Free(void)
   for(int i = 0; i < LG_POINTER_COUNT; ++i)
     if (x11.cursors[i])
       XFreeCursor(x11.display, x11.cursors[i]);
+
+  if (x11.keysyms)
+    XFree(x11.keysyms);
 
   XCloseDisplay(x11.display);
 }
@@ -1022,6 +1034,27 @@ static void updateModifiers(void)
   );
 }
 
+static void setFocus(bool focused, double x, double y)
+{
+  if (x11.focused == focused)
+    return;
+
+  x11.focused = focused;
+  app_updateCursorPos(x, y);
+  app_handleFocusEvent(focused);
+}
+
+static int getCharcode(int detail)
+{
+  if (detail < x11.minKeycode || detail > x11.maxKeycode)
+    return 0;
+
+  KeySym sym = x11.keysyms[(detail - x11.minKeycode) *
+      x11.symsPerKeycode];
+  sym = xkb_keysym_to_upper(sym);
+  return xkb_keysym_to_utf32(sym);
+}
+
 static void x11XInputEvent(XGenericEventCookie *cookie)
 {
   static int button_state = 0;
@@ -1030,43 +1063,50 @@ static void x11XInputEvent(XGenericEventCookie *cookie)
   {
     case XI_FocusIn:
     {
+      XIFocusOutEvent *xie = cookie->data;
       if (x11.ewmhHasFocusEvent)
+      {
+        // if meta ungrab for move/resize
+        if (xie->mode == XINotifyUngrab)
+          setFocus(true, xie->event_x, xie->event_y);
         return;
+      }
 
       atomic_store(&x11.lastWMEvent, microtime());
       if (x11.focused)
         return;
 
-      XIFocusOutEvent *xie = cookie->data;
       if (xie->mode != XINotifyNormal &&
           xie->mode != XINotifyWhileGrabbed &&
           xie->mode != XINotifyUngrab)
         return;
 
-      x11.focused = true;
-      app_updateCursorPos(xie->event_x, xie->event_y);
-      app_handleFocusEvent(true);
+
+      setFocus(true, xie->event_x, xie->event_y);
       return;
     }
 
     case XI_FocusOut:
     {
+      XIFocusOutEvent *xie = cookie->data;
       if (x11.ewmhHasFocusEvent)
+      {
+        // if meta grab for move/resize
+        if (xie->mode == XINotifyGrab)
+          setFocus(false, xie->event_x, xie->event_y);
         return;
+      }
 
       atomic_store(&x11.lastWMEvent, microtime());
       if (!x11.focused)
         return;
 
-      XIFocusOutEvent *xie = cookie->data;
       if (xie->mode != XINotifyNormal &&
           xie->mode != XINotifyWhileGrabbed &&
           xie->mode != XINotifyGrab)
         return;
 
-      app_updateCursorPos(xie->event_x, xie->event_y);
-      app_handleFocusEvent(false);
-      x11.focused = false;
+      setFocus(false, xie->event_x, xie->event_y);
       return;
     }
 
@@ -1106,7 +1146,8 @@ static void x11XInputEvent(XGenericEventCookie *cookie)
         return;
 
       XIDeviceEvent *device = cookie->data;
-      app_handleKeyPress(device->detail - 8);
+      app_handleKeyPress(device->detail - x11.minKeycode,
+          getCharcode(device->detail));
 
       if (!x11.xic || !app_isOverlayMode())
         return;
@@ -1156,7 +1197,8 @@ static void x11XInputEvent(XGenericEventCookie *cookie)
         return;
 
       XIDeviceEvent *device = cookie->data;
-      app_handleKeyRelease(device->detail - 8);
+      app_handleKeyRelease(device->detail - x11.minKeycode,
+          getCharcode(device->detail));
 
       if (!x11.xic || !app_isOverlayMode())
         return;
@@ -1185,7 +1227,8 @@ static void x11XInputEvent(XGenericEventCookie *cookie)
         return;
 
       XIRawEvent *raw = cookie->data;
-      app_handleKeyPress(raw->detail - 8);
+      app_handleKeyPress(raw->detail - x11.minKeycode,
+          getCharcode(raw->detail));
       return;
     }
 
@@ -1195,7 +1238,8 @@ static void x11XInputEvent(XGenericEventCookie *cookie)
         return;
 
       XIRawEvent *raw = cookie->data;
-      app_handleKeyRelease(raw->detail - 8);
+      app_handleKeyRelease(raw->detail - x11.minKeycode,
+          getCharcode(raw->detail));
       return;
     }
 
@@ -1799,6 +1843,28 @@ static bool x11IsValidPointerPos(int x, int y)
   return ret;
 }
 
+static void x11RequestActivation(void)
+{
+  XEvent e =
+  {
+    .xclient = {
+      .type         = ClientMessage,
+      .send_event   = true,
+      .message_type = x11atoms._NET_WM_STATE,
+      .format       = 32,
+      .window       = x11.window,
+      .data.l       = {
+        _NET_WM_STATE_ADD,
+        x11atoms._NET_WM_STATE_DEMANDS_ATTENTION,
+        0
+      }
+    }
+  };
+
+  XSendEvent(x11.display, DefaultRootWindow(x11.display), False,
+      SubstructureNotifyMask | SubstructureRedirectMask, &e);
+}
+
 static void x11InhibitIdle(void)
 {
   XScreenSaverSuspend(x11.display, true);
@@ -1889,6 +1955,7 @@ struct LG_DisplayServerOps LGDS_X11 =
   .warpPointer         = x11WarpPointer,
   .realignPointer      = x11RealignPointer,
   .isValidPointerPos   = x11IsValidPointerPos,
+  .requestActivation   = x11RequestActivation,
   .inhibitIdle         = x11InhibitIdle,
   .uninhibitIdle       = x11UninhibitIdle,
   .wait                = x11Wait,

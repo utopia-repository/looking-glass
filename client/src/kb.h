@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,6 +23,10 @@
 
 #include <linux/input.h>
 #include <stdint.h>
+
+#define PS2_MUTE        0xE020
+#define PS2_VOLUME_UP   0xE030
+#define PS2_VOLUME_DOWN 0xE02E
 
 extern const uint32_t linux_to_ps2[KEY_MAX];
 extern const char *   linux_to_str[KEY_MAX];

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,8 +24,8 @@
 #include "core.h"
 #include "util.h"
 #include "clipboard.h"
+#include "render_queue.h"
 
-#include "ll.h"
 #include "kb.h"
 
 #include "common/debug.h"
@@ -38,8 +38,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <string.h>
-
-#define ALERT_TIMEOUT 2000000
+#include <ctype.h>
 
 bool app_isRunning(void)
 {
@@ -65,7 +64,23 @@ bool app_isFormatValid(void)
 
 bool app_isOverlayMode(void)
 {
-  return g_state.overlayInput;
+  if (g_state.overlayInput)
+    return true;
+
+  bool result = false;
+  struct Overlay * overlay;
+  ll_lock(g_state.overlays);
+  ll_forEachNL(g_state.overlays, item, overlay)
+  {
+    if (overlay->ops->needs_overlay && overlay->ops->needs_overlay(overlay))
+    {
+      result = true;
+      break;
+    }
+  }
+  ll_unlock(g_state.overlays);
+
+  return result;
 }
 
 void app_updateCursorPos(double x, double y)
@@ -74,7 +89,7 @@ void app_updateCursorPos(double x, double y)
   g_cursor.pos.y = y;
   g_cursor.valid = true;
 
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
     g_state.io->MousePos = (ImVec2) { x, y };
 }
 
@@ -83,7 +98,7 @@ void app_handleFocusEvent(bool focused)
   g_state.focused = focused;
 
   // release any imgui buttons/keys if we lost focus
-  if (!focused && g_state.overlayInput)
+  if (!focused && app_isOverlayMode())
     core_resetOverlayInputState();
 
   if (!core_inputEnabled())
@@ -101,7 +116,7 @@ void app_handleFocusEvent(bool focused)
     if (g_params.releaseKeysOnFocusLoss)
       for (int key = 0; key < KEY_MAX; key++)
         if (g_state.keyDown[key])
-          app_handleKeyRelease(key);
+          app_handleKeyRelease(key, 0);
 
     g_state.escapeActive = false;
 
@@ -133,7 +148,7 @@ void app_handleEnterEvent(bool entered)
 
     // stop the user being able to drag windows off the screen and work around
     // the mouse button release being missed due to not being in capture mode.
-    if (g_state.overlayInput)
+    if (app_isOverlayMode())
     {
       g_state.io->MouseDown[ImGuiMouseButton_Left  ] = false;
       g_state.io->MouseDown[ImGuiMouseButton_Right ] = false;
@@ -154,7 +169,7 @@ void app_clipboardRelease(void)
   if (!g_params.clipboardToVM)
     return;
 
-  spice_clipboard_release();
+  purespice_clipboardRelease();
 }
 
 void app_clipboardNotifyTypes(const LG_ClipboardData types[], int count)
@@ -164,15 +179,15 @@ void app_clipboardNotifyTypes(const LG_ClipboardData types[], int count)
 
   if (count == 0)
   {
-    spice_clipboard_release();
+    purespice_clipboardRelease();
     return;
   }
 
-  SpiceDataType conv[count];
+  PSDataType conv[count];
   for(int i = 0; i < count; ++i)
     conv[i] = cb_lgTypeToSpiceType(types[i]);
 
-  spice_clipboard_grab(conv, count);
+  purespice_clipboardGrab(conv, count);
 }
 
 void app_clipboardNotifySize(const LG_ClipboardData type, size_t size)
@@ -182,7 +197,7 @@ void app_clipboardNotifySize(const LG_ClipboardData type, size_t size)
 
   if (type == LG_CLIPBOARD_DATA_NONE)
   {
-    spice_clipboard_release();
+    purespice_clipboardRelease();
     return;
   }
 
@@ -190,7 +205,7 @@ void app_clipboardNotifySize(const LG_ClipboardData type, size_t size)
   g_state.cbChunked = size > 0;
   g_state.cbXfer    = size;
 
-  spice_clipboard_data_start(g_state.cbType, size);
+  purespice_clipboardDataStart(g_state.cbType, size);
 }
 
 void app_clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
@@ -205,9 +220,9 @@ void app_clipboardData(const LG_ClipboardData type, uint8_t * data, size_t size)
   }
 
   if (!g_state.cbChunked)
-    spice_clipboard_data_start(g_state.cbType, size);
+    purespice_clipboardDataStart(g_state.cbType, size);
 
-  spice_clipboard_data(g_state.cbType, data, (uint32_t)size);
+  purespice_clipboardData(g_state.cbType, data, (uint32_t)size);
   g_state.cbXfer -= size;
 }
 
@@ -217,13 +232,18 @@ void app_clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque)
     return;
 
   struct CBRequest * cbr = malloc(sizeof(*cbr));
+  if (!cbr)
+  {
+    DEBUG_ERROR("out of memory");
+    return;
+  }
 
   cbr->type    = g_state.cbType;
   cbr->replyFn = replyFn;
   cbr->opaque  = opaque;
   ll_push(g_state.cbRequestList, cbr);
 
-  spice_clipboard_request(g_state.cbType);
+  purespice_clipboardRequest(g_state.cbType);
 }
 
 static int mapSpiceToImGuiButton(uint32_t button)
@@ -245,7 +265,7 @@ void app_handleButtonPress(int button)
 {
   g_cursor.buttons |= (1U << button);
 
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
   {
     int igButton = mapSpiceToImGuiButton(button);
     if (igButton != -1)
@@ -256,7 +276,7 @@ void app_handleButtonPress(int button)
   if (!core_inputEnabled() || !g_cursor.inView)
     return;
 
-  if (!spice_mouse_press(button))
+  if (!purespice_mousePress(button))
     DEBUG_ERROR("app_handleButtonPress: failed to send message");
 }
 
@@ -264,7 +284,7 @@ void app_handleButtonRelease(int button)
 {
   g_cursor.buttons &= ~(1U << button);
 
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
   {
     int igButton = mapSpiceToImGuiButton(button);
     if (igButton != -1)
@@ -275,19 +295,19 @@ void app_handleButtonRelease(int button)
   if (!core_inputEnabled())
     return;
 
-  if (!spice_mouse_release(button))
+  if (!purespice_mouseRelease(button))
     DEBUG_ERROR("app_handleButtonRelease: failed to send message");
 }
 
 void app_handleWheelMotion(double motion)
 {
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
     g_state.io->MouseWheel -= motion;
 }
 
-void app_handleKeyPress(int sc)
+void app_handleKeyPress(int sc, int charcode)
 {
-  if (!g_state.overlayInput || !g_state.io->WantCaptureKeyboard)
+  if (!app_isOverlayMode() || !g_state.io->WantCaptureKeyboard)
   {
     if (sc == g_params.escapeKey && !g_state.escapeActive)
     {
@@ -300,11 +320,21 @@ void app_handleKeyPress(int sc)
     if (g_state.escapeActive)
     {
       g_state.escapeAction = sc;
+      KeybindHandle handle;
+      ll_forEachNL(g_state.bindings, item, handle)
+      {
+        if ((handle->sc       && handle->sc       == sc       ) ||
+            (handle->charcode && handle->charcode == charcode))
+        {
+          handle->callback(sc, handle->opaque);
+          break;
+        }
+      }
       return;
     }
   }
 
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
   {
     if (sc == KEY_ESC)
       app_setOverlay(false);
@@ -325,7 +355,7 @@ void app_handleKeyPress(int sc)
     if (!ps2)
       return;
 
-    if (spice_key_down(ps2))
+    if (purespice_keyDown(ps2))
       g_state.keyDown[sc] = true;
     else
     {
@@ -335,30 +365,22 @@ void app_handleKeyPress(int sc)
   }
 }
 
-void app_handleKeyRelease(int sc)
+void app_handleKeyRelease(int sc, int charcode)
 {
   if (g_state.escapeActive)
   {
     if (g_state.escapeAction == -1)
     {
-      if (!g_state.escapeHelp && g_params.useSpiceInput && !g_state.overlayInput)
+      if (!g_state.escapeHelp && g_params.useSpiceInput &&
+          !app_isOverlayMode())
         core_setGrab(!g_cursor.grab);
-    }
-    else
-    {
-      KeybindHandle handle = g_state.bindings[sc];
-      if (handle)
-      {
-        handle->callback(sc, handle->opaque);
-        return;
-      }
     }
 
     if (sc == g_params.escapeKey)
       g_state.escapeActive = false;
   }
 
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
   {
     g_state.io->KeysDown[sc] = false;
     return;
@@ -378,7 +400,7 @@ void app_handleKeyRelease(int sc)
   if (!ps2)
     return;
 
-  if (spice_key_up(ps2))
+  if (purespice_keyUp(ps2))
     g_state.keyDown[sc] = false;
   else
   {
@@ -410,14 +432,14 @@ void app_handleKeyboardLEDs(bool numLock, bool capsLock, bool scrollLock)
     (numLock    ? 2 /* SPICE_NUM_LOCK_MODIFIER    */ : 0) |
     (capsLock   ? 4 /* SPICE_CAPS_LOCK_MODIFIER   */ : 0);
 
-  if (!spice_key_modifiers(modifiers))
+  if (!purespice_keyModifiers(modifiers))
     DEBUG_ERROR("app_handleKeyboardLEDs: failed to send message");
 }
 
 void app_handleMouseRelative(double normx, double normy,
     double rawx, double rawy)
 {
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
     return;
 
   if (g_cursor.grab)
@@ -439,7 +461,8 @@ void app_handleMouseRelative(double normx, double normy,
 void app_handleMouseBasic()
 {
   /* do not pass mouse events to the guest if we do not have focus */
-  if (!g_cursor.guest.valid || !g_state.haveSrcSize || !g_state.focused || g_state.overlayInput)
+  if (!g_cursor.guest.valid || !g_state.haveSrcSize || !g_state.focused ||
+      app_isOverlayMode())
     return;
 
   if (!core_inputEnabled())
@@ -468,7 +491,7 @@ void app_handleMouseBasic()
   g_cursor.projected.x += x;
   g_cursor.projected.y += y;
 
-  if (!spice_mouse_motion(x, y))
+  if (!purespice_mouseMotion(x, y))
     DEBUG_ERROR("failed to send mouse motion message");
 }
 
@@ -519,6 +542,10 @@ void app_invalidateWindow(bool full)
 {
   if (full)
     atomic_store(&g_state.invalidateWindow, true);
+
+  if (g_state.dsInitialized && g_state.jitRender && g_state.ds->stopWaitFrame)
+    g_state.ds->stopWaitFrame();
+
   lgSignalEvent(g_state.frameEvent);
 }
 
@@ -547,15 +574,6 @@ void app_handleRenderEvent(const uint64_t timeUs)
       invalidate = true;
     }
   }
-
-  if (g_state.alertShow)
-    if (g_state.alertTimeout < timeUs)
-    {
-      g_state.alertShow = false;
-      free(g_state.alertMessage);
-      g_state.alertMessage = NULL;
-      invalidate = true;
-    }
 
   if (invalidate)
     app_invalidateWindow(false);
@@ -625,37 +643,92 @@ void app_alert(LG_MsgAlert type, const char * fmt, ...)
   if (!g_state.lgr || !g_params.showAlerts)
     return;
 
-  char * buffer;
-
   va_list args;
   va_start(args, fmt);
-  valloc_sprintf(&buffer, fmt, args);
+  overlayAlert_show(type, fmt, args);
   va_end(args);
-
-  free(g_state.alertMessage);
-  g_state.alertMessage = buffer;
-  g_state.alertTimeout = microtime() + ALERT_TIMEOUT;
-  g_state.alertType    = type;
-  g_state.alertShow    = true;
-  app_invalidateWindow(false);
 }
 
-KeybindHandle app_registerKeybind(int sc, KeybindFn callback, void * opaque, const char * description)
+MsgBoxHandle app_msgBox(const char * caption, const char * fmt, ...)
 {
-  // don't allow duplicate binds
-  if (g_state.bindings[sc])
+  va_list args;
+  va_start(args, fmt);
+  MsgBoxHandle handle = overlayMsg_show(caption, NULL, NULL, fmt, args);
+  va_end(args);
+
+  core_updateOverlayState();
+
+  return handle;
+}
+
+MsgBoxHandle app_confirmMsgBox(const char * caption,
+    MsgBoxConfirmCallback callback, void * opaque, const char * fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  MsgBoxHandle handle = overlayMsg_show(caption, callback, opaque, fmt, args);
+  va_end(args);
+
+  core_updateOverlayState();
+
+  return handle;
+}
+
+void app_msgBoxClose(MsgBoxHandle handle)
+{
+  if (!handle)
+    return;
+
+  overlayMsg_close(handle);
+}
+
+void app_showRecord(bool show)
+{
+  overlayStatus_set(LG_USER_STATUS_RECORDING, show);
+}
+
+KeybindHandle app_registerKeybind(int sc, int charcode, KeybindFn callback,
+    void * opaque, const char * description)
+{
+  if (charcode != 0 && sc != 0)
   {
-    DEBUG_INFO("Key already bound");
+    DEBUG_ERROR("invalid keybind, one of scancode or charcode must be 0");
     return NULL;
   }
 
-  KeybindHandle handle = malloc(sizeof(*handle));
-  handle->sc       = sc;
-  handle->callback = callback;
-  handle->opaque   = opaque;
+  if (charcode && islower(charcode))
+  {
+    DEBUG_ERROR("invalid keybind, charcode must be uppercase");
+    return NULL;
+  }
 
-  g_state.bindings[sc] = handle;
-  g_state.keyDescription[sc] = description;
+  KeybindHandle handle;
+
+  // don't allow duplicate binds
+  ll_forEachNL(g_state.bindings, item, handle)
+  {
+    if ((sc       && handle->sc       == sc      ) ||
+        (charcode && handle->charcode == charcode))
+    {
+      DEBUG_INFO("Key already bound");
+      return NULL;
+    }
+  }
+
+  handle = malloc(sizeof(*handle));
+  if (!handle)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
+
+  handle->sc          = sc;
+  handle->charcode    = charcode;
+  handle->callback    = callback;
+  handle->description = description;
+  handle->opaque      = opaque;
+
+  ll_push(g_state.bindings, handle);
   return handle;
 }
 
@@ -664,24 +737,22 @@ void app_releaseKeybind(KeybindHandle * handle)
   if (!*handle)
     return;
 
-  g_state.bindings[(*handle)->sc] = NULL;
+  ll_removeData(g_state.bindings, *handle);
   free(*handle);
   *handle = NULL;
 }
 
 void app_releaseAllKeybinds(void)
 {
-  for(int i = 0; i < KEY_MAX; ++i)
-    if (g_state.bindings[i])
-    {
-      free(g_state.bindings[i]);
-      g_state.bindings[i] = NULL;
-    }
+  KeybindHandle * handle;
+  while(ll_shift(g_state.bindings, (void **)&handle))
+    free(handle);
 }
 
-GraphHandle app_registerGraph(const char * name, RingBuffer buffer, float min, float max)
+GraphHandle app_registerGraph(const char * name, RingBuffer buffer,
+    float min, float max, GraphFormatFn formatFn)
 {
-  return overlayGraph_register(name, buffer, min, max);
+  return overlayGraph_register(name, buffer, min, max, formatFn);
 }
 
 void app_unregisterGraph(GraphHandle handle)
@@ -689,20 +760,22 @@ void app_unregisterGraph(GraphHandle handle)
   overlayGraph_unregister(handle);
 }
 
-struct Overlay
+void app_invalidateGraph(GraphHandle handle)
 {
-  const struct LG_OverlayOps * ops;
-  const void * params;
-  void * udata;
-  int lastRectCount;
-  struct Rect lastRects[MAX_OVERLAY_RECTS];
-};
+  overlayGraph_invalidate(handle);
+}
 
 void app_registerOverlay(const struct LG_OverlayOps * ops, const void * params)
 {
   ASSERT_LG_OVERLAY_VALID(ops);
 
   struct Overlay * overlay = malloc(sizeof(*overlay));
+  if (!overlay)
+  {
+    DEBUG_ERROR("out of ram");
+    return;
+  }
+
   overlay->ops           = ops;
   overlay->params        = params;
   overlay->udata         = NULL;
@@ -716,15 +789,17 @@ void app_registerOverlay(const struct LG_OverlayOps * ops, const void * params)
 void app_initOverlays(void)
 {
   struct Overlay * overlay;
-  for (ll_reset(g_state.overlays);
-      ll_walk(g_state.overlays, (void **)&overlay); )
+  ll_lock(g_state.overlays);
+  ll_forEachNL(g_state.overlays, item, overlay)
   {
+    DEBUG_ASSERT(overlay->ops);
     if (!overlay->ops->init(&overlay->udata, overlay->params))
     {
       DEBUG_ERROR("Overlay `%s` failed to initialize", overlay->ops->name);
       overlay->ops = NULL;
     }
   }
+  ll_unlock(g_state.overlays);
 }
 
 static inline void mergeRect(struct Rect * dest, const struct Rect * a, const struct Rect * b)
@@ -769,22 +844,26 @@ static inline LG_DSPointer mapImGuiCursor(ImGuiMouseCursor cursor)
 
 bool app_overlayNeedsRender(void)
 {
-  struct Overlay * overlay;
-
-  if (g_state.overlayInput)
+  if (app_isOverlayMode())
     return true;
 
-  for (ll_reset(g_state.overlays);
-      ll_walk(g_state.overlays, (void **)&overlay); )
+  bool result = false;
+  struct Overlay * overlay;
+  ll_lock(g_state.overlays);
+  ll_forEachNL(g_state.overlays, item, overlay)
   {
     if (!overlay->ops->needs_render)
       continue;
 
-    if (overlay->ops->needs_render(overlay->udata, g_state.overlayInput))
-      return true;
+    if (overlay->ops->needs_render(overlay->udata, false))
+    {
+      result = true;
+      break;
+    }
   }
+  ll_unlock(g_state.overlays);
 
-  return false;
+  return result;
 }
 
 int app_renderOverlay(struct Rect * rects, int maxRects)
@@ -803,24 +882,31 @@ int app_renderOverlay(struct Rect * rects, int maxRects)
   g_state.io->DeltaTime  = (now - g_state.lastImGuiFrame) * 1e-9f;
   g_state.lastImGuiFrame = now;
 
+render_again:
+
   igNewFrame();
 
-  if (g_state.overlayInput)
+  const bool overlayMode = app_isOverlayMode();
+  if (overlayMode && g_params.overlayDim)
   {
     totalDamage = true;
-    ImDrawList_AddRectFilled(igGetBackgroundDrawListNil(), (ImVec2) { 0.0f , 0.0f },
-      g_state.io->DisplaySize, igGetColorU32Col(ImGuiCol_ModalWindowDimBg, 1.0f), 0, 0);
-
-//    bool test;
-//    igShowDemoWindow(&test);
+    ImDrawList_AddRectFilled(igGetBackgroundDrawList_Nil(), (ImVec2) { 0.0f , 0.0f },
+      g_state.io->DisplaySize,
+      igGetColorU32_Col(ImGuiCol_ModalWindowDimBg, 1.0f),
+      0, 0);
   }
 
+  const bool msgModal = overlayMsg_modal();
+
   // render the overlays
-  for (ll_reset(g_state.overlays);
-      ll_walk(g_state.overlays, (void **)&overlay); )
+  ll_lock(g_state.overlays);
+  ll_forEachNL(g_state.overlays, item, overlay)
   {
+    if (msgModal && overlay->ops != &LGOverlayMsg)
+      continue;
+
     const int written =
-      overlay->ops->render(overlay->udata, g_state.overlayInput,
+      overlay->ops->render(overlay->udata, overlayMode,
           buffer, MAX_OVERLAY_RECTS);
 
     for (int i = 0; i < written; ++i)
@@ -856,8 +942,9 @@ int app_renderOverlay(struct Rect * rects, int maxRects)
     memcpy(overlay->lastRects, buffer, sizeof(struct Rect) * written);
     overlay->lastRectCount = written;
   }
+  ll_unlock(g_state.overlays);
 
-  if (g_state.overlayInput)
+  if (overlayMode)
   {
     ImGuiMouseCursor cursor = igGetMouseCursor();
     if (cursor != g_state.cursorLast)
@@ -868,6 +955,16 @@ int app_renderOverlay(struct Rect * rects, int maxRects)
   }
 
   igRender();
+
+  /* imgui requires two passes to calculate the bounding box of auto sized
+   * windows, this is by design
+   * ref: https://github.com/ocornut/imgui/issues/2158#issuecomment-434223618
+   */
+  if (g_state.renderImGuiTwice)
+  {
+    g_state.renderImGuiTwice = false;
+    goto render_again;
+  }
 
   return totalDamage ? -1 : totalRects;
 }
@@ -884,31 +981,11 @@ void app_freeOverlays(void)
 
 void app_setOverlay(bool enable)
 {
-  static bool wasGrabbed = false;
-
   if (g_state.overlayInput == enable)
     return;
 
   g_state.overlayInput = enable;
-  g_state.cursorLast   = -2;
-
-  if (g_state.overlayInput)
-  {
-    wasGrabbed = g_cursor.grab;
-
-    g_state.io->ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
-    g_state.io->MousePos = (ImVec2) { g_cursor.pos.x, g_cursor.pos.y };
-
-    core_setGrabQuiet(false);
-    core_setCursorInView(false);
-  }
-  else
-  {
-    g_state.io->ConfigFlags |= ImGuiConfigFlags_NoMouse;
-    core_resetOverlayInputState();
-    core_setGrabQuiet(wasGrabbed);
-    app_invalidateWindow(false);
-  }
+  core_updateOverlayState();
 }
 
 void app_overlayConfigRegister(const char * title,
@@ -921,4 +998,103 @@ void app_overlayConfigRegisterTab(const char * title,
     void (*callback)(void * udata, int * id), void * udata)
 {
   overlayConfig_registerTab(title, callback, udata);
+}
+
+void app_invalidateOverlay(bool renderTwice)
+{
+  if (g_state.state == APP_STATE_SHUTDOWN)
+    return;
+
+  if (renderTwice)
+    g_state.renderImGuiTwice = true;
+  app_invalidateWindow(false);
+}
+
+bool app_guestIsLinux(void)
+{
+  return g_state.guestOS == KVMFR_OS_LINUX;
+}
+
+bool app_guestIsWindows(void)
+{
+  return g_state.guestOS == KVMFR_OS_WINDOWS;
+}
+
+bool app_guestIsOSX(void)
+{
+  return g_state.guestOS == KVMFR_OS_OSX;
+}
+
+bool app_guestIsBSD(void)
+{
+  return g_state.guestOS == KVMFR_OS_BSD;
+}
+
+bool app_guestIsOther(void)
+{
+  return g_state.guestOS == KVMFR_OS_OTHER;
+}
+
+void app_stopVideo(bool stop)
+{
+  if (g_state.stopVideo == stop)
+    return;
+
+  // do not change the state if the host app is not connected
+  if (!g_state.lgHostConnected)
+    return;
+
+  g_state.stopVideo = stop;
+
+  app_alert(
+    LG_ALERT_INFO,
+    stop ? "Video Stream Disabled" : "Video Stream Enabled"
+  );
+
+  if (stop)
+  {
+    core_stopCursorThread();
+    core_stopFrameThread();
+  }
+  else
+  {
+    core_startCursorThread();
+    core_startFrameThread();
+  }
+}
+
+bool app_useSpiceDisplay(bool enable)
+{
+  static bool lastState = false;
+  if (!g_params.useSpice || lastState == enable)
+    return g_params.useSpice && lastState;
+
+  // if spice is not yet ready, flag the state we want for when it is
+  if (!g_state.spiceReady)
+  {
+    g_state.initialSpiceDisplay = enable;
+    return false;
+  }
+
+  if (!purespice_hasChannel(PS_CHANNEL_DISPLAY))
+    return false;
+
+  // do not allow stopping of the host app if not connected
+  if (!enable && !g_state.lgHostConnected)
+    return false;
+
+  lastState = enable;
+  if (enable)
+  {
+    purespice_connectChannel(PS_CHANNEL_DISPLAY);
+    renderQueue_spiceShow(true);
+  }
+  else
+  {
+    renderQueue_spiceShow(false);
+    purespice_disconnectChannel(PS_CHANNEL_DISPLAY);
+  }
+
+  overlayStatus_set(LG_USER_STATUS_SPICE, enable);
+  return enable;
 }

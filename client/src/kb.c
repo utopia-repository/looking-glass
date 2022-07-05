@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -142,6 +142,13 @@ const uint32_t linux_to_ps2[KEY_MAX] =
   [KEY_F14]              /* = USB 105 */ = 0x00005E,
   [KEY_F15]              /* = USB 106 */ = 0x00005F,
   [KEY_PRINT]            /* = USB  70 */ = 0x00E037,
+  [KEY_MUTE]             /* = USB 127 */ = 0x00E020,
+  [KEY_VOLUMEUP]         /* = USB 128 */ = 0x00E030,
+  [KEY_VOLUMEDOWN]       /* = USB 129 */ = 0x00E02E,
+  [KEY_NEXTSONG]         /* = USB 235 */ = 0x00E019,
+  [KEY_PLAYPAUSE]        /* = USB 232 */ = 0x00E022,
+  [KEY_PREVIOUSSONG]     /* = USB 234 */ = 0x00E010,
+  [KEY_STOPCD]           /* = USB 233 */ = 0x00E024,
 };
 
 const char * linux_to_str[KEY_MAX] =
@@ -265,6 +272,13 @@ const char * linux_to_str[KEY_MAX] =
   [KEY_F14]              = "KEY_F14",
   [KEY_F15]              = "KEY_F15",
   [KEY_PRINT]            = "KEY_PRINT",
+  [KEY_MUTE]             = "KEY_MUTE",
+  [KEY_VOLUMEUP]         = "KEY_VOLUMEUP",
+  [KEY_VOLUMEDOWN]       = "KEY_VOLUMEDOWN",
+  [KEY_NEXTSONG]         = "KEY_NEXTSONG",
+  [KEY_PLAYPAUSE]        = "KEY_PLAYPAUSE",
+  [KEY_PREVIOUSSONG]     = "KEY_PREVIOUSSONG",
+  [KEY_STOPCD]           = "KEY_STOPCD",
 };
 
 const char * linux_to_display[KEY_MAX] =
@@ -388,6 +402,13 @@ const char * linux_to_display[KEY_MAX] =
   [KEY_F14]              = "F14",
   [KEY_F15]              = "F15",
   [KEY_PRINT]            = "Print",
+  [KEY_MUTE]             = "Mute",
+  [KEY_VOLUMEUP]         = "VolumeUp",
+  [KEY_VOLUMEDOWN]       = "VolumeDown",
+  [KEY_NEXTSONG]         = "NextSong",
+  [KEY_PLAYPAUSE]        = "PlayPause",
+  [KEY_PREVIOUSSONG]     = "PreviousSong",
+  [KEY_STOPCD]           = "StopMedia",
 };
 
 void initImGuiKeyMap(int * keymap)
@@ -407,7 +428,7 @@ void initImGuiKeyMap(int * keymap)
   keymap[ImGuiKey_Space      ] = KEY_SPACE;
   keymap[ImGuiKey_Enter      ] = KEY_ENTER;
   keymap[ImGuiKey_Escape     ] = KEY_SPACE;
-  keymap[ImGuiKey_KeyPadEnter] = KEY_KPENTER;
+  keymap[ImGuiKey_KeypadEnter] = KEY_KPENTER;
   keymap[ImGuiKey_A          ] = KEY_A;
   keymap[ImGuiKey_C          ] = KEY_C;
   keymap[ImGuiKey_V          ] = KEY_V;

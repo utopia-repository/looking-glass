@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,12 +24,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include "common/types.h"
-
-#define min(a,b) ({ __typeof__ (a) _a = (a); __typeof__ (b) _b = (b); _a < _b ? _a : _b; })
-#define max(a,b) ({ __typeof__ (a) _a = (a); __typeof__ (b) _b = (b); _a > _b ? _a : _b; })
-
-#define UPCAST(type, x) \
-  (type *)((uintptr_t)(x) - offsetof(type, base))
+#include "common/util.h"
 
 // reads the specified file into a new buffer
 // the callee must free the buffer

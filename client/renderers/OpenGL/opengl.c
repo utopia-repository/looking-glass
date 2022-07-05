@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -36,16 +36,14 @@
 #include "common/framebuffer.h"
 #include "common/locking.h"
 #include "gl_dynprocs.h"
-#include "ll.h"
 #include "util.h"
 
 #define BUFFER_COUNT       2
 
 #define FPS_TEXTURE        0
 #define MOUSE_TEXTURE      1
-#define TEXTURE_COUNT      2
-
-#define FADE_TIME 1000000
+#define SPICE_TEXTURE      2
+#define TEXTURE_COUNT      3
 
 static struct Option opengl_options[] =
 {
@@ -137,16 +135,15 @@ struct Inst
   int               texWIndex, texRIndex;
   int               texList;
   int               mouseList;
+  int               spiceList;
   LG_RendererRect   destRect;
+  struct IntPoint   spiceSize;
+  bool              spiceShow;
 
   bool              hasTextures, hasFrames;
   GLuint            frames[BUFFER_COUNT];
   GLsync            fences[BUFFER_COUNT];
   GLuint            textures[TEXTURE_COUNT];
-
-  bool              waiting;
-  uint64_t          waitFadeTime;
-  bool              waitDone;
 
   LG_Lock           mouseLock;
   LG_RendererCursor mouseCursor;
@@ -175,10 +172,9 @@ enum ConfigStatus
 
 static void deconfigure(struct Inst * this);
 static enum ConfigStatus configure(struct Inst * this);
-static void updateMouseShape(struct Inst * this, bool * newShape);
+static void updateMouseShape(struct Inst * this);
 static bool drawFrame(struct Inst * this);
 static void drawMouse(struct Inst * this);
-static void renderWait(struct Inst * this);
 
 const char * opengl_getName(void)
 {
@@ -208,7 +204,6 @@ bool opengl_create(LG_Renderer ** renderer, const LG_RendererParams params,
   this->opt.preventBuffer = option_get_bool("opengl", "preventBuffer");
   this->opt.amdPinnedMem  = option_get_bool("opengl", "amdPinnedMem" );
 
-
   LG_LOCK_INIT(this->formatLock);
   LG_LOCK_INIT(this->frameLock );
   LG_LOCK_INIT(this->mouseLock );
@@ -219,10 +214,7 @@ bool opengl_create(LG_Renderer ** renderer, const LG_RendererParams params,
 
 bool opengl_initialize(LG_Renderer * renderer)
 {
-  struct Inst * this = UPCAST(struct Inst, renderer);
-
-  this->waiting  = true;
-  this->waitDone = false;
+//  struct Inst * this = UPCAST(struct Inst, renderer);
   return true;
 }
 
@@ -236,6 +228,7 @@ void opengl_deinitialize(LG_Renderer * renderer)
 
     glDeleteLists(this->texList  , BUFFER_COUNT);
     glDeleteLists(this->mouseList, 1);
+    glDeleteLists(this->spiceList, 1);
   }
 
   deconfigure(this);
@@ -264,9 +257,34 @@ void opengl_deinitialize(LG_Renderer * renderer)
 
 void opengl_onRestart(LG_Renderer * renderer)
 {
-  struct Inst * this = UPCAST(struct Inst, renderer);
+//  struct Inst * this = UPCAST(struct Inst, renderer);
+}
 
-  this->waiting = true;
+static void setupModelView(struct Inst * this)
+{
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+
+  if (!this->destRect.valid)
+    return;
+
+  int fw, fh;
+  if (this->spiceShow)
+  {
+    fw = this->spiceSize.x;
+    fh = this->spiceSize.y;
+  }
+  else
+  {
+    fw = this->format.frameWidth;
+    fh = this->format.frameHeight;
+  }
+  glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
+  glScalef(
+    (float)this->destRect.w / (float)fw,
+    (float)this->destRect.h / (float)fh,
+    1.0f
+  );
 }
 
 void opengl_onResize(LG_Renderer * renderer, const int width, const int height, const double scale,
@@ -293,21 +311,9 @@ void opengl_onResize(LG_Renderer * renderer, const int width, const int height, 
   glLoadIdentity();
   glOrtho(0, this->window.x, this->window.y, 0, -1, 1);
 
-  glMatrixMode(GL_MODELVIEW);
-  glLoadIdentity();
-
-  if (this->destRect.valid)
-  {
-    glTranslatef(this->destRect.x, this->destRect.y, 0.0f);
-    glScalef(
-      (float)this->destRect.w / (float)this->format.width,
-      (float)this->destRect.h / (float)this->format.height,
-      1.0f
-    );
-  }
-
   // this is needed to refresh the font atlas texture
   ImGui_ImplOpenGL2_Shutdown();
+  ImGui_ImplOpenGL2_Init();
   ImGui_ImplOpenGL2_NewFrame();
 }
 
@@ -327,7 +333,14 @@ bool opengl_onMouseShape(LG_Renderer * renderer, const LG_RendererCursor cursor,
   {
     if (this->mouseData)
       free(this->mouseData);
-    this->mouseData     = malloc(size);
+
+    this->mouseData = malloc(size);
+    if (!this->mouseData)
+    {
+      DEBUG_ERROR("out of memory");
+      return false;
+    }
+
     this->mouseDataSize = size;
   }
 
@@ -338,7 +351,8 @@ bool opengl_onMouseShape(LG_Renderer * renderer, const LG_RendererCursor cursor,
   return true;
 }
 
-bool opengl_onMouseEvent(LG_Renderer * renderer, const bool visible, const int x, const int y)
+bool opengl_onMouseEvent(LG_Renderer * renderer, const bool visible,
+    int x, int y, const int hx, const int hy)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
 
@@ -372,18 +386,6 @@ bool opengl_onFrame(LG_Renderer * renderer, const FrameBuffer * frame, int dmaFd
   this->frame = frame;
   atomic_store_explicit(&this->frameUpdate, true, memory_order_release);
   LG_UNLOCK(this->frameLock);
-
-  if (this->waiting)
-  {
-    this->waiting = false;
-    if (!this->params.quickSplash)
-      this->waitFadeTime = microtime() + FADE_TIME;
-    else
-    {
-      glDisable(GL_MULTISAMPLE);
-      this->waitDone = true;
-    }
-  }
 
   return true;
 }
@@ -448,6 +450,7 @@ bool opengl_renderStartup(LG_Renderer * renderer, bool useDMA)
   // generate lists for drawing
   this->texList   = glGenLists(BUFFER_COUNT);
   this->mouseList = glGenLists(1);
+  this->spiceList = glGenLists(1);
 
   // create the overlay textures
   glGenTextures(TEXTURE_COUNT, this->textures);
@@ -470,16 +473,12 @@ bool opengl_renderStartup(LG_Renderer * renderer, bool useDMA)
   return true;
 }
 
-static bool opengl_needsRender(LG_Renderer * renderer)
-{
-  struct Inst * this = UPCAST(struct Inst, renderer);
-  return !this->waitDone;
-}
-
 bool opengl_render(LG_Renderer * renderer, LG_RendererRotate rotate, const bool newFrame,
     const bool invalidateWindow, void (*preSwap)(void * udata), void * udata)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
+
+  setupModelView(this);
 
   switch(configure(this))
   {
@@ -496,17 +495,13 @@ bool opengl_render(LG_Renderer * renderer, LG_RendererRotate rotate, const bool 
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT);
 
-  if (this->waiting)
-    renderWait(this);
+  if (this->spiceShow)
+    glCallList(this->spiceList);
   else
   {
-    bool newShape;
-    updateMouseShape(this, &newShape);
+    updateMouseShape(this);
     glCallList(this->texList + this->texRIndex);
     drawMouse(this);
-
-    if (!this->waitDone)
-      renderWait(this);
   }
 
   if (app_renderOverlay(NULL, 0) != 0)
@@ -528,98 +523,154 @@ bool opengl_render(LG_Renderer * renderer, LG_RendererRotate rotate, const bool 
   return true;
 }
 
-void drawTorus(float x, float y, float inner, float outer, unsigned int pts)
+static void * opengl_createTexture(LG_Renderer * renderer,
+  int width, int height, uint8_t * data)
 {
-  glBegin(GL_QUAD_STRIP);
-  for (unsigned int i = 0; i <= pts; ++i)
-  {
-    float angle = (i / (float)pts) * M_PI * 2.0f;
-    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
-    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
-  }
-  glEnd();
+  GLuint tex;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+  glTexImage2D(
+      GL_TEXTURE_2D,
+      0,
+      GL_RGBA,
+      width,
+      height,
+      0,
+      GL_RGBA,
+      GL_UNSIGNED_BYTE,
+      data);
+
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  return (void*)(intptr_t)tex;
 }
 
-void drawTorusArc(float x, float y, float inner, float outer, unsigned int pts, float s, float e)
+static void opengl_freeTexture(LG_Renderer * renderer, void * texture)
 {
-  glBegin(GL_QUAD_STRIP);
-  for (unsigned int i = 0; i <= pts; ++i)
-  {
-    float angle = s + ((i / (float)pts) * e);
-    glVertex2f(x + (inner * cos(angle)), y + (inner * sin(angle)));
-    glVertex2f(x + (outer * cos(angle)), y + (outer * sin(angle)));
-  }
-  glEnd();
+  GLuint tex = (GLuint)(intptr_t)texture;
+  glDeleteTextures(1, &tex);
 }
 
-static void renderWait(struct Inst * this)
+static void opengl_spiceConfigure(LG_Renderer * renderer, int width, int height)
 {
-  float a;
-  if (this->waiting)
-    a = 1.0f;
-  else
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  this->spiceSize.x = width;
+  this->spiceSize.y = height;
+
+  glBindTexture(GL_TEXTURE_2D, this->textures[SPICE_TEXTURE]);
+  glTexImage2D
+  (
+    GL_TEXTURE_2D,
+    0      ,
+    GL_RGBA,
+    width  ,
+    height ,
+    0      ,
+    GL_BGRA,
+    GL_UNSIGNED_BYTE,
+    0
+  );
+
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  // create the display lists
+  glNewList(this->spiceList, GL_COMPILE);
+    glBindTexture(GL_TEXTURE_2D, this->textures[SPICE_TEXTURE]);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glBegin(GL_TRIANGLE_STRIP);
+      glTexCoord2f(0.0f, 0.0f); glVertex2i(0, 0);
+      glTexCoord2f(1.0f, 0.0f); glVertex2i(this->spiceSize.x, 0);
+      glTexCoord2f(0.0f, 1.0f); glVertex2i(0, this->spiceSize.y);
+      glTexCoord2f(1.0f, 1.0f);
+      glVertex2i(this->spiceSize.x, this->spiceSize.y);
+    glEnd();
+    glBindTexture(GL_TEXTURE_2D, 0);
+  glEndList();
+}
+
+static void opengl_spiceDrawFill(LG_Renderer * renderer, int x, int y, int width,
+    int height, uint32_t color)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+
+  /* this is a fairly hacky way to do this, but since it's only for the fallback
+   * spice display it's not really an issue */
+
+  uint32_t line[width];
+  for(int x = 0; x < width; ++x)
+    line[x] = color;
+
+  glBindTexture(GL_TEXTURE_2D, this->textures[SPICE_TEXTURE]);
+  glPixelStorei(GL_UNPACK_ALIGNMENT , 4    );
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+  for(; y < height; ++y)
+    glTexSubImage2D
+    (
+      GL_TEXTURE_2D,
+      0      ,
+      x      ,
+      y      ,
+      width  ,
+      1      ,
+      GL_BGRA,
+      GL_UNSIGNED_BYTE,
+      line
+    );
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+static void opengl_spiceDrawBitmap(LG_Renderer * renderer, int x, int y, int width,
+    int height, int stride, uint8_t * data, bool topDown)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+
+  if (!topDown)
   {
-    uint64_t t = microtime();
-    if (t > this->waitFadeTime)
+    // this is non-optimal but as spice is a fallback it's not too critical
+    uint8_t line[stride];
+    for(int y = 0; y < height / 2; ++y)
     {
-      glDisable(GL_MULTISAMPLE);
-      this->waitDone = true;
-      return;
+      uint8_t * top = data + y                * stride;
+      uint8_t * btm = data + (height - y - 1) * stride;
+      memcpy(line, top , stride);
+      memcpy(top , btm , stride);
+      memcpy(btm , line, stride);
     }
-
-    uint64_t delta = this->waitFadeTime - t;
-    a = 1.0f / FADE_TIME * delta;
   }
 
-  glEnable(GL_BLEND);
-  glPushMatrix();
-  glLoadIdentity();
-  glTranslatef(this->window.x / 2.0f, this->window.y / 2.0f, 0.0f);
+  glBindTexture(GL_TEXTURE_2D, this->textures[SPICE_TEXTURE]);
+  glPixelStorei(GL_UNPACK_ALIGNMENT , 4         );
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+  glTexSubImage2D
+  (
+    GL_TEXTURE_2D,
+    0      ,
+    x      ,
+    y      ,
+    width  ,
+    height ,
+    GL_BGRA,
+    GL_UNSIGNED_BYTE,
+    data
+  );
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
 
-  //draw the background gradient
-  glBegin(GL_TRIANGLE_FAN);
-  glColor4f(0.234375f, 0.015625f, 0.425781f, a);
-  glVertex2f(0, 0);
-  glColor4f(0, 0, 0, a);
-  for (unsigned int i = 0; i <= 100; ++i)
-  {
-    float angle = (i / (float)100) * M_PI * 2.0f;
-    glVertex2f(cos(angle) * this->window.x, sin(angle) * this->window.y);
-  }
-  glEnd();
-
-  // draw the logo
-  glColor4f(1.0f, 1.0f, 1.0f, a);
-  glScalef (2.0f, 2.0f, 1.0f);
-
-  drawTorus   (  0,  0, 40, 42, 60);
-  drawTorus   (  0,  0, 32, 34, 60);
-  drawTorus   (-50, -3,  2,  4, 30);
-  drawTorus   ( 50, -3,  2,  4, 30);
-  drawTorusArc(  0,  0, 51, 49, 60, 0.0f, M_PI);
-
-  glBegin(GL_QUADS);
-    glVertex2f(-1 , 50);
-    glVertex2f(-1 , 76);
-    glVertex2f( 1 , 76);
-    glVertex2f( 1 , 50);
-    glVertex2f(-14, 76);
-    glVertex2f(-14, 78);
-    glVertex2f( 14, 78);
-    glVertex2f( 14, 76);
-    glVertex2f(-21, 83);
-    glVertex2f(-21, 85);
-    glVertex2f( 21, 85);
-    glVertex2f( 21, 83);
-  glEnd();
-
-  drawTorusArc(-14, 83, 5, 7, 10, M_PI       , M_PI / 2.0f);
-  drawTorusArc( 14, 83, 5, 7, 10, M_PI * 1.5f, M_PI / 2.0f);
-
-  //FIXME: draw the diagnoal marks on the circle
-
-  glPopMatrix();
-  glDisable(GL_BLEND);
+static void opengl_spiceShow(LG_Renderer * renderer, bool show)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  this->spiceShow = show;
 }
 
 const LG_RendererOps LGR_OpenGL =
@@ -637,8 +688,14 @@ const LG_RendererOps LGR_OpenGL =
   .onFrameFormat = opengl_onFrameFormat,
   .onFrame       = opengl_onFrame,
   .renderStartup = opengl_renderStartup,
-  .needsRender   = opengl_needsRender,
-  .render        = opengl_render
+  .render        = opengl_render,
+  .createTexture = opengl_createTexture,
+  .freeTexture   = opengl_freeTexture,
+
+  .spiceConfigure  = opengl_spiceConfigure,
+  .spiceDrawFill   = opengl_spiceDrawFill,
+  .spiceDrawBitmap = opengl_spiceDrawBitmap,
+  .spiceShow       = opengl_spiceShow
 };
 
 static bool _checkGLError(unsigned int line, const char * name)
@@ -728,7 +785,7 @@ static enum ConfigStatus configure(struct Inst * this)
   }
 
   // calculate the texture size in bytes
-  this->texSize = this->format.height * this->format.pitch;
+  this->texSize = this->format.frameHeight * this->format.pitch;
   this->texPos  = 0;
 
   g_gl_dynProcs.glGenBuffers(BUFFER_COUNT, this->vboID);
@@ -825,8 +882,8 @@ static enum ConfigStatus configure(struct Inst * this)
       GL_TEXTURE_2D,
       0,
       this->intFormat,
-      this->format.width,
-      this->format.height,
+      this->format.frameWidth,
+      this->format.frameHeight,
       0,
       this->vboFormat,
       this->dataFormat,
@@ -849,10 +906,11 @@ static enum ConfigStatus configure(struct Inst * this)
       glBindTexture(GL_TEXTURE_2D, this->frames[i]);
       glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
       glBegin(GL_TRIANGLE_STRIP);
-        glTexCoord2f(0.0f, 0.0f); glVertex2i(0                 , 0                  );
-        glTexCoord2f(1.0f, 0.0f); glVertex2i(this->format.width, 0                  );
-        glTexCoord2f(0.0f, 1.0f); glVertex2i(0                 , this->format.height);
-        glTexCoord2f(1.0f, 1.0f); glVertex2i(this->format.width, this->format.height);
+        glTexCoord2f(0.0f, 0.0f); glVertex2i(0, 0);
+        glTexCoord2f(1.0f, 0.0f); glVertex2i(this->format.frameWidth, 0);
+        glTexCoord2f(0.0f, 1.0f); glVertex2i(0, this->format.frameHeight);
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex2i(this->format.frameWidth, this->format.frameHeight);
       glEnd();
       glBindTexture(GL_TEXTURE_2D, 0);
     glEndList();
@@ -904,10 +962,9 @@ static void deconfigure(struct Inst * this)
   this->configured = false;
 }
 
-static void updateMouseShape(struct Inst * this, bool * newShape)
+static void updateMouseShape(struct Inst * this)
 {
   LG_LOCK(this->mouseLock);
-  *newShape = this->newShape;
   if (!this->newShape)
   {
     LG_UNLOCK(this->mouseLock);
@@ -1109,14 +1166,14 @@ static bool drawFrame(struct Inst * this)
 
   const int bpp = this->format.bpp / 8;
   glPixelStorei(GL_UNPACK_ALIGNMENT , bpp);
-  glPixelStorei(GL_UNPACK_ROW_LENGTH, this->format.width);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, this->format.frameWidth);
 
   this->texPos = 0;
 
   framebuffer_read_fn(
     this->frame,
-    this->format.height,
-    this->format.width,
+    this->format.frameHeight,
+    this->format.frameWidth,
     bpp,
     this->format.pitch,
     opengl_bufferFn,
@@ -1131,8 +1188,8 @@ static bool drawFrame(struct Inst * this)
     0,
     0,
     0,
-    this->format.width ,
-    this->format.height,
+    this->format.frameWidth ,
+    this->format.frameHeight,
     this->vboFormat,
     this->dataFormat,
     (void*)0
@@ -1140,7 +1197,8 @@ static bool drawFrame(struct Inst * this)
   if (check_gl_error("glTexSubImage2D"))
   {
     DEBUG_ERROR("texWIndex: %u, width: %u, height: %u, vboFormat: %x, texSize: %lu",
-      this->texWIndex, this->format.width, this->format.height, this->vboFormat, this->texSize
+      this->texWIndex, this->format.frameWidth, this->format.frameHeight,
+      this->vboFormat, this->texSize
     );
   }
 
@@ -1148,8 +1206,8 @@ static bool drawFrame(struct Inst * this)
   g_gl_dynProcs.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   const bool mipmap = this->opt.mipmap && (
-    (this->format.width  > this->destRect.w) ||
-    (this->format.height > this->destRect.h));
+    (this->format.frameWidth  > this->destRect.w) ||
+    (this->format.frameHeight > this->destRect.h));
 
   if (mipmap)
   {

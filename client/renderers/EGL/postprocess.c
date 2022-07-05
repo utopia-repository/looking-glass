@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -74,6 +74,12 @@ void egl_postProcessEarlyInit(void)
       .type           = OPTION_TYPE_STRING,
       .value.x_string = ""
     },
+    {
+      .module         = "egl",
+      .name           = "preset",
+      .description    = "The initial filter preset to load",
+      .type           = OPTION_TYPE_STRING
+    },
     { 0 }
   };
   option_register(options);
@@ -81,6 +87,8 @@ void egl_postProcessEarlyInit(void)
   for (int i = 0; i < ARRAY_LENGTH(EGL_Filters); ++i)
     EGL_Filters[i]->earlyInit();
 }
+
+static void loadPreset(struct EGL_PostProcess * this, const char * name);
 
 static void loadPresetList(struct EGL_PostProcess * this)
 {
@@ -114,6 +122,9 @@ static void loadPresetList(struct EGL_PostProcess * this)
   }
 
   struct dirent * entry;
+  const char * preset = option_get_string("egl", "preset");
+  this->activePreset = -1;
+
   while ((entry = readdir(dir)) != NULL)
   {
     if (entry->d_type != DT_REG)
@@ -127,10 +138,21 @@ static void loadPresetList(struct EGL_PostProcess * this)
       goto fail;
     }
     stringlist_push(this->presets, name);
+
+    if (preset && strcmp(preset, name) == 0)
+      this->activePreset = stringlist_count(this->presets) - 1;
   }
   closedir(dir);
 
-  this->activePreset = -1;
+
+  if (preset)
+  {
+    if (this->activePreset > -1)
+      loadPreset(this, preset);
+    else
+      DEBUG_WARN("egl:preset '%s' does not exist", preset);
+  }
+
   return;
 
 fail:
@@ -334,7 +356,8 @@ static bool presetsUI(struct EGL_PostProcess * this)
     for (unsigned i = 0; i < stringlist_count(this->presets); ++i)
     {
       bool selected = i == this->activePreset;
-      if (igSelectableBool(stringlist_at(this->presets, i), selected, 0, (ImVec2) { 0.0f, 0.0f }))
+      if (igSelectable_Bool(stringlist_at(this->presets, i), selected, 0,
+            (ImVec2) { 0.0f, 0.0f }))
       {
         this->activePreset = i;
         redraw = true;
@@ -365,7 +388,7 @@ static bool presetsUI(struct EGL_PostProcess * this)
   if (igButton("Save preset as...", (ImVec2) { 0.0f, 0.0f }))
   {
     this->presetEdit[0] = '\0';
-    igOpenPopup("Save preset as...", ImGuiPopupFlags_None);
+    igOpenPopup_Str("Save preset as...", ImGuiPopupFlags_None);
   }
 
   igSameLine(0.0f, -1.0f);
@@ -401,7 +424,7 @@ static bool presetsUI(struct EGL_PostProcess * this)
   }
 
   if (this->presetError)
-    igOpenPopup("Preset error", ImGuiPopupFlags_None);
+    igOpenPopup_Str("Preset error", ImGuiPopupFlags_None);
 
   if (igBeginPopupModal("Preset error", NULL, ImGuiWindowFlags_AlwaysAutoResize))
   {
@@ -425,7 +448,7 @@ static bool presetsUI(struct EGL_PostProcess * this)
 
 static void drawDropTarget(void)
 {
-  igPushStyleColorVec4(ImGuiCol_Separator, (ImVec4) { 1.0f, 1.0f, 0.0f, 1.0f });
+  igPushStyleColor_Vec4(ImGuiCol_Separator, (ImVec4) { 1.0f, 1.0f, 0.0f, 1.0f });
   igSeparator();
   igPopStyleColor(1);
 }
@@ -456,8 +479,8 @@ static void configUI(void * opaque, int * id)
     if (moving && mouseIdx < moveIdx && i == mouseIdx)
       drawDropTarget();
 
-    igPushIDPtr(filter);
-    bool draw = igCollapsingHeaderBoolPtr(filter->ops.name, NULL, 0);
+    igPushID_Ptr(filter);
+    bool draw = igCollapsingHeader_BoolPtr(filter->ops.name, NULL, 0);
     if (igIsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem))
       mouseIdx = i;
 
@@ -504,7 +527,7 @@ static void configUI(void * opaque, int * id)
   if (redraw)
   {
     atomic_store(&this->modified, true);
-    app_invalidateWindow(false);
+    app_invalidateWindow(true);
   }
 }
 

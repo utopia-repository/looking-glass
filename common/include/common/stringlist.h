@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,5 +31,6 @@ int          stringlist_push  (StringList sl, char * str);
 void         stringlist_remove(StringList sl, unsigned int index);
 unsigned int stringlist_count (StringList sl);
 char *       stringlist_at    (StringList sl, unsigned int index);
+void         stringlist_clear (StringList sl);
 
 #endif

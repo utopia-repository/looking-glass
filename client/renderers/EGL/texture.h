@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -29,7 +29,6 @@
 #include "common/types.h"
 
 #include "util.h"
-#include "ll.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -43,12 +42,23 @@ typedef struct EGL_TexUpdate
   /* the type of this update */
   EGL_TexType type;
 
+  int x, y, width, height;
+
+  //pitch  = row length in pixels
+  //stride = row length in bytes
+  int pitch, stride;
+
   union
   {
-    /* EGL_TEXTURE_BUFFER */
-    const uint8_t * buffer;
+    /* EGL_TEXTYPE_BUFFER */
+    struct
+    {
+      // true if row 0 is the top of the image
+      bool topDown;
+      const uint8_t * buffer;
+    };
 
-    /* EGL_TEXTURE_FRAMEBUFFER */
+    /* EGL_TEXTYPE_FRAMEBUFFER */
     struct
     {
       const FrameBuffer * frame;
@@ -56,7 +66,7 @@ typedef struct EGL_TexUpdate
       int rectCount;
     };
 
-    /* EGL_TEXTURE_DMABUF */
+    /* EGL_TEXTYPE_DMABUF */
     int dmaFD;
   };
 }
@@ -67,7 +77,7 @@ typedef struct EGL_Texture EGL_Texture;
 typedef struct EGL_TextureOps
 {
   /* allocate & initialize an EGL_Texture */
-  bool (*init)(EGL_Texture ** texture, EGLDisplay * display);
+  bool (*init)(EGL_Texture ** texture, EGL_TexType type, EGLDisplay * display);
 
   /* free the EGL_Texture */
   void (*free)(EGL_Texture * texture);
@@ -89,19 +99,25 @@ EGL_TextureOps;
 struct EGL_Texture
 {
   struct EGL_TextureOps ops;
+  EGL_TexType type;
   GLuint sampler;
 
   EGL_TexFormat format;
 };
 
 bool egl_textureInit(EGL_Texture ** texture, EGLDisplay * display,
-    EGL_TexType type, bool streaming);
+    EGL_TexType type);
 void egl_textureFree(EGL_Texture ** tex);
 
 bool egl_textureSetup(EGL_Texture * texture, enum EGL_PixelFormat pixFmt,
     size_t width, size_t height, size_t stride);
 
-bool egl_textureUpdate(EGL_Texture * texture, const uint8_t * buffer);
+bool egl_textureUpdate(EGL_Texture * texture, const uint8_t * buffer,
+    bool topDown);
+
+bool egl_textureUpdateRect(EGL_Texture * texture,
+    int x, int y, int width, int height, int stride,
+    const uint8_t * buffer, bool topDown);
 
 bool egl_textureUpdateFromFrame(EGL_Texture * texture,
     const FrameBuffer * frame, const FrameDamageRect * damageRects,

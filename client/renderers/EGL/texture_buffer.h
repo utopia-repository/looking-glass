@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -33,7 +33,6 @@ typedef struct TextureBuffer
 
   int           texCount;
   GLuint        tex[EGL_TEX_BUFFER_MAX];
-  GLuint        sampler;
   EGL_TexBuffer buf[EGL_TEX_BUFFER_MAX];
   int           bufFree;
   GLsync        sync;
@@ -43,13 +42,15 @@ typedef struct TextureBuffer
 }
 TextureBuffer;
 
-bool egl_texBufferInit(EGL_Texture ** texture_, EGLDisplay * display);
+bool egl_texBufferInit(EGL_Texture ** texture_, EGL_TexType type,
+    EGLDisplay * display);
 void egl_texBufferFree(EGL_Texture * texture_);
 bool egl_texBufferSetup(EGL_Texture * texture_, const EGL_TexSetup * setup);
 EGL_TexStatus egl_texBufferProcess(EGL_Texture * texture_);
 EGL_TexStatus egl_texBufferGet(EGL_Texture * texture_, GLuint * tex);
 
-bool egl_texBufferStreamInit(EGL_Texture ** texture_, EGLDisplay * display);
+bool egl_texBufferStreamInit(EGL_Texture ** texture_, EGL_TexType type,
+    EGLDisplay * display);
 bool egl_texBufferStreamSetup(EGL_Texture * texture_,
     const EGL_TexSetup * setup);
 EGL_TexStatus egl_texBufferStreamProcess(EGL_Texture * texture_);

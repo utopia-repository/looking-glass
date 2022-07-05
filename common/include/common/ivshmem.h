@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -33,7 +33,7 @@ struct IVSHMEM
   void * opaque;
 };
 
-void ivshmemOptionsInit();
+void ivshmemOptionsInit(void);
 bool ivshmemInit(struct IVSHMEM * dev);
 bool ivshmemOpen(struct IVSHMEM * dev);
 bool ivshmemOpenDev(struct IVSHMEM * dev, const char * shmDev);

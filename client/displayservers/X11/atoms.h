@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -28,11 +28,13 @@
   DEF_ATOM(_NET_REQUEST_FRAME_EXTENTS, True) \
   DEF_ATOM(_NET_FRAME_EXTENTS, True) \
   DEF_ATOM(_NET_WM_BYPASS_COMPOSITOR, False) \
+  DEF_ATOM(_NET_WM_ICON, True) \
   DEF_ATOM(_NET_WM_STATE, True) \
   DEF_ATOM(_NET_WM_STATE_FULLSCREEN, True) \
   DEF_ATOM(_NET_WM_STATE_FOCUSED, True) \
   DEF_ATOM(_NET_WM_STATE_MAXIMIZED_HORZ, True) \
   DEF_ATOM(_NET_WM_STATE_MAXIMIZED_VERT, True) \
+  DEF_ATOM(_NET_WM_STATE_DEMANDS_ATTENTION, True) \
   DEF_ATOM(_NET_WM_WINDOW_TYPE, True) \
   DEF_ATOM(_NET_WM_WINDOW_TYPE_NORMAL, True) \
   DEF_ATOM(_NET_WM_WINDOW_TYPE_UTILITY, True) \

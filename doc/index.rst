@@ -10,6 +10,7 @@ systems for legacy programs that require high-performance graphics.
 .. toctree::
    :maxdepth: 2
 
+   usage
    install
    build
    troubleshooting
@@ -40,3 +41,4 @@ Donate:
 * `PayPal <https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=ESQ72XUPGKXRY>`_
 * BTC - 14ZFcYjsKPiVreHqcaekvHGL846u3ZuT13
 * ETH - 0x6f8aEe454384122bF9ed28f025FBCe2Bce98db85
+* XMR - 47xM4zG7b2tEj4mnSywHve4ydZzn3wzhf22snDRB7aSEcXrgUBpoT2Z4phTnyFMi1sMyQtHbdufMYRQ2PzMn3PGUJAE1dpc

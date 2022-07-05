@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -116,6 +116,7 @@ bool ivshmemInit(struct IVSHMEM * dev)
 
   if (GetLastError() != ERROR_NO_MORE_ITEMS)
   {
+    vector_destroy(&devices);
     DEBUG_WINERROR("SetupDiEnumDeviceInfo failed", GetLastError());
     return false;
   }
@@ -130,6 +131,13 @@ bool ivshmemInit(struct IVSHMEM * dev)
     DWORD addr = device->busAddr & 0xFFFFFFFF;
     DEBUG_INFO("IVSHMEM %" PRIuPTR "%c on bus 0x%lx, device 0x%lx, function 0x%lx", i,
       i == shmDevice ? '*' : ' ', bus, addr >> 16, addr & 0xFFFF);
+  }
+
+  if (!device)
+  {
+    vector_destroy(&devices);
+    DEBUG_ERROR("Unable to find a IVSHMEM device");
+    return false;
   }
 
   device = vector_ptrTo(&devices, shmDevice);

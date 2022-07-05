@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -39,18 +39,15 @@
 #include <math.h>
 #include <string.h>
 
-#include "app.h"
 #include "egl_dynprocs.h"
 #include "model.h"
 #include "shader.h"
 #include "damage.h"
 #include "desktop.h"
 #include "cursor.h"
-#include "splash.h"
 #include "postprocess.h"
 #include "util.h"
 
-#define SPLASH_FADE_TIME 1000000
 #define MAX_BUFFER_AGE       3
 #define DESKTOP_DAMAGE_COUNT 4
 #define MAX_ACCUMULATED_DAMAGE ((KVMFR_MAX_DAMAGE_RECTS + MAX_OVERLAY_RECTS + 2) * MAX_BUFFER_AGE)
@@ -78,15 +75,11 @@ struct Inst
 
   EGL_Desktop     * desktop; // the desktop
   EGL_Cursor      * cursor;  // the mouse cursor
-  EGL_Splash      * splash;  // the splash screen
   EGL_Damage      * damage;  // the damage display
   bool              imgui;   // if imgui was initialized
 
   LG_RendererFormat    format;
   bool                 formatValid;
-  bool                 start;
-  uint64_t             waitFadeTime;
-  bool                 waitDone;
 
   int               width, height;
   float             uiScale;
@@ -103,9 +96,11 @@ struct Inst
 
   bool  cursorVisible;
   int   cursorX    , cursorY;
+  int   cursorHX   , cursorHY;
   float mouseWidth , mouseHeight;
   float mouseScaleX, mouseScaleY;
   bool  showDamage;
+  bool  scalePointer;
 
   struct CursorState cursorLast;
 
@@ -122,6 +117,8 @@ struct Inst
 
   RingBuffer importTimings;
   GraphHandle importGraph;
+
+  bool showSpice;
 };
 
 static struct Option egl_options[] =
@@ -197,6 +194,13 @@ static struct Option egl_options[] =
     .type         = OPTION_TYPE_BOOL,
     .value.x_bool = false
   },
+  {
+    .module       = "egl",
+    .name         = "scalePointer",
+    .description  = "Keep the pointer size 1:1 when downscaling",
+    .type         = OPTION_TYPE_BOOL,
+    .value.x_bool = true
+  },
 
   {0}
 };
@@ -249,7 +253,8 @@ static bool egl_create(LG_Renderer ** renderer, const LG_RendererParams params,
   this->desktopDamage[0].count = -1;
 
   this->importTimings = ringbuffer_new(256, sizeof(float));
-  this->importGraph   = app_registerGraph("IMPORT", this->importTimings, 0.0f, 5.0f);
+  this->importGraph   = app_registerGraph("IMPORT", this->importTimings,
+      0.0f, 5.0f, NULL);
 
   *needsOpenGL = false;
   return true;
@@ -269,12 +274,10 @@ static void egl_deinitialize(LG_Renderer * renderer)
   if (this->imgui)
     ImGui_ImplOpenGL3_Shutdown();
 
-  app_unregisterGraph(this->importGraph);
   ringbuffer_free(&this->importTimings);
 
   egl_desktopFree(&this->desktop);
   egl_cursorFree (&this->cursor);
-  egl_splashFree (&this->splash);
   egl_damageFree (&this->damage);
 
   LG_LOCK_FREE(this->lock);
@@ -313,7 +316,6 @@ static void egl_onRestart(LG_Renderer * renderer)
 
   eglDestroyContext(this->display, this->frameContext);
   this->frameContext = NULL;
-  this->start        = false;
 
   INTERLOCKED_SECTION(this->desktopDamageLock, {
     this->desktopDamage[this->desktopDamageIdx].count = -1;
@@ -331,18 +333,18 @@ static void egl_calc_mouse_size(struct Inst * this)
   {
     case LG_ROTATE_0:
     case LG_ROTATE_180:
-      this->mouseScaleX = 2.0f / this->format.width;
-      this->mouseScaleY = 2.0f / this->format.height;
-      w = this->format.width;
-      h = this->format.height;
+      this->mouseScaleX = 2.0f / this->format.screenWidth;
+      this->mouseScaleY = 2.0f / this->format.screenHeight;
+      w = this->format.screenWidth;
+      h = this->format.screenHeight;
       break;
 
     case LG_ROTATE_90:
     case LG_ROTATE_270:
-      this->mouseScaleX = 2.0f / this->format.height;
-      this->mouseScaleY = 2.0f / this->format.width;
-      w = this->format.height;
-      h = this->format.width;
+      this->mouseScaleX = 2.0f / this->format.screenHeight;
+      this->mouseScaleY = 2.0f / this->format.screenWidth;
+      w = this->format.screenHeight;
+      h = this->format.screenWidth;
       break;
 
     default:
@@ -381,8 +383,10 @@ static void egl_calc_mouse_state(struct Inst * this)
       egl_cursorSetState(
         this->cursor,
         this->cursorVisible,
-        (((float)this->cursorX * this->mouseScaleX) - 1.0f) * this->scaleX,
-        (((float)this->cursorY * this->mouseScaleY) - 1.0f) * this->scaleY
+        (((float)this->cursorX  * this->mouseScaleX) - 1.0f) * this->scaleX,
+        (((float)this->cursorY  * this->mouseScaleY) - 1.0f) * this->scaleY,
+        ((float)this->cursorHX * this->mouseScaleX) * this->scaleX,
+        ((float)this->cursorHY * this->mouseScaleY) * this->scaleY
       );
       break;
 
@@ -391,8 +395,10 @@ static void egl_calc_mouse_state(struct Inst * this)
       egl_cursorSetState(
         this->cursor,
         this->cursorVisible,
-        (((float)this->cursorX * this->mouseScaleX) - 1.0f) * this->scaleY,
-        (((float)this->cursorY * this->mouseScaleY) - 1.0f) * this->scaleX
+        (((float)this->cursorX  * this->mouseScaleX) - 1.0f) * this->scaleY,
+        (((float)this->cursorY  * this->mouseScaleY) - 1.0f) * this->scaleX,
+        ((float)this->cursorHX * this->mouseScaleX) * this->scaleY,
+        ((float)this->cursorHY * this->mouseScaleY) * this->scaleX
       );
       break;
   }
@@ -406,14 +412,14 @@ static void egl_update_scale_type(struct Inst * this)
   {
     case LG_ROTATE_0:
     case LG_ROTATE_180:
-      width  = this->format.width;
-      height = this->format.height;
+      width  = this->format.frameWidth;
+      height = this->format.frameHeight;
       break;
 
     case LG_ROTATE_90:
     case LG_ROTATE_270:
-      width  = this->format.height;
-      height = this->format.width;
+      width  = this->format.frameHeight;
+      height = this->format.frameWidth;
       break;
   }
 
@@ -465,6 +471,16 @@ static void egl_onResize(LG_Renderer * renderer, const int width, const int heig
   this->screenScaleY = 1.0f / this->height;
 
   egl_calc_mouse_state(this);
+  if (this->scalePointer)
+  {
+    float scale = max(1.0f,
+        this->formatValid ?
+        max(
+          (float)this->format.screenWidth  / this->width,
+          (float)this->format.screenHeight / this->height)
+        : 1.0f);
+    egl_cursorSetScale(this->cursor, scale);
+  }
 
   INTERLOCKED_SECTION(this->desktopDamageLock, {
     this->desktopDamage[this->desktopDamageIdx].count = -1;
@@ -472,6 +488,7 @@ static void egl_onResize(LG_Renderer * renderer, const int width, const int heig
 
   // this is needed to refresh the font atlas texture
   ImGui_ImplOpenGL3_Shutdown();
+  ImGui_ImplOpenGL3_Init("#version 300 es");
   ImGui_ImplOpenGL3_NewFrame();
 
   egl_damageResize(this->damage, this->translateX, this->translateY, this->scaleX, this->scaleY);
@@ -497,12 +514,15 @@ static bool egl_onMouseShape(LG_Renderer * renderer, const LG_RendererCursor cur
   return true;
 }
 
-static bool egl_onMouseEvent(LG_Renderer * renderer, const bool visible, const int x, const int y)
+static bool egl_onMouseEvent(LG_Renderer * renderer, const bool visible,
+    int x, int y, const int hx, const int hy)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
   this->cursorVisible = visible;
-  this->cursorX       = x;
-  this->cursorY       = y;
+  this->cursorX       = x + hx;
+  this->cursorY       = y + hy;
+  this->cursorHX      = hx;
+  this->cursorHY      = hy;
   egl_calc_mouse_state(this);
   return true;
 }
@@ -534,8 +554,14 @@ static bool egl_onFrameFormat(LG_Renderer * renderer, const LG_RendererFormat fo
     }
   }
 
+  if (this->scalePointer)
+  {
+    float scale = max(1.0f, (float)format.screenWidth / this->width);
+    egl_cursorSetScale(this->cursor, scale);
+  }
+
   egl_update_scale_type(this);
-  egl_damageSetup(this->damage, format.width, format.height);
+  egl_damageSetup(this->damage, format.frameWidth, format.frameHeight);
 
   /* we need full screen damage when the format changes */
   INTERLOCKED_SECTION(this->desktopDamageLock, {
@@ -557,8 +583,6 @@ static bool egl_onFrame(LG_Renderer * renderer, const FrameBuffer * frame, int d
     return false;
   }
   ringbuffer_push(this->importTimings, &(float){ (nanotime() - start) * 1e-6f });
-
-  this->start = true;
 
   INTERLOCKED_SECTION(this->desktopDamageLock, {
     struct DesktopDamage * damage = this->desktopDamage + this->desktopDamageIdx;
@@ -736,7 +760,13 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
   }
 
   const char * client_exts = eglQueryString(this->display, EGL_EXTENSIONS);
-  bool debugContext = option_get_bool("egl", "debug");
+  if (!client_exts)
+  {
+    DEBUG_ERROR("Failed to query EGL_EXTENSIONS");
+    return false;
+  }
+
+  bool debug = option_get_bool("egl", "debug");
   EGLint ctxattr[5];
   int ctxidx = 0;
 
@@ -746,17 +776,17 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
   if (maj > 1 || (maj == 1 && min >= 5))
   {
     ctxattr[ctxidx++] = EGL_CONTEXT_OPENGL_DEBUG;
-    ctxattr[ctxidx++] = debugContext ? EGL_TRUE : EGL_FALSE;
+    ctxattr[ctxidx++] = debug ? EGL_TRUE : EGL_FALSE;
   }
   else if (util_hasGLExt(client_exts, "EGL_KHR_create_context"))
   {
     ctxattr[ctxidx++] = EGL_CONTEXT_FLAGS_KHR;
-    ctxattr[ctxidx++] = debugContext ? EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR : 0;
+    ctxattr[ctxidx++] = debug ? EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR : 0;
   }
-  else if (debugContext)
+  else if (debug)
     DEBUG_WARN("Cannot create debug contexts before EGL 1.5 without EGL_KHR_create_context");
 
-  ctxattr[ctxidx++] = EGL_NONE;
+  ctxattr[ctxidx] = EGL_NONE;
 
   this->context = eglCreateContext(this->display, this->configs, EGL_NO_CONTEXT, ctxattr);
   if (this->context == EGL_NO_CONTEXT)
@@ -784,15 +814,30 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
 
   eglMakeCurrent(this->display, this->surface, this->surface, this->context);
   const char * gl_exts = (const char *)glGetString(GL_EXTENSIONS);
+  if (!gl_exts)
+  {
+    DEBUG_ERROR("Failed to query GL_EXTENSIONS");
+    return false;
+  }
+
   const char * vendor  = (const char *)glGetString(GL_VENDOR);
+  if (!vendor)
+  {
+    DEBUG_ERROR("Failed to query GL_VENDOR");
+    return false;
+  }
 
   DEBUG_INFO("EGL     : %d.%d", maj, min);
   DEBUG_INFO("Vendor  : %s", vendor);
   DEBUG_INFO("Renderer: %s", glGetString(GL_RENDERER));
   DEBUG_INFO("Version : %s", glGetString(GL_VERSION ));
   DEBUG_INFO("EGL APIs: %s", eglQueryString(this->display, EGL_CLIENT_APIS));
-  DEBUG_INFO("EGL Exts: %s", client_exts);
-  DEBUG_INFO("GL Exts : %s", gl_exts);
+
+  if (debug)
+  {
+    DEBUG_INFO("EGL Exts: %s", client_exts);
+    DEBUG_INFO("GL Exts : %s", gl_exts);
+  }
 
   GLint esMaj, esMin;
   glGetIntegerv(GL_MAJOR_VERSION, &esMaj);
@@ -818,6 +863,8 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
   if (this->noSwapDamage)
     DEBUG_WARN("egl:noSwapDamage specified, disabling swap buffers with damage.");
 
+  this->scalePointer = option_get_bool("egl", "scalePointer");
+
   if (!g_egl_dynProcs.glEGLImageTargetTexture2DOES)
     DEBUG_INFO("glEGLImageTargetTexture2DOES unavilable, DMA support disabled");
   else if (!g_egl_dynProcs.eglCreateImage || !g_egl_dynProcs.eglDestroyImage)
@@ -839,7 +886,7 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
     }
   }
 
-  if (debugContext)
+  if (debug)
   {
     if ((esMaj > 3 || (esMaj == 3 && esMin >= 2)) && g_egl_dynProcs.glDebugMessageCallback)
     {
@@ -871,12 +918,6 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
     return false;
   }
 
-  if (!egl_splashInit(&this->splash))
-  {
-    DEBUG_ERROR("Failed to initialize the splash screen");
-    return false;
-  }
-
   if (!egl_damageInit(&this->damage))
   {
     DEBUG_ERROR("Failed to initialize the damage display");
@@ -893,12 +934,6 @@ static bool egl_renderStartup(LG_Renderer * renderer, bool useDMA)
 
   this->imgui = true;
   return true;
-}
-
-static bool egl_needsRender(LG_Renderer * renderer)
-{
-  struct Inst * this = UPCAST(struct Inst, renderer);
-  return !this->waitDone;
 }
 
 inline static EGLint egl_bufferAge(struct Inst * this)
@@ -955,8 +990,9 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
   EGLint bufferAge   = egl_bufferAge(this);
-  bool renderAll     = invalidateWindow || !this->start || this->hadOverlay ||
-                       bufferAge <= 0 || bufferAge > MAX_BUFFER_AGE;
+  bool renderAll     = invalidateWindow || this->hadOverlay ||
+                       bufferAge <= 0 || bufferAge > MAX_BUFFER_AGE ||
+                       this->showSpice;
 
   bool hasOverlay = false;
   struct CursorState cursorState = { .visible = false };
@@ -989,8 +1025,8 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
           int y = rect->y > 0 ? rect->y - 1 : 0;
           accumulated->rects[accumulated->count++] = (struct FrameDamageRect) {
             .x = x, .y = y,
-            .width  = min(this->format.width  - x, rect->width  + 2),
-            .height = min(this->format.height - y, rect->height + 2),
+            .width  = min(this->format.frameWidth  - x, rect->width  + 2),
+            .height = min(this->format.frameHeight - y, rect->height + 2),
           };
         }
       }
@@ -1003,7 +1039,8 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   if (!renderAll)
   {
     double matrix[6];
-    egl_screenToDesktopMatrix(matrix, this->format.width, this->format.height,
+    egl_screenToDesktopMatrix(matrix,
+        this->format.frameWidth, this->format.frameHeight,
         this->translateX, this->translateY, this->scaleX, this->scaleY, rotate,
         this->width, this->height);
 
@@ -1022,7 +1059,7 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
       for (int j = 0; j < count; ++j)
         accumulated->count += egl_screenToDesktop(
           accumulated->rects + accumulated->count, matrix, damage + j,
-          this->format.width, this->format.height
+          this->format.frameWidth, this->format.frameHeight
         );
     }
 
@@ -1030,7 +1067,7 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   }
   ++this->overlayHistoryIdx;
 
-  if (this->start && this->destRect.w > 0 && this->destRect.h > 0)
+  if (this->destRect.w > 0 && this->destRect.h > 0)
   {
     if (egl_desktopRender(this->desktop,
         this->destRect.w, this->destRect.h,
@@ -1038,52 +1075,16 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
         this->scaleX    , this->scaleY    ,
         this->scaleType , rotate, renderAll ? NULL : accumulated))
     {
-      if (!this->waitFadeTime)
-      {
-        if (!this->params.quickSplash)
-          this->waitFadeTime = microtime() + SPLASH_FADE_TIME;
-        else
-          this->waitDone = true;
-      }
-
-      cursorState = egl_cursorRender(this->cursor,
-          (this->format.rotate + rotate) % LG_ROTATE_MAX,
-          this->width, this->height);
+      if (!this->showSpice)
+        cursorState = egl_cursorRender(this->cursor,
+            (this->format.rotate + rotate) % LG_ROTATE_MAX,
+            this->width, this->height);
     }
     else
       hasOverlay = true;
   }
 
   renderLetterBox(this);
-
-  if (!this->waitDone)
-  {
-    float a = 1.0f;
-    if (!this->waitFadeTime)
-      a = 1.0f;
-    else
-    {
-      uint64_t t = microtime();
-      if (t > this->waitFadeTime)
-        this->waitDone = true;
-      else
-      {
-        uint64_t delta = this->waitFadeTime - t;
-        a = 1.0f / SPLASH_FADE_TIME * delta;
-      }
-    }
-
-    if (!this->waitDone)
-    {
-      egl_splashRender(this->splash, a, this->splashRatio);
-      hasOverlay = true;
-    }
-  }
-  else if (!this->start)
-  {
-    egl_splashRender(this->splash, 1.0f, this->splashRatio);
-    hasOverlay = true;
-  }
 
   hasOverlay |= egl_damageRender(this->damage, rotate, newFrame ? desktopDamage : NULL);
   hasOverlay |= invalidateWindow;
@@ -1130,7 +1131,8 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
     else
     {
       double matrix[6];
-      egl_desktopToScreenMatrix(matrix, this->format.width, this->format.height,
+      egl_desktopToScreenMatrix(matrix,
+          this->format.frameWidth, this->format.frameHeight,
           this->translateX, this->translateY, this->scaleX, this->scaleY, rotate,
           this->width, this->height);
 
@@ -1149,6 +1151,69 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
   return true;
 }
 
+static void * egl_createTexture(LG_Renderer * renderer,
+  int width, int height, uint8_t * data)
+{
+  GLuint tex;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, width);
+  glTexImage2D(
+      GL_TEXTURE_2D,
+      0,
+      GL_RGBA,
+      width,
+      height,
+      0,
+      GL_RGBA,
+      GL_UNSIGNED_BYTE,
+      data);
+
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  return (void*)(intptr_t)tex;
+}
+
+static void egl_freeTexture(LG_Renderer * renderer, void * texture)
+{
+  GLuint tex = (GLuint)(intptr_t)texture;
+  glDeleteTextures(1, &tex);
+}
+
+static void egl_spiceConfigure(LG_Renderer * renderer, int width, int height)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  egl_desktopSpiceConfigure(this->desktop, width, height);
+}
+
+static void egl_spiceDrawFill(LG_Renderer * renderer, int x, int y, int width,
+    int height, uint32_t color)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  egl_desktopSpiceDrawFill(this->desktop, x, y, width, height, color);
+}
+
+static void egl_spiceDrawBitmap(LG_Renderer * renderer, int x, int y, int width,
+    int height, int stride, uint8_t * data, bool topDown)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  egl_desktopSpiceDrawBitmap(this->desktop, x, y, width, height, stride,
+      data, topDown);
+}
+
+static void egl_spiceShow(LG_Renderer * renderer, bool show)
+{
+  struct Inst * this = UPCAST(struct Inst, renderer);
+  this->showSpice = show;
+  egl_desktopSpiceShow(this->desktop, show);
+}
+
 struct LG_RendererOps LGR_EGL =
 {
   .getName       = egl_getName,
@@ -1164,6 +1229,12 @@ struct LG_RendererOps LGR_EGL =
   .onFrameFormat = egl_onFrameFormat,
   .onFrame       = egl_onFrame,
   .renderStartup = egl_renderStartup,
-  .needsRender   = egl_needsRender,
-  .render        = egl_render
+  .render        = egl_render,
+  .createTexture = egl_createTexture,
+  .freeTexture   = egl_freeTexture,
+
+  .spiceConfigure  = egl_spiceConfigure,
+  .spiceDrawFill   = egl_spiceDrawFill,
+  .spiceDrawBitmap = egl_spiceDrawBitmap,
+  .spiceShow       = egl_spiceShow
 };

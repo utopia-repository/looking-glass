@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -50,23 +50,26 @@
 #include "common/version.h"
 #include "common/paths.h"
 #include "common/cpuinfo.h"
+#include "common/ll.h"
 
 #include "core.h"
 #include "app.h"
+#include "audio.h"
 #include "keybind.h"
 #include "clipboard.h"
 #include "kb.h"
-#include "ll.h"
 #include "egl_dynprocs.h"
 #include "gl_dynprocs.h"
 #include "overlays.h"
 #include "overlay_utils.h"
 #include "util.h"
+#include "render_queue.h"
 
 // forwards
 static int renderThread(void * unused);
 
 static LGEvent  *e_startup = NULL;
+static LGEvent  *e_spice   = NULL;
 static LGThread *t_spice   = NULL;
 static LGThread *t_render  = NULL;
 
@@ -78,10 +81,10 @@ struct AppParams g_params = { 0 };
 
 static void lgInit(void)
 {
-  g_state.state         = APP_STATE_RUNNING;
   g_state.formatValid   = false;
   g_state.resizeDone    = true;
 
+  core_setCursorInView(false);
   if (g_cursor.grab)
     core_setGrab(false);
 
@@ -138,6 +141,27 @@ static bool fpsTimerFn(void * unused)
   return true;
 }
 
+static bool tickTimerFn(void * unused)
+{
+  static unsigned long long tickCount = 0;
+
+  bool needsRender = false;
+  struct Overlay * overlay;
+  ll_lock(g_state.overlays);
+  ll_forEachNL(g_state.overlays, item, overlay)
+  {
+    if (overlay->ops->tick && overlay->ops->tick(overlay->udata, tickCount))
+      needsRender = true;
+  }
+  ll_unlock(g_state.overlays);
+
+  if (needsRender)
+    app_invalidateWindow(false);
+
+  ++tickCount;
+  return true;
+}
+
 static void preSwapCallback(void * udata)
 {
   const uint64_t * renderStart = (const uint64_t *)udata;
@@ -168,6 +192,15 @@ static int renderThread(void * unused)
     return 1;
   }
 
+  app_initOverlays();
+  LGTimer * tickTimer;
+  if (!lgCreateTimer(1000 / TICK_RATE, tickTimerFn, NULL, &tickTimer))
+  {
+    lgTimerDestroy(fpsTimer);
+    DEBUG_ERROR("Failed to create the tick timer");
+    return 1;
+  }
+
   LG_LOCK_INIT(g_state.lgrLock);
 
   /* signal to other threads that the renderer is ready */
@@ -190,8 +223,7 @@ static int renderThread(void * unused)
       if (!lgResetEvent(g_state.frameEvent)
           && !forceRender
           && !pending
-          && !app_overlayNeedsRender()
-          && !RENDERER(needsRender))
+          && !app_overlayNeedsRender())
       {
         if (g_state.ds->skipFrame)
           g_state.ds->skipFrame();
@@ -209,7 +241,7 @@ static int renderThread(void * unused)
       {
         /* only update the time if we woke up early */
         clock_gettime(CLOCK_MONOTONIC, &time);
-        tsAdd(&time, g_state.overlayInput ?
+        tsAdd(&time, app_isOverlayMode() ?
             g_state.overlayFrameTime : g_state.frameTime);
       }
     }
@@ -229,9 +261,9 @@ static int renderThread(void * unused)
 
       ImFontAtlas_Clear(g_state.io->Fonts);
       ImFontAtlas_AddFontFromFileTTF(g_state.io->Fonts, g_state.fontName,
-        g_params.uiSize * g_state.windowScale, NULL, NULL);
+        g_params.uiSize * g_state.windowScale, NULL, g_state.fontRange.Data);
       g_state.fontLarge = ImFontAtlas_AddFontFromFileTTF(g_state.io->Fonts,
-        g_state.fontName, 1.3f * g_params.uiSize * g_state.windowScale, NULL, NULL);
+        g_state.fontName, 1.3f * g_params.uiSize * g_state.windowScale, NULL, g_state.fontRange.Data);
       if (!ImFontAtlas_Build(g_state.io->Fonts))
         DEBUG_FATAL("Failed to build font atlas: %s (%s)", g_params.uiFont, g_state.fontName);
 
@@ -251,6 +283,9 @@ static int renderThread(void * unused)
 
     const uint64_t renderStart = nanotime();
     LG_LOCK(g_state.lgrLock);
+
+    renderQueue_process();
+
     if (!RENDERER(render, g_params.winRotate, newFrame, invalidate,
           preSwapCallback, (void *)&renderStart))
     {
@@ -288,6 +323,14 @@ static int renderThread(void * unused)
 
   g_state.state = APP_STATE_SHUTDOWN;
 
+  if (g_state.overlays)
+  {
+    app_freeOverlays();
+    ll_free(g_state.overlays);
+    g_state.overlays = NULL;
+  }
+
+  lgTimerDestroy(tickTimer);
   lgTimerDestroy(fpsTimer);
 
   core_stopCursorThread();
@@ -341,7 +384,9 @@ int main_cursorThread(void * unused)
           RENDERER(onMouseEvent,
             g_cursor.guest.visible && (g_cursor.draw || !g_params.useSpiceInput),
             g_cursor.guest.x,
-            g_cursor.guest.y
+            g_cursor.guest.y,
+            g_cursor.guest.hx,
+            g_cursor.guest.hy
           );
 
           if (!g_state.stopVideo)
@@ -378,7 +423,11 @@ int main_cursorThread(void * unused)
       break;
     }
 
-    if (cursor && msg.size > cursorSize)
+    KVMFRCursor * tmp = (KVMFRCursor *)msg.mem;
+    const int neededSize = sizeof(*tmp) +
+      (msg.udata & CURSOR_FLAG_SHAPE ? tmp->height * tmp->pitch : 0);
+
+    if (cursor && neededSize > cursorSize)
     {
       free(cursor);
       cursor = NULL;
@@ -387,17 +436,17 @@ int main_cursorThread(void * unused)
     /* copy and release the message ASAP */
     if (!cursor)
     {
-      cursor = malloc(msg.size);
+      cursor = malloc(neededSize);
       if (!cursor)
       {
-        DEBUG_ERROR("failed to allocate %d bytes for cursor", msg.size);
+        DEBUG_ERROR("failed to allocate %d bytes for cursor", neededSize);
         g_state.state = APP_STATE_SHUTDOWN;
         break;
       }
-      cursorSize = msg.size;
+      cursorSize = neededSize;
     }
 
-    memcpy(cursor, msg.mem, msg.size);
+    memcpy(cursor, msg.mem, neededSize);
     lgmpClientMessageDone(g_state.pointerQueue);
 
     g_cursor.guest.visible =
@@ -412,7 +461,6 @@ int main_cursorThread(void * unused)
         case CURSOR_TYPE_MASKED_COLOR: cursorType = LG_CURSOR_MASKED_COLOR; break;
         default:
           DEBUG_ERROR("Invalid cursor type");
-          lgmpClientMessageDone(g_state.pointerQueue);
           continue;
       }
 
@@ -456,15 +504,18 @@ int main_cursorThread(void * unused)
     RENDERER(onMouseEvent,
       g_cursor.guest.visible && (g_cursor.draw || !g_params.useSpiceInput),
       g_cursor.guest.x,
-      g_cursor.guest.y
+      g_cursor.guest.y,
+      g_cursor.guest.hx,
+      g_cursor.guest.hy
     );
 
     if (g_params.mouseRedraw && g_cursor.guest.visible && !g_state.stopVideo)
       lgSignalEvent(g_state.frameEvent);
   }
 
+  LG_LOCK(g_state.pointerQueueLock);
   lgmpClientUnsubscribe(&g_state.pointerQueue);
-
+  LG_UNLOCK(g_state.pointerQueueLock);
 
   if (cursor)
   {
@@ -517,6 +568,8 @@ int main_frameThread(void * unused)
     g_state.state = APP_STATE_SHUTDOWN;
     break;
   }
+
+  g_state.ds->requestActivation();
 
   while(g_state.state == APP_STATE_RUNNING && !g_state.stopVideo)
   {
@@ -571,16 +624,18 @@ int main_frameThread(void * unused)
     if (!g_state.formatValid || frame->formatVer != formatVer)
     {
       // setup the renderer format with the frame format details
-      lgrFormat.type   = frame->type;
-      lgrFormat.width  = frame->width;
-      lgrFormat.height = frame->height;
-      lgrFormat.stride = frame->stride;
-      lgrFormat.pitch  = frame->pitch;
+      lgrFormat.type         = frame->type;
+      lgrFormat.screenWidth  = frame->screenWidth;
+      lgrFormat.screenHeight = frame->screenHeight;
+      lgrFormat.frameWidth   = frame->frameWidth;
+      lgrFormat.frameHeight  = frame->frameHeight;
+      lgrFormat.stride       = frame->stride;
+      lgrFormat.pitch        = frame->pitch;
 
-      if (frame->height != frame->realHeight)
+      if (frame->flags & FRAME_FLAG_TRUNCATED)
       {
         const float needed =
-          ((frame->realHeight * frame->pitch * 2) / 1048576.0f) + 10.0f;
+          ((frame->screenHeight * frame->pitch * 2) / 1048576.0f) + 10.0f;
         const int   size   = (int)powf(2.0f, ceilf(logf(needed) / logf(2.0f)));
 
         DEBUG_BREAK();
@@ -588,9 +643,10 @@ int main_frameThread(void * unused)
         DEBUG_WARN("Recommend increase size to %d MiB", size);
         DEBUG_BREAK();
 
-        app_alert(LG_ALERT_ERROR,
-          "IVSHMEM too small, screen truncated\n"
-          "Recommend increasing size to %d MiB",
+        app_msgBox(
+          "IVSHMEM too small",
+          "IVSHMEM too small\n"
+          "Please increase the size to %d MiB",
           size);
       }
 
@@ -600,6 +656,11 @@ int main_frameThread(void * unused)
         case FRAME_ROT_90 : lgrFormat.rotate = LG_ROTATE_90 ; break;
         case FRAME_ROT_180: lgrFormat.rotate = LG_ROTATE_180; break;
         case FRAME_ROT_270: lgrFormat.rotate = LG_ROTATE_270; break;
+
+        default:
+          DEBUG_ERROR("Unsupported/invalid frame rotation");
+          lgrFormat.rotate = LG_ROTATE_0;
+          break;
       }
       g_state.rotate = lgrFormat.rotate;
 
@@ -609,12 +670,12 @@ int main_frameThread(void * unused)
         case FRAME_TYPE_RGBA:
         case FRAME_TYPE_BGRA:
         case FRAME_TYPE_RGBA10:
-          dataSize       = lgrFormat.height * lgrFormat.pitch;
+          dataSize       = lgrFormat.frameHeight * lgrFormat.pitch;
           lgrFormat.bpp  = 32;
           break;
 
         case FRAME_TYPE_RGBA16F:
-          dataSize       = lgrFormat.height * lgrFormat.pitch;
+          dataSize       = lgrFormat.frameHeight * lgrFormat.pitch;
           lgrFormat.bpp  = 64;
           break;
 
@@ -636,7 +697,7 @@ int main_frameThread(void * unused)
 
       DEBUG_INFO("Format: %s %ux%u stride:%u pitch:%u rotation:%d",
           FrameTypeStr[frame->type],
-          frame->width, frame->height,
+          frame->frameWidth, frame->frameHeight,
           frame->stride, frame->pitch,
           frame->rotation);
 
@@ -650,11 +711,11 @@ int main_frameThread(void * unused)
       }
       LG_UNLOCK(g_state.lgrLock);
 
-      g_state.srcSize.x = lgrFormat.width;
-      g_state.srcSize.y = lgrFormat.height;
+      g_state.srcSize.x = lgrFormat.screenWidth;
+      g_state.srcSize.y = lgrFormat.screenHeight;
       g_state.haveSrcSize = true;
       if (g_params.autoResize)
-        g_state.ds->setWindowSize(lgrFormat.width, lgrFormat.height);
+        g_state.ds->setWindowSize(lgrFormat.frameWidth, lgrFormat.frameHeight);
 
       core_updatePositionInfo();
     }
@@ -694,7 +755,7 @@ int main_frameThread(void * unused)
       if (dma->fd == -1)
       {
         const uintptr_t pos    = (uintptr_t)msg.mem - (uintptr_t)g_state.shm.mem;
-        const uintptr_t offset = (uintptr_t)frame->offset + FrameBufferStructSize;
+        const uintptr_t offset = (uintptr_t)frame->offset + sizeof(FrameBuffer);
 
         dma->dataSize = dataSize;
         dma->fd       = ivshmemGetDMABuf(&g_state.shm, pos + offset, dataSize);
@@ -717,13 +778,19 @@ int main_frameThread(void * unused)
       break;
     }
 
-    if (g_params.autoScreensaver && g_state.autoIdleInhibitState != frame->blockScreensaver)
+    overlaySplash_show(false);
+
+    if (frame->flags & FRAME_FLAG_REQUEST_ACTIVATION)
+      g_state.ds->requestActivation();
+
+    const bool blockScreensaver = frame->flags & FRAME_FLAG_BLOCK_SCREENSAVER;
+    if (g_params.autoScreensaver && g_state.autoIdleInhibitState != blockScreensaver)
     {
-      if (frame->blockScreensaver)
+      if (blockScreensaver)
         g_state.ds->inhibitIdle();
       else
         g_state.ds->uninhibitIdle();
-      g_state.autoIdleInhibitState = frame->blockScreensaver;
+      g_state.autoIdleInhibitState = blockScreensaver;
     }
 
     const uint64_t t      = nanotime();
@@ -745,10 +812,20 @@ int main_frameThread(void * unused)
       lgSignalEvent(g_state.frameEvent);
 
     lgmpClientMessageDone(queue);
+
+    // switch over to the LG stream
+    app_useSpiceDisplay(false);
   }
 
   lgmpClientUnsubscribe(&queue);
+
   RENDERER(onRestart);
+
+  if (g_state.state != APP_STATE_SHUTDOWN)
+  {
+    if (!app_useSpiceDisplay(true))
+      overlaySplash_show(true);
+  }
 
   if (g_state.useDMA)
   {
@@ -757,24 +834,198 @@ int main_frameThread(void * unused)
         close(dmaInfo[i].fd);
   }
 
-
   return 0;
+}
+
+static void checkUUID(void)
+{
+  if (!g_state.spiceReady || !g_state.guestUUIDValid)
+    return;
+
+  if (memcmp(g_state.spiceUUID, g_state.guestUUID,
+        sizeof(g_state.spiceUUID)) == 0)
+    return;
+
+  app_msgBox(
+      "SPICE Configuration Error",
+      "You have connected SPICE to the wrong guest.\n"
+      "Input will not function until this is corrected.");
+
+  g_params.useSpiceInput = false;
+  g_state.spiceClose = true;
+  purespice_disconnect();
+}
+
+void spiceReady(void)
+{
+  g_state.spiceReady = true;
+  if (g_state.initialSpiceDisplay)
+    app_useSpiceDisplay(true);
+
+  // set the intial mouse mode
+  purespice_mouseMode(true);
+
+  PSServerInfo info;
+  if (!purespice_getServerInfo(&info))
+    return;
+
+  bool uuidValid = false;
+  for(int i = 0; i < sizeof(info.uuid); ++i)
+    if (info.uuid[i])
+    {
+      uuidValid = true;
+      break;
+    }
+
+  if (uuidValid)
+  {
+    memcpy(g_state.spiceUUID, info.uuid, sizeof(g_state.spiceUUID));
+    checkUUID();
+  }
+  purespice_freeServerInfo(&info);
+
+  if (g_params.useSpiceInput)
+    keybind_spiceRegister();
+
+  lgSignalEvent(e_spice);
+}
+
+static void spice_surfaceCreate(unsigned int surfaceId, PSSurfaceFormat format,
+    unsigned int width, unsigned int height)
+{
+  DEBUG_INFO("Create SPICE surface: id: %d, size: %dx%d",
+      surfaceId, width, height);
+
+  g_state.srcSize.x   = width;
+  g_state.srcSize.y   = height;
+  g_state.haveSrcSize = true;
+  core_updatePositionInfo();
+
+  renderQueue_spiceConfigure(width, height);
+  renderQueue_spiceDrawFill(0, 0, width, height, 0x0);
+}
+
+static void spice_surfaceDestroy(unsigned int surfaceId)
+{
+  DEBUG_INFO("Destroy spice surface %d", surfaceId);
+  app_useSpiceDisplay(false);
+}
+
+static void spice_drawFill(unsigned int surfaceId, int x, int y, int width,
+    int height, uint32_t color)
+{
+  renderQueue_spiceDrawFill(x, y, width, height, color);
+}
+
+static void spice_drawBitmap(unsigned int surfaceId, PSBitmapFormat format,
+    bool topDown, int x, int y, int width, int height, int stride, void * data)
+{
+  renderQueue_spiceDrawBitmap(x, y, width, height, stride, data, topDown);
 }
 
 int spiceThread(void * arg)
 {
-  while(g_state.state != APP_STATE_SHUTDOWN)
-    if (!spice_process(100))
-    {
-      if (g_state.state != APP_STATE_SHUTDOWN)
-      {
-        g_state.state = APP_STATE_SHUTDOWN;
-        DEBUG_ERROR("failed to process spice messages");
-      }
-      break;
-    }
+  if (g_params.useSpiceAudio)
+    audio_init();
 
-  g_state.state = APP_STATE_SHUTDOWN;
+  const struct PSConfig config =
+  {
+    .host      = g_params.spiceHost,
+    .port      = g_params.spicePort,
+    .password  = "",
+    .ready     = spiceReady,
+    .inputs    =
+    {
+      .enable      = g_params.useSpiceInput,
+      .autoConnect = true
+    },
+    .clipboard =
+    {
+      .enable  = g_params.useSpiceClipboard,
+      .notice  = cb_spiceNotice,
+      .data    = cb_spiceData,
+      .release = cb_spiceRelease,
+      .request = cb_spiceRequest
+    },
+    .display  =
+    {
+      .enable         = true,
+      .autoConnect    = false,
+      .surfaceCreate  = spice_surfaceCreate,
+      .surfaceDestroy = spice_surfaceDestroy,
+      .drawFill       = spice_drawFill,
+      .drawBitmap     = spice_drawBitmap
+    },
+#if ENABLE_AUDIO
+    .playback =
+    {
+      .enable      = audio_supportsPlayback(),
+      .autoConnect = true,
+      .start       = audio_playbackStart,
+      .volume      = audio_playbackVolume,
+      .mute        = audio_playbackMute,
+      .stop        = audio_playbackStop,
+      .data        = audio_playbackData
+    },
+    .record =
+    {
+      .enable      = audio_supportsRecord(),
+      .autoConnect = true,
+      .start       = audio_recordStart,
+      .volume      = audio_recordVolume,
+      .mute        = audio_recordMute,
+      .stop        = audio_recordStop
+    }
+#endif
+  };
+
+  /* use the spice display until we get frames from the LG host application
+   * it is safe to call this before connect as it will be delayed until
+   * spiceReady is called */
+  app_useSpiceDisplay(true);
+
+  if (!purespice_connect(&config))
+  {
+    DEBUG_ERROR("Failed to connect to spice server");
+    lgSignalEvent(e_spice);
+    goto end;
+  }
+
+  // process all spice messages
+  while(g_state.state != APP_STATE_SHUTDOWN)
+  {
+    PSStatus status;
+    if ((status = purespice_process(100)) != PS_STATUS_RUN)
+    {
+      if (status != PS_STATUS_SHUTDOWN)
+        DEBUG_ERROR("failed to process spice messages");
+      goto end;
+    }
+  }
+
+  // send key up events for any pressed keys
+  if (g_params.useSpiceInput)
+  {
+    for(int scancode = 0; scancode < KEY_MAX; ++scancode)
+      if (g_state.keyDown[scancode])
+      {
+        g_state.keyDown[scancode] = false;
+        purespice_keyUp(scancode);
+      }
+  }
+
+  purespice_disconnect();
+
+end:
+
+  audio_free();
+
+  // if the connection was disconnected intentionally we don't want to shutdown
+  // so that the user can see the message box and take action
+  if (!g_state.spiceClose)
+    g_state.state = APP_STATE_SHUTDOWN;
+
+  lgSignalEvent(e_spice);
   return 0;
 }
 
@@ -834,12 +1085,25 @@ static bool tryRenderer(const int index, const LG_RendererParams lgrParams,
   return true;
 }
 
-static void reportBadVersion()
+static void reportBadVersion(void)
 {
   DEBUG_BREAK();
   DEBUG_ERROR("The host application is not compatible with this client");
   DEBUG_ERROR("This is not a Looking Glass error, do not report this");
   DEBUG_ERROR("Please install the matching host application for this client");
+}
+
+static MsgBoxHandle showSpiceInputHelp(void)
+{
+  static bool done = false;
+  if (!g_params.useSpiceInput || done)
+    return NULL;
+
+  done = true;
+  return app_msgBox(
+    "Information",
+    "Please note you can still control your guest\n"
+    "through SPICE if you press the capture key.");
 }
 
 static int lg_run(void)
@@ -866,17 +1130,29 @@ static int lg_run(void)
     DEBUG_INFO("Using font: %s", g_state.fontName);
   }
 
-  app_initOverlays();
+  ImVector_ImWchar_Init(&g_state.fontRange);
+  ImFontGlyphRangesBuilder * rangeBuilder =
+    ImFontGlyphRangesBuilder_ImFontGlyphRangesBuilder();
+  ImFontGlyphRangesBuilder_AddRanges(rangeBuilder, (ImWchar[]) {
+    0x0020, 0x00FF, // Basic Latin + Latin Supplement
+    0x2190, 0x2193, // four directional arrows
+    0,
+  });
+  ImFontGlyphRangesBuilder_BuildRanges(rangeBuilder, &g_state.fontRange);
+  ImFontGlyphRangesBuilder_destroy(rangeBuilder);
 
   // initialize metrics ringbuffers
   g_state.renderTimings  = ringbuffer_new(256, sizeof(float));
   g_state.uploadTimings  = ringbuffer_new(256, sizeof(float));
   g_state.renderDuration = ringbuffer_new(256, sizeof(float));
-  overlayGraph_register("FRAME" , g_state.renderTimings , 0.0f, 50.0f);
-  overlayGraph_register("UPLOAD", g_state.uploadTimings , 0.0f, 50.0f);
-  overlayGraph_register("RENDER", g_state.renderDuration, 0.0f, 10.0f);
+  overlayGraph_register("FRAME" , g_state.renderTimings , 0.0f, 50.0f, NULL);
+  overlayGraph_register("UPLOAD", g_state.uploadTimings , 0.0f, 50.0f, NULL);
+  overlayGraph_register("RENDER", g_state.renderDuration, 0.0f, 10.0f, NULL);
 
   initImGuiKeyMap(g_state.io->KeyMap);
+
+  // unknown guest OS at this time
+  g_state.guestOS = KVMFR_OS_OTHER;
 
   // search for the best displayserver ops to use
   for(int i = 0; i < LG_DISPLAYSERVER_COUNT; ++i)
@@ -916,40 +1192,58 @@ static int lg_run(void)
     return -1;
   }
 
-  // try to connect to the spice server
-  if (g_params.useSpiceInput || g_params.useSpiceClipboard)
+  // setup the spice startup condition
+  if (!(e_spice = lgCreateEvent(false, 0)))
   {
-    if (g_params.useSpiceClipboard)
-      spice_set_clipboard_cb(
-          cb_spiceNotice,
-          cb_spiceData,
-          cb_spiceRelease,
-          cb_spiceRequest);
+    DEBUG_ERROR("failed to create the spice startup event");
+    return -1;
+  }
 
-    if (!spice_connect(g_params.spiceHost, g_params.spicePort, ""))
+  // setup the startup condition
+  if (!(e_startup = lgCreateEvent(false, 0)))
+  {
+    DEBUG_ERROR("failed to create the startup event");
+    return -1;
+  }
+
+  // setup the new frame event
+  if (!(g_state.frameEvent = lgCreateEvent(!g_state.jitRender, 0)))
+  {
+    DEBUG_ERROR("failed to create the frame event");
+    return -1;
+  }
+
+  //setup the render command queue
+  renderQueue_init();
+
+  const PSInit psInit =
+  {
+    .log =
     {
-      DEBUG_ERROR("Failed to connect to spice server");
-      return -1;
+      .info  = debug_info,
+      .warn  = debug_warn,
+      .error = debug_error,
     }
+  };
+  purespice_init(&psInit);
 
-    while(g_state.state != APP_STATE_SHUTDOWN && !spice_ready())
-      if (!spice_process(1000))
-      {
-        g_state.state = APP_STATE_SHUTDOWN;
-        DEBUG_ERROR("Failed to process spice messages");
-        return -1;
-      }
-
-    spice_mouse_mode(true);
+  if (g_params.useSpiceInput     ||
+      g_params.useSpiceClipboard ||
+      g_params.useSpiceAudio)
+  {
     if (!lgCreateThread("spiceThread", spiceThread, NULL, &t_spice))
     {
       DEBUG_ERROR("spice create thread failed");
       return -1;
     }
+
+    lgWaitEvent(e_spice, TIMEOUT_INFINITE);
+    if (!g_state.spiceReady)
+      return -1;
   }
 
   // select and init a renderer
-  bool needsOpenGL;
+  bool needsOpenGL = false;
   LG_RendererParams lgrParams;
   lgrParams.quickSplash = g_params.quickSplash;
 
@@ -974,7 +1268,7 @@ static int lg_run(void)
 
   if (!g_state.lgr)
   {
-    DEBUG_INFO("Unable to find a suitable renderer");
+    DEBUG_ERROR("Unable to find a suitable renderer");
     return -1;
   }
 
@@ -1033,21 +1327,7 @@ static int lg_run(void)
   // interactivity.
   g_state.overlayFrameTime = min(g_state.frameTime, 1000000000ULL / 60ULL);
 
-  keybind_register();
-
-  // setup the startup condition
-  if (!(e_startup = lgCreateEvent(false, 0)))
-  {
-    DEBUG_ERROR("failed to create the startup event");
-    return -1;
-  }
-
-  // setup the new frame event
-  if (!(g_state.frameEvent = lgCreateEvent(!g_state.jitRender, 0)))
-  {
-    DEBUG_ERROR("failed to create the frame event");
-    return -1;
-  }
+  keybind_commonRegister();
 
   if (g_state.jitRender)
     DEBUG_INFO("Using JIT render mode");
@@ -1092,99 +1372,258 @@ static int lg_run(void)
   KVMFR *udata;
   int waitCount = 0;
 
+  MsgBoxHandle msgs[10];
+  int msgsCount;
+
 restart:
+  msgsCount = 0;
+  memset(msgs, 0, sizeof(msgs));
+
   while(g_state.state == APP_STATE_RUNNING)
   {
-    if ((status = lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata)) == LGMP_OK)
-      break;
-
-    if (status == LGMP_ERR_INVALID_VERSION)
+    status = lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata);
+    switch(status)
     {
+      case LGMP_OK:
+        break;
+
+      case LGMP_ERR_INVALID_VERSION:
+      {
+        reportBadVersion();
+        msgs[msgsCount++] = app_msgBox(
+          "Incompatible LGMP Version",
+          "The host application is not compatible with this client.\n"
+          "Please download and install the matching version."
+        );
+
+        DEBUG_INFO("Waiting for you to upgrade the host application");
+        while (g_state.state == APP_STATE_RUNNING &&
+            lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata) != LGMP_OK)
+          g_state.ds->wait(1000);
+
+        if (g_state.state != APP_STATE_RUNNING)
+          return -1;
+
+        continue;
+      }
+
+      case LGMP_ERR_INVALID_SESSION:
+      case LGMP_ERR_INVALID_MAGIC:
+      {
+        if (waitCount++ == 0)
+        {
+          DEBUG_BREAK();
+          DEBUG_INFO("The host application seems to not be running");
+          DEBUG_INFO("Waiting for the host application to start...");
+        }
+
+        if (waitCount == 30)
+        {
+          DEBUG_BREAK();
+          msgs[msgsCount++] = app_msgBox(
+              "Host Application Not Running",
+              "It seems the host application is not running or your\n"
+              "virtual machine is still starting up\n"
+              "\n"
+              "If the the VM is running and booted please check the\n"
+              "host application log for errors. You can find the\n"
+              "log through the shortcut in your start menu\n"
+              "\n"
+              "Continuing to wait...");
+
+          msgs[msgsCount++] = showSpiceInputHelp();
+
+          DEBUG_INFO("Check the host log in your guest at %%ProgramData%%\\Looking Glass (host)\\looking-glass-host.txt");
+          DEBUG_INFO("Continuing to wait...");
+        }
+
+        g_state.ds->wait(1000);
+        continue;
+      }
+
+      default:
+        DEBUG_ERROR("lgmpClientSessionInit Failed: %s", lgmpStatusString(status));
+        return -1;
+    }
+
+    if (g_state.state != APP_STATE_RUNNING)
+      return -1;
+
+    // dont show warnings again after the first successful startup
+    waitCount = 100;
+
+    const bool magicMatches = memcmp(udata->magic, KVMFR_MAGIC, sizeof(udata->magic)) == 0;
+    if (udataSize < sizeof(*udata) || !magicMatches || udata->version != KVMFR_VERSION)
+    {
+      static bool alertsDone = false;
+      if (alertsDone)
+      {
+        if(g_state.state == APP_STATE_RUNNING)
+          g_state.ds->wait(1000);
+        continue;
+      }
+
       reportBadVersion();
+      if (magicMatches)
+      {
+        msgs[msgsCount++] = app_msgBox(
+          "Incompatible KVMFR Version",
+          "The host application is not compatible with this client.\n"
+          "Please download and install the matching version.\n"
+          "\n"
+          "Client Version: %s\n"
+          "Host Version: %s",
+          BUILD_VERSION,
+          udata->version >= 2 ? udata->hostver : NULL
+        );
+
+        DEBUG_ERROR("Expected KVMFR version %d, got %d", KVMFR_VERSION, udata->version);
+        DEBUG_ERROR("Client version: %s", BUILD_VERSION);
+        if (udata->version >= 2)
+          DEBUG_ERROR("  Host version: %s", udata->hostver);
+      }
+      else
+        DEBUG_ERROR("Invalid KVMFR magic");
+
+      DEBUG_BREAK();
+
+      msgs[msgsCount++] = showSpiceInputHelp();
+
       DEBUG_INFO("Waiting for you to upgrade the host application");
-      while (g_state.state == APP_STATE_RUNNING &&
-          lgmpClientSessionInit(g_state.lgmp, &udataSize, (uint8_t **)&udata) != LGMP_OK)
+
+      alertsDone = true;
+      if(g_state.state == APP_STATE_RUNNING)
         g_state.ds->wait(1000);
 
-      if (g_state.state != APP_STATE_RUNNING)
-        return -1;
-
-      break;
+      continue;
     }
 
-    if (status != LGMP_ERR_INVALID_SESSION && status != LGMP_ERR_INVALID_MAGIC)
-    {
-      DEBUG_ERROR("lgmpClientSessionInit Failed: %s", lgmpStatusString(status));
-      return -1;
-    }
-
-    if (waitCount++ == 0)
-    {
-      DEBUG_BREAK();
-      DEBUG_INFO("The host application seems to not be running");
-      DEBUG_INFO("Waiting for the host application to start...");
-    }
-
-    if (waitCount == 30)
-    {
-      DEBUG_BREAK();
-      DEBUG_INFO("Please check the host application is running and is the correct version");
-      DEBUG_INFO("Check the host log in your guest at %%ProgramData%%\\Looking Glass (host)\\looking-glass-host.txt");
-      DEBUG_INFO("Continuing to wait...");
-    }
-
-    g_state.ds->wait(1000);
+    break;
   }
 
-  if (g_state.state != APP_STATE_RUNNING)
+  if(g_state.state != APP_STATE_RUNNING)
     return -1;
 
-  // dont show warnings again after the first startup
-  waitCount = 100;
+  /* close any informational message boxes from above as we now connected
+   * successfully */
 
-  const bool magicMatches = memcmp(udata->magic, KVMFR_MAGIC, sizeof(udata->magic)) == 0;
-  if (udataSize != sizeof(KVMFR) || !magicMatches || udata->version != KVMFR_VERSION)
+  for(int i = 0; i < msgsCount; ++i)
+    if (msgs[i])
+      app_msgBoxClose(msgs[i]);
+
+  DEBUG_INFO("Guest Information:");
+  DEBUG_INFO("Version  : %s", udata->hostver);
+
+  /* parse the kvmfr records from the userdata */
+  udataSize -= sizeof(*udata);
+  uint8_t * p = (uint8_t *)(udata + 1);
+  while(udataSize >= sizeof(KVMFRRecord))
   {
-    reportBadVersion();
-    if (magicMatches)
+    KVMFRRecord * record = (KVMFRRecord *)p;
+    p         += sizeof(*record);
+    udataSize -= sizeof(*record);
+    if (record->size > udataSize)
     {
-      DEBUG_ERROR("Expected KVMFR version %d, got %d", KVMFR_VERSION, udata->version);
-      DEBUG_ERROR("Client version: %s", BUILD_VERSION);
-      if (udata->version >= 2)
-        DEBUG_ERROR("  Host version: %s", udata->hostver);
+      DEBUG_WARN("KVMFRecord size is invalid, aborting parsing.");
+      break;
     }
-    else
-      DEBUG_ERROR("Invalid KVMFR magic");
 
-    DEBUG_BREAK();
-
-    if (magicMatches)
+    switch(record->type)
     {
-      DEBUG_INFO("Waiting for you to upgrade the host application");
-      while (g_state.state == APP_STATE_RUNNING && udata->version != KVMFR_VERSION)
-        g_state.ds->wait(1000);
+      case KVMFR_RECORD_VMINFO:
+      {
+        KVMFRRecord_VMInfo * vmInfo = (KVMFRRecord_VMInfo *)p;
+        DEBUG_INFO("UUID     : "
+          "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+          vmInfo->uuid[ 0], vmInfo->uuid[ 1], vmInfo->uuid[ 2],
+          vmInfo->uuid[ 3], vmInfo->uuid[ 4], vmInfo->uuid[ 5],
+          vmInfo->uuid[ 6], vmInfo->uuid[ 7], vmInfo->uuid[ 8],
+          vmInfo->uuid[ 9], vmInfo->uuid[10], vmInfo->uuid[11],
+          vmInfo->uuid[12], vmInfo->uuid[13], vmInfo->uuid[14],
+          vmInfo->uuid[15]);
 
-      if (g_state.state != APP_STATE_RUNNING)
-        return -1;
+        DEBUG_INFO("CPU Model: %s", vmInfo->model);
+        DEBUG_INFO("CPU      : %u sockets, %u cores, %u threads",
+            vmInfo->sockets, vmInfo->cores, vmInfo->cpus);
+        DEBUG_INFO("Using    : %s", vmInfo->capture);
 
-      goto restart;
+        bool uuidValid = false;
+        for(int i = 0; i < sizeof(vmInfo->uuid); ++i)
+         if (vmInfo->uuid[i])
+         {
+           uuidValid = true;
+           break;
+         }
+
+        if (!uuidValid)
+          break;
+
+        memcpy(g_state.guestUUID, vmInfo->uuid, sizeof(g_state.guestUUID));
+        g_state.guestUUIDValid = true;
+        break;
+      }
+
+      case KVMFR_RECORD_OSINFO:
+      {
+        KVMFRRecord_OSInfo * osInfo = (KVMFRRecord_OSInfo *)p;
+        static const char * typeStr[] =
+        {
+          "Linux",
+          "BSD",
+          "OSX",
+          "Windows",
+          "Other"
+        };
+
+        const char * type;
+        if (osInfo->os >= ARRAY_LENGTH(typeStr))
+          type = "Unknown";
+        else
+          type = typeStr[osInfo->os];
+
+        DEBUG_INFO("OS       : %s", type);
+        if (osInfo->name[0])
+          DEBUG_INFO("OS Name  : %s", osInfo->name);
+
+        g_state.guestOS = osInfo->os;
+
+        if (g_state.spiceReady && g_params.useSpiceInput)
+          keybind_spiceRegister();
+        break;
+      }
+
+      default:
+        DEBUG_WARN("Unhandled KVMFRecord type: %d", record->type);
+        break;
     }
-    else
-      return -1;
+
+    p         += record->size;
+    udataSize -= record->size;
   }
 
-  DEBUG_INFO("Host ready, reported version: %s", udata->hostver);
-  DEBUG_INFO("Starting session");
+  checkUUID();
+
+  if (g_state.state == APP_STATE_RUNNING)
+  {
+    DEBUG_INFO("Starting session");
+    g_state.lgHostConnected = true;
+  }
 
   g_state.kvmfrFeatures = udata->features;
 
+  LG_LOCK_INIT(g_state.pointerQueueLock);
   if (!core_startCursorThread() || !core_startFrameThread())
+  {
+    LG_LOCK_FREE(g_state.pointerQueueLock);
     return -1;
+  }
 
   while(g_state.state == APP_STATE_RUNNING)
   {
     if (!lgmpClientSessionValid(g_state.lgmp))
     {
+      g_state.lgHostConnected = false;
+      DEBUG_INFO("Waiting for the host to restart...");
       g_state.state = APP_STATE_RESTART;
       break;
     }
@@ -1199,20 +1638,22 @@ restart:
     core_stopFrameThread();
     core_stopCursorThread();
 
+    g_state.state = APP_STATE_RUNNING;
     lgInit();
-
-    RENDERER(onRestart);
-
-    DEBUG_INFO("Waiting for the host to restart...");
     goto restart;
   }
 
+  LG_LOCK_FREE(g_state.pointerQueueLock);
   return 0;
 }
 
 static void lg_shutdown(void)
 {
   g_state.state = APP_STATE_SHUTDOWN;
+
+  if (t_spice)
+    lgJoinThread(t_spice, NULL);
+
   if (t_render)
   {
     if (g_state.jitRender && g_state.ds->stopWaitFrame)
@@ -1236,19 +1677,10 @@ static void lg_shutdown(void)
     e_startup = NULL;
   }
 
-  // if spice is still connected send key up events for any pressed keys
-  if (g_params.useSpiceInput && spice_ready())
+  if (e_spice)
   {
-    for(int scancode = 0; scancode < KEY_MAX; ++scancode)
-      if (g_state.keyDown[scancode])
-      {
-        g_state.keyDown[scancode] = false;
-        spice_key_up(scancode);
-      }
-
-    spice_disconnect();
-    if (t_spice)
-      lgJoinThread(t_spice, NULL);
+    lgFreeEvent(e_spice);
+    e_startup = NULL;
   }
 
   if (g_state.ds)
@@ -1261,18 +1693,14 @@ static void lg_shutdown(void)
   }
 
   app_releaseAllKeybinds();
+  ll_free(g_state.bindings);
 
   if (g_state.dsInitialized)
     g_state.ds->free();
 
-  if (g_state.overlays)
-  {
-    app_freeOverlays();
-    ll_free(g_state.overlays);
-    g_state.overlays = NULL;
-  }
-
   ivshmemClose(&g_state.shm);
+
+  renderQueue_free();
 
   // free metrics ringbuffers
   ringbuffer_free(&g_state.renderTimings);
@@ -1280,6 +1708,7 @@ static void lg_shutdown(void)
   ringbuffer_free(&g_state.renderDuration);
 
   free(g_state.fontName);
+  ImVector_ImWchar_UnInit(&g_state.fontRange);
   igDestroyContext(NULL);
   free(g_state.imGuiIni);
 }
@@ -1314,12 +1743,17 @@ int main(int argc, char * argv[])
   egl_dynProcsInit();
   gl_dynProcsInit();
 
+  g_state.bindings = ll_new();
+
   g_state.overlays = ll_new();
+  app_registerOverlay(&LGOverlaySplash, NULL);
   app_registerOverlay(&LGOverlayConfig, NULL);
   app_registerOverlay(&LGOverlayAlert , NULL);
   app_registerOverlay(&LGOverlayFPS   , NULL);
   app_registerOverlay(&LGOverlayGraphs, NULL);
   app_registerOverlay(&LGOverlayHelp  , NULL);
+  app_registerOverlay(&LGOverlayMsg   , NULL);
+  app_registerOverlay(&LGOverlayStatus, NULL);
 
   // early renderer setup for option registration
   for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)

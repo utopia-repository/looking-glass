@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,6 +20,7 @@
 
 #include "common/stringlist.h"
 #include "common/vector.h"
+#include "common/debug.h"
 
 #include <stdlib.h>
 
@@ -32,6 +33,12 @@ struct StringList
 StringList stringlist_new(bool owns_strings)
 {
   StringList sl = malloc(sizeof(*sl));
+  if (!sl)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
+
   sl->owns_strings = owns_strings;
 
   if (!vector_create(&sl->vector, sizeof(char *), 32))
@@ -44,12 +51,7 @@ StringList stringlist_new(bool owns_strings)
 
 void stringlist_free(StringList * sl)
 {
-  if ((*sl)->owns_strings)
-  {
-    char * ptr;
-    vector_forEach(ptr, &(*sl)->vector)
-      free(ptr);
-  }
+  stringlist_clear(*sl);
 
   vector_destroy(&(*sl)->vector);
   free((*sl));
@@ -81,4 +83,16 @@ char * stringlist_at(StringList sl, unsigned int index)
   char * ptr;
   vector_at(&sl->vector, index, &ptr);
   return ptr;
+}
+
+void stringlist_clear(StringList sl)
+{
+  if (sl->owns_strings)
+  {
+    char * ptr;
+    vector_forEach(ptr, &sl->vector)
+      free(ptr);
+  }
+
+  vector_clear(&sl->vector);
 }

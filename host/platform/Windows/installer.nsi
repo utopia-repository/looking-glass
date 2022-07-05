@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ Unicode true
 RequestExecutionLevel admin
 ShowInstDetails "show"
 ShowUninstDetails "show"
+ManifestDPIAware true
 
 !ifndef BUILD_32BIT
 Target AMD64-Unicode
@@ -97,8 +98,13 @@ Function .onInit
   StrCpy $option_desktop       0
   StrCpy $option_noservice     0
 
+!ifdef IVSHMEM
+  Var /GlOBAL option_driver
+  StrCpy $option_driver        0
+!endif
+
   Push $R0
-    
+
   ${GetOptions} $cmdLineParams '/startmenu' $R0
   IfErrors +2 0
   StrCpy $option_startMenu 1
@@ -110,6 +116,12 @@ Function .onInit
   ${GetOptions} $cmdLineParams '/noservice' $R0
   IfErrors +2 0
   StrCpy $option_noservice 1
+
+!ifdef IVSHMEM
+  ${GetOptions} $cmdLineParams '/driver' $R0
+  IfErrors +2 0
+  StrCpy $option_driver 1
+!endif
 
   Pop $R0
 
@@ -129,6 +141,26 @@ FunctionEnd
 !macroend
 
 ;Install 
+!ifdef IVSHMEM
+Section "IVSHMEM Driver" Section0
+  StrCpy $option_driver 1
+SectionEnd
+
+Section "-IVSHMEM Driver"
+  ${If} $option_driver == 1
+    DetailPrint "Extracting IVSHMEM driver"
+    SetOutPath $INSTDIR
+    File ..\..\ivshmem\ivshmem.cat
+    File ..\..\ivshmem\ivshmem.inf
+    File ..\..\ivshmem\ivshmem.sys
+    File /nonfatal ..\..\ivshmem\ivshmem.pdb
+
+    DetailPrint "Installing IVSHMEM driver"
+    nsExec::ExecToLog '"$SYSDIR\pnputil.exe" /add-driver "$INSTDIR\ivshmem.inf" /install'
+  ${EndIf}
+SectionEnd
+!endif
+
 Section "-Install" Section1
 
   !insertmacro StopLookingGlassService
@@ -184,7 +216,7 @@ SectionEnd
 
 Section "-Hidden Start Menu" Section5
   SetShellVarContext all
-  
+
   ${If} $option_startMenu == 1
     CreateDirectory "$APPDATA\Looking Glass (host)"
     CreateDirectory "$SMPROGRAMS\Looking Glass (host)"
@@ -195,7 +227,6 @@ Section "-Hidden Start Menu" Section5
   ${If} $option_desktop == 1
     CreateShortCut "$DESKTOP\Looking Glass (host).lnk" $INSTDIR\looking-glass-host.exe
   ${EndIf}
-  
 SectionEnd
 
 Section "Uninstall" Section6
@@ -211,18 +242,27 @@ Section "Uninstall" Section6
   Delete "$DESKTOP\Looking Glass (host).lnk"
   Delete "$INSTDIR\uninstaller.exe"
   Delete "$INSTDIR\looking-glass-host.exe"
+  Delete "$INSTDIR\looking-glass-host.pdb"
+  Delete "$INSTDIR\ivshmem.cat"
+  Delete "$INSTDIR\ivshmem.inf"
+  Delete "$INSTDIR\ivshmem.sys"
+  Delete "$INSTDIR\ivshmem.pdb"
   Delete "$INSTDIR\LICENSE.txt"
 
   RMDir $INSTDIR
 SectionEnd
 
 ;Description text for selection of install items
+LangString DESC_Section0 ${LANG_ENGLISH} "Install the IVSHMEM driver. This driver is needed for Looking Glass to function. This will replace the driver if it is already installed."
 LangString DESC_Section1 ${LANG_ENGLISH} "Install Files into $INSTDIR"
 LangString DESC_Section2 ${LANG_ENGLISH} "Install service to automatically start Looking Glass (host)."
 LangString DESC_Section3 ${LANG_ENGLISH} "Create desktop shortcut icon."
 LangString DESC_Section4 ${LANG_ENGLISH} "Create start menu shortcut."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+!ifdef IVSHMEM
+  !insertmacro MUI_DESCRIPTION_TEXT ${Section0} $(DESC_Section0)
+!endif
   !insertmacro MUI_DESCRIPTION_TEXT ${Section1} $(DESC_Section1)
   !insertmacro MUI_DESCRIPTION_TEXT ${Section2} $(DESC_Section2)
   !insertmacro MUI_DESCRIPTION_TEXT ${Section3} $(DESC_Section3)

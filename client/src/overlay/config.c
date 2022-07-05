@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,7 +21,6 @@
 #include "interface/overlay.h"
 #include "cimgui.h"
 #include "overlay_utils.h"
-#include "ll.h"
 
 #include "../main.h"
 #include "../overlays.h"
@@ -47,16 +46,14 @@ OverlayConfig;
 
 static OverlayConfig cfg = { 0 };
 
-static bool config_init(void ** udata, const void * params)
+static void config_earlyInit(void)
 {
   cfg.callbacks    = ll_new();
   cfg.tabCallbacks = ll_new();
-  if (!cfg.callbacks)
-  {
-    DEBUG_ERROR("failed to allocate ram");
-    return false;
-  }
+}
 
+static bool config_init(void ** udata, const void * params)
+{
   return true;
 }
 
@@ -78,17 +75,22 @@ static void config_renderLGTab(void)
 {
   const float fontSize = igGetFontSize();
 
-  if (igCollapsingHeaderBoolPtr("About", NULL,
+  if (igCollapsingHeader_BoolPtr("Donations", NULL,
         ImGuiTreeNodeFlags_DefaultOpen))
   {
-    igText(LG_COPYRIGHT_STR);
-    overlayTextURL(LG_WEBSITE_STR, NULL);
-    igText(LG_VERSION_STR);
-    igSeparator();
-    igTextWrapped(LG_LICENSE_STR);
+    igTextWrapped(LG_DONATION_STR);
+
+    igBeginTable("split", 2, 0, (ImVec2){}, 0.0f);
+    igTableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, fontSize, 0);
+    igTableNextColumn();
+    igBulletText("");
+    igTableNextColumn();
+    overlayTextURL(LG_DONATION_URL, NULL);
+
+    igEndTable();
   }
 
-  if (igCollapsingHeaderBoolPtr("Help & Support", NULL,
+  if (igCollapsingHeader_BoolPtr("Help & Support", NULL,
         ImGuiTreeNodeFlags_DefaultOpen))
   {
     igBeginTable("split", 2, 0, (ImVec2){}, 0.0f);
@@ -103,12 +105,12 @@ static void config_renderLGTab(void)
     igEndTable();
   }
 
-  if (igCollapsingHeaderBoolPtr("The Looking Glass Team / Donations", NULL,
+  if (igCollapsingHeader_BoolPtr("The Looking Glass Team", NULL,
         ImGuiTreeNodeFlags_DefaultOpen))
   {
     for(const struct LGTeamMember * member = LG_TEAM; member->name; ++member)
     {
-      if (igTreeNodeStr(member->name))
+      if (igTreeNode_Str(member->name))
       {
         igSpacing();
         igTextWrapped(member->blurb);
@@ -139,6 +141,15 @@ static void config_renderLGTab(void)
   }
 }
 
+static void config_renderLicenseTab(void)
+{
+  igText(LG_COPYRIGHT_STR);
+  overlayTextURL(LG_WEBSITE_URL, NULL);
+  igText(LG_VERSION_STR);
+  igSeparator();
+  igTextWrapped(LG_LICENSE_STR);
+}
+
 static int config_render(void * udata, bool interactive, struct Rect * windowRects,
     int maxRects)
 {
@@ -161,7 +172,7 @@ static int config_render(void * udata, bool interactive, struct Rect * windowRec
       (ImVec2){550, 680},
       ImGuiCond_FirstUseEver);
 
-  igPushIDInt(id++);
+  igPushID_Int(id++);
   if (!igBegin("Configuration", NULL, 0))
   {
     overlayGetImGuiRect(windowRects);
@@ -172,7 +183,7 @@ static int config_render(void * udata, bool interactive, struct Rect * windowRec
 
   igBeginTabBar("Configuration#tabs", 0);
 
-  if (igBeginTabItem("Looking Glass", NULL, 0))
+  if (igBeginTabItem("About", NULL, 0))
   {
     config_renderLGTab();
     igEndTabItem();
@@ -182,26 +193,36 @@ static int config_render(void * udata, bool interactive, struct Rect * windowRec
 
   if (igBeginTabItem("Settings", NULL, 0))
   {
-    for (ll_reset(cfg.callbacks); ll_walk(cfg.callbacks, (void **)&cb); )
+    ll_lock(cfg.callbacks);
+    ll_forEachNL(cfg.callbacks, item, cb)
     {
-      if (!igCollapsingHeaderBoolPtr(cb->title, NULL, 0))
+      if (!igCollapsingHeader_BoolPtr(cb->title, NULL, 0))
         continue;
 
-      igPushIDInt(id++);
+      igPushID_Int(id++);
       cb->callback(cb->udata, &id);
       igPopID();
     }
+    ll_unlock(cfg.callbacks);
     igEndTabItem();
   }
 
-  for (ll_reset(cfg.tabCallbacks); ll_walk(cfg.tabCallbacks, (void **)&cb); )
+  ll_lock(cfg.tabCallbacks);
+  ll_forEachNL(cfg.tabCallbacks, item, cb)
   {
     if (!igBeginTabItem(cb->title, NULL, 0))
       continue;
 
-    igPushIDInt(id++);
+    igPushID_Int(id++);
     cb->callback(cb->udata, &id);
     igPopID();
+    igEndTabItem();
+  }
+  ll_unlock(cfg.tabCallbacks);
+
+  if (igBeginTabItem("License", NULL, 0))
+  {
+    config_renderLicenseTab();
     igEndTabItem();
   }
 
@@ -216,6 +237,7 @@ static int config_render(void * udata, bool interactive, struct Rect * windowRec
 struct LG_OverlayOps LGOverlayConfig =
 {
   .name           = "Config",
+  .earlyInit      = config_earlyInit,
   .init           = config_init,
   .free           = config_free,
   .render         = config_render

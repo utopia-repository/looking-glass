@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -40,7 +40,7 @@ bool egl_framebufferInit(EGL_Framebuffer ** fb)
     return false;
   }
 
-  if (!egl_textureInit(&this->tex, NULL, EGL_TEXTYPE_BUFFER, false))
+  if (!egl_textureInit(&this->tex, NULL, EGL_TEXTYPE_BUFFER))
   {
     DEBUG_ERROR("Failed to initialize the texture");
     return false;

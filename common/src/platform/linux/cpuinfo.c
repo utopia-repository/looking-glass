@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,7 +27,8 @@
 #include <string.h>
 #include <ctype.h>
 
-bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores)
+bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores,
+  int * sockets)
 {
   FILE * cpuinfo = fopen("/proc/cpuinfo", "r");
   if (!cpuinfo)
@@ -35,6 +36,8 @@ bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores)
     DEBUG_ERROR("Failed to open /proc/cpuinfo: %s", strerror(errno));
     return false;
   }
+
+  int socketCount = 0;
 
   if (procs)
     *procs = 0;
@@ -61,13 +64,20 @@ bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores)
 
       model = NULL;
     }
-    else if (cores && strncmp(buffer, "cpu cores", 9) == 0)
+    else if (cores && *cores == 0 && strncmp(buffer, "cpu cores", 9) == 0)
+    {
+      const char * num = strstr(buffer, ": ");
+      if (num)
+        *cores = atoi(num + 2);
+    }
+    else if (strncmp(buffer, "physical id", 11) == 0)
     {
       const char * num = strstr(buffer, ": ");
       if (num)
       {
-        *cores = atoi(num + 2);
-        cores = NULL;
+        int id = atoi(num + 2);
+        if (id >= socketCount)
+          socketCount = id + 1;
       }
     }
 
@@ -78,6 +88,12 @@ bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores)
   }
 
 done:
+  if (sockets)
+    *sockets = socketCount;
+
+  if (cores)
+    *cores *= socketCount;
+
   fclose(cpuinfo);
   return true;
 }

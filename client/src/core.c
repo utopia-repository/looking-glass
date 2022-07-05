@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,39 +31,45 @@
 
 #define RESIZE_TIMEOUT (10 * 1000) // 10ms
 
+static bool isInView(void)
+{
+  return
+    g_cursor.pos.x >= g_state.dstRect.x                     &&
+    g_cursor.pos.x <  g_state.dstRect.x + g_state.dstRect.w &&
+    g_cursor.pos.y >= g_state.dstRect.y                     &&
+    g_cursor.pos.y <  g_state.dstRect.y + g_state.dstRect.h;
+}
+
 bool core_inputEnabled(void)
 {
   return g_params.useSpiceInput && !g_state.ignoreInput &&
     ((g_cursor.grab && g_params.captureInputOnly) || !g_params.captureInputOnly);
 }
 
-void core_setCursorInView(bool enable)
+void core_invalidatePointer(bool detectInView)
 {
-  // if the state has not changed, don't do anything else
-  if (g_cursor.inView == enable)
-    return;
-
-  if (enable && !g_state.focused)
-    return;
-
-  // do not allow the view to become active if any mouse buttons are being held,
-  // this fixes issues with meta window resizing.
-  if (enable && g_cursor.buttons)
-    return;
-
-  g_cursor.inView = enable;
-  g_cursor.draw   = (g_params.alwaysShowCursor || g_params.captureInputOnly)
-    ? true : enable;
-  g_cursor.redraw = true;
-
   /* if the display server does not support warp, then we can not operate in
    * always relative mode and we should not grab the pointer */
   enum LG_DSWarpSupport warpSupport = LG_DS_WARP_NONE;
   app_getProp(LG_DS_WARP_SUPPORT, &warpSupport);
 
-  g_cursor.warpState = enable ? WARP_STATE_ON : WARP_STATE_OFF;
+  if (detectInView)
+  {
+    bool inView = isInView();
+    // do not allow the view to become active if any mouse buttons are being held,
+    // this fixes issues with meta window resizing.
+    if (inView && g_cursor.buttons)
+      return;
 
-  if (enable)
+    g_cursor.inView = inView;
+  }
+
+  g_cursor.draw = (g_params.alwaysShowCursor || g_params.captureInputOnly)
+    ? true : g_cursor.inView;
+  g_cursor.redraw = true;
+
+  g_cursor.warpState = g_cursor.inView ? WARP_STATE_ON : WARP_STATE_OFF;
+  if (g_cursor.inView)
   {
     if (g_params.hideMouse)
       g_state.ds->setPointer(LG_POINTER_NONE);
@@ -86,6 +92,19 @@ void core_setCursorInView(bool enable)
   }
 
   g_cursor.warpState = WARP_STATE_ON;
+}
+
+void core_setCursorInView(bool enable)
+{
+  // if the state has not changed, don't do anything else
+  if (g_cursor.inView == enable)
+    return;
+
+  if (enable && !g_state.focused)
+    return;
+
+  g_cursor.inView = enable;
+  core_invalidatePointer(false);
 }
 
 void core_setGrab(bool enable)
@@ -147,7 +166,7 @@ void core_setGrabQuiet(bool enable)
 bool core_warpPointer(int x, int y, bool exiting)
 {
   if ((!g_cursor.inWindow && !exiting) ||
-      g_state.overlayInput ||
+      app_isOverlayMode() ||
       g_cursor.warpState == WARP_STATE_OFF)
     return false;
 
@@ -202,6 +221,20 @@ void core_updatePositionInfo(void)
       g_state.dstRect.h = srcH;
       g_state.dstRect.x = g_state.windowCX - srcW / 2;
       g_state.dstRect.y = g_state.windowCY - srcH / 2;
+    }
+    else
+    if (g_params.intUpscale &&
+        srcW <= g_state.windowW &&
+        srcH <= g_state.windowH)
+    {
+      force = false;
+      const int scale = min(
+          floor(g_state.windowW / srcW),
+          floor(g_state.windowH / srcH));
+      g_state.dstRect.w = srcW * scale;
+      g_state.dstRect.h = srcH * scale;
+      g_state.dstRect.x = g_state.windowCX - g_state.dstRect.w / 2;
+      g_state.dstRect.y = g_state.windowCY - g_state.dstRect.h / 2;
     }
     else
     if ((int)(wndAspect * 1000) == (int)(srcAspect * 1000))
@@ -357,7 +390,7 @@ void core_handleGuestMouseUpdate(void)
   if (!util_guestCurToLocal(&localPos))
     return;
 
-  if (g_state.overlayInput || !g_cursor.inView)
+  if (app_isOverlayMode() || !g_cursor.inView)
     return;
 
   g_state.ds->guestPointerUpdated(
@@ -392,23 +425,17 @@ void core_handleMouseGrabbed(double ex, double ey)
   if (x == 0 && y == 0)
     return;
 
-  if (!spice_mouse_motion(x, y))
+  if (!purespice_mouseMotion(x, y))
     DEBUG_ERROR("failed to send mouse motion message");
-}
-
-static bool isInView(void)
-{
-  return
-    g_cursor.pos.x >= g_state.dstRect.x                     &&
-    g_cursor.pos.x <  g_state.dstRect.x + g_state.dstRect.w &&
-    g_cursor.pos.y >= g_state.dstRect.y                     &&
-    g_cursor.pos.y <  g_state.dstRect.y + g_state.dstRect.h;
 }
 
 void core_handleMouseNormal(double ex, double ey)
 {
   // prevent cursor handling outside of capture if the position is not known
   if (!g_cursor.guest.valid)
+    return;
+
+  if (g_cursor.realigning)
     return;
 
   if (!core_inputEnabled())
@@ -458,15 +485,36 @@ void core_handleMouseNormal(double ex, double ey)
       };
 
       uint32_t setPosSerial;
-      if (lgmpClientSendData(g_state.pointerQueue,
-            &msg, sizeof(msg), &setPosSerial) == LGMP_OK)
+      LGMP_STATUS status;
+      if ((status = lgmpClientSendData(g_state.pointerQueue,
+            &msg, sizeof(msg), &setPosSerial)) != LGMP_OK)
+      {
+        DEBUG_WARN("Message send failed: %s", lgmpStatusString(status));
+        goto fallback;
+      }
+      else
       {
         /* wait for the move request to be processed */
+        g_cursor.realigning = true;
         do
         {
+          LG_LOCK(g_state.pointerQueueLock);
+          if (!g_state.pointerQueue)
+          {
+            /* the queue is nolonger valid, assume complete */
+            g_cursor.realigning = false;
+            LG_UNLOCK(g_state.pointerQueueLock);
+            break;
+          }
+
           uint32_t hostSerial;
           if (lgmpClientGetSerial(g_state.pointerQueue, &hostSerial) != LGMP_OK)
+          {
+            g_cursor.realigning = false;
+            LG_UNLOCK(g_state.pointerQueueLock);
             return;
+          }
+          LG_UNLOCK(g_state.pointerQueueLock);
 
           if (hostSerial >= setPosSerial)
             break;
@@ -475,9 +523,11 @@ void core_handleMouseNormal(double ex, double ey)
         }
         while(app_isRunning());
 
-        g_cursor.guest.x = msg.x;
-        g_cursor.guest.y = msg.y;
-        g_cursor.realign = false;
+        g_cursor.guest.x    = msg.x;
+        g_cursor.guest.y    = msg.y;
+        g_cursor.realign    = false;
+        g_cursor.realigning = false;
+        g_cursor.redraw     = true;
 
         if (!g_cursor.inWindow)
           return;
@@ -488,6 +538,7 @@ void core_handleMouseNormal(double ex, double ey)
     }
     else
     {
+fallback:
       /* add the difference to the offset */
       ex += guest.x - (g_cursor.guest.x + g_cursor.guest.hx);
       ey += guest.y - (g_cursor.guest.y + g_cursor.guest.hy);
@@ -602,7 +653,7 @@ void core_handleMouseNormal(double ex, double ey)
     g_cursor.guest.y += y;
   }
 
-  if (!spice_mouse_motion(x, y))
+  if (!purespice_mouseMotion(x, y))
     DEBUG_ERROR("failed to send mouse motion message");
 }
 
@@ -613,4 +664,35 @@ void core_resetOverlayInputState(void)
   g_state.io->MouseDown[ImGuiMouseButton_Middle] = false;
   for(int key = 0; key < ARRAY_LENGTH(g_state.io->KeysDown); key++)
     g_state.io->KeysDown[key] = false;
+}
+
+void core_updateOverlayState(void)
+{
+  g_state.cursorLast = -2;
+
+  static bool wasGrabbed = false;
+  if (app_isOverlayMode())
+  {
+    wasGrabbed = g_cursor.grab;
+
+    g_state.io->ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+    g_state.io->MousePos = (ImVec2) { g_cursor.pos.x, g_cursor.pos.y };
+
+    core_setGrabQuiet(false);
+    core_setCursorInView(false);
+  }
+  else
+  {
+    g_state.io->ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    core_resetOverlayInputState();
+    core_setGrabQuiet(wasGrabbed);
+    core_invalidatePointer(true);
+    app_invalidateWindow(false);
+
+    if (!g_cursor.grab)
+    {
+      g_cursor.realign = true;
+      core_handleMouseNormal(0, 0);
+    }
+  }
 }

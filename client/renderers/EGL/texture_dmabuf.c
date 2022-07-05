@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -54,7 +54,8 @@ static void egl_texDMABUFCleanup(TexDMABUF * this)
 
 // dmabuf functions
 
-static bool egl_texDMABUFInit(EGL_Texture ** texture, EGLDisplay * display)
+static bool egl_texDMABUFInit(EGL_Texture ** texture, EGL_TexType type,
+    EGLDisplay * display)
 {
   TexDMABUF * this = calloc(1, sizeof(*this));
   *texture = &this->base.base;
@@ -67,7 +68,7 @@ static bool egl_texDMABUFInit(EGL_Texture ** texture, EGLDisplay * display)
   }
 
   EGL_Texture * parent = &this->base.base;
-  if (!egl_texBufferStreamInit(&parent, display))
+  if (!egl_texBufferStreamInit(&parent, type, display))
   {
     vector_destroy(&this->images);
     free(this);

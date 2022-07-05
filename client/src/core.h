@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,6 +24,7 @@
 #include <stdbool.h>
 
 bool core_inputEnabled(void);
+void core_invalidatePointer(bool detectInView);
 void core_setCursorInView(bool enable);
 void core_setGrab(bool enable);
 void core_setGrabQuiet(bool enable);
@@ -39,5 +40,6 @@ void core_handleGuestMouseUpdate(void);
 void core_handleMouseGrabbed(double ex, double ey);
 void core_handleMouseNormal(double ex, double ey);
 void core_resetOverlayInputState(void);
+void core_updateOverlayState(void);
 
 #endif

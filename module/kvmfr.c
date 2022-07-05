@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -28,6 +28,7 @@
 #include <linux/fs.h>
 #include <linux/dma-buf.h>
 #include <linux/highmem.h>
+#include <linux/memremap.h>
 #include <linux/version.h>
 
 #include <asm/io.h>
@@ -570,4 +571,7 @@ MODULE_DEVICE_TABLE(pci, kvmfr_pci_ids);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Geoffrey McRae <geoff@hostfission.com>");
 MODULE_AUTHOR("Guanzhong Chen <quantum2048@gmail.com>");
-MODULE_VERSION("0.0.7");
+MODULE_VERSION("0.0.8");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+MODULE_IMPORT_NS(DMA_BUF);
+#endif

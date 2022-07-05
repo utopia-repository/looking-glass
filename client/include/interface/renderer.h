@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -27,17 +27,22 @@
 #include "common/framebuffer.h"
 
 #define IS_LG_RENDERER_VALID(x) \
-  ((x)->getName       && \
-   (x)->create         && \
-   (x)->initialize     && \
-   (x)->deinitialize   && \
-   (x)->onRestart     && \
-   (x)->onResize      && \
-   (x)->onMouseShape && \
-   (x)->onMouseEvent && \
-   (x)->renderStartup && \
-   (x)->needsRender   && \
-   (x)->render)
+  ((x)->getName         && \
+   (x)->create          && \
+   (x)->initialize      && \
+   (x)->deinitialize    && \
+   (x)->onRestart       && \
+   (x)->onResize        && \
+   (x)->onMouseShape    && \
+   (x)->onMouseEvent    && \
+   (x)->renderStartup   && \
+   (x)->render          && \
+   (x)->createTexture   && \
+   (x)->freeTexture     && \
+   (x)->spiceConfigure  && \
+   (x)->spiceDrawFill   && \
+   (x)->spiceDrawBitmap && \
+   (x)->spiceShow)
 
 typedef struct LG_RendererParams
 {
@@ -66,9 +71,11 @@ LG_RendererRotate;
 
 typedef struct LG_RendererFormat
 {
-  FrameType         type;    // frame type
-  unsigned int      width;   // image width
-  unsigned int      height;  // image height
+  FrameType         type;         // frame type
+  unsigned int      screenWidth;  // actual width of the host
+  unsigned int      screenHeight; // actual height of the host
+  unsigned int      frameWidth;   // width of frame transmitted
+  unsigned int      frameHeight;  // height of frame transmitted
   unsigned int      stride;  // scanline width (zero if compresed)
   unsigned int      pitch;   // scanline bytes (or compressed size)
   unsigned int      bpp;     // bits per pixel (zero if compressed)
@@ -139,8 +146,8 @@ typedef struct LG_RendererOps
 
   /* called when the mouse has moved or changed visibillity
    * Context: cursorThread */
-  bool (*onMouseEvent)(LG_Renderer * renderer, const bool visible, const int x,
-      const int y);
+  bool (*onMouseEvent)(LG_Renderer * renderer, const bool visible, int x, int y,
+      const int hx, const int hy);
 
   /* called when the frame format has changed
    * Context: frameThread */
@@ -156,15 +163,36 @@ typedef struct LG_RendererOps
    * Context: renderThread */
   bool (*renderStartup)(LG_Renderer * renderer, bool useDMA);
 
-  /* returns if the render method must be called even if nothing has changed.
-   * Context: renderThread */
-  bool (*needsRender)(LG_Renderer * renderer);
-
   /* called to render the scene
    * Context: renderThread */
   bool (*render)(LG_Renderer * renderer, LG_RendererRotate rotate,
       const bool newFrame, const bool invalidateWindow,
       void (*preSwap)(void * udata), void * udata);
+
+  /* called to create a texture from the specified 32-bit RGB image data. This
+   * method is for use with Dear ImGui
+   * Context: renderThread */
+  void * (*createTexture)(LG_Renderer * renderer,
+      int width, int height, uint8_t * data);
+
+  /* called to free a texture previously created by createTexture. This method
+   * is for use with Dear ImGui
+   * Context: renderThread */
+  void (*freeTexture)(LG_Renderer * renderer, void * texture);
+
+  /* setup the spice display */
+  void (*spiceConfigure)(LG_Renderer * renderer, int width, int height);
+
+  /* draw a filled rect on the spice display with the specified color */
+  void (*spiceDrawFill)(LG_Renderer * renderer, int x, int y, int width,
+      int height, uint32_t color);
+
+  /* draw an image on the spice display, data is RGBA32 */
+  void (*spiceDrawBitmap)(LG_Renderer * renderer, int x, int y, int width,
+      int height, int stride, uint8_t * data, bool topDown);
+
+  /* show the spice display */
+  void (*spiceShow)(LG_Renderer * renderer, bool show);
 }
 LG_RendererOps;
 

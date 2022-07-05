@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -53,6 +53,10 @@ struct X11DSState
   Display *     display;
   Window        window;
   XVisualInfo * visual;
+
+  int           minKeycode, maxKeycode;
+  int           symsPerKeycode;
+  KeySym *      keysyms;
 
   //Extended Window Manager Hints
   //ref: https://specifications.freedesktop.org/wm-spec/latest/

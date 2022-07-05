@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -28,7 +28,7 @@
 #include "types.h"
 
 #define KVMFR_MAGIC   "KVMFR---"
-#define KVMFR_VERSION 14
+#define KVMFR_VERSION 19
 
 #define KVMFR_MAX_DAMAGE_RECTS 64
 
@@ -67,8 +67,51 @@ typedef struct KVMFR
   uint32_t          version;
   char              hostver[32];
   KVMFRFeatureFlags features;
+  //KVMFRRecords start here if there are any
 }
 KVMFR;
+
+typedef struct KVMFRRecord
+{
+  uint8_t  type;
+  uint32_t size;
+  uint8_t  data[];
+}
+KVMFRRecord;
+
+enum
+{
+  KVMFR_RECORD_VMINFO = 1,
+  KVMFR_RECORD_OSINFO
+};
+
+typedef enum
+{
+  KVMFR_OS_LINUX,
+  KVMFR_OS_BSD,
+  KVMFR_OS_OSX,
+  KVMFR_OS_WINDOWS,
+  KVMFR_OS_OTHER
+}
+KVMFROS;
+
+typedef struct KVMFRRecord_VMInfo
+{
+  uint8_t uuid   [16]; // the guest's UUID
+  char    capture[32]; // the capture device in use
+  uint8_t cpus;        // number of CPUs
+  uint8_t cores;       // number of CPU cores
+  uint8_t sockets;     // number of CPU sockets
+  char    model[];
+}
+KVMFRRecord_VMInfo;
+
+typedef struct KVMFRRecord_OSInfo
+{
+  uint8_t os;     // KVMFR_OS_*
+  char    name[]; // friendly name
+}
+KVMFRRecord_OSInfo;
 
 typedef struct KVMFRCursor
 {
@@ -81,21 +124,31 @@ typedef struct KVMFRCursor
 }
 KVMFRCursor;
 
+enum
+{
+  FRAME_FLAG_BLOCK_SCREENSAVER  = 0x1,
+  FRAME_FLAG_REQUEST_ACTIVATION = 0x2,
+  FRAME_FLAG_TRUNCATED          = 0x4 // ivshmem was too small for the frame
+};
+
+typedef uint32_t KVMFRFrameFlags;
+
 typedef struct KVMFRFrame
 {
   uint32_t        formatVer;          // the frame format version number
   uint32_t        frameSerial;        // the unique frame number
   FrameType       type;               // the frame data type
-  uint32_t        width;              // the frame width
-  uint32_t        height;             // the frame height
-  uint32_t        realHeight;         // the real height if the frame was truncated due to low mem
+  uint32_t        screenWidth;        // the client's screen width
+  uint32_t        screenHeight;       // the client's screen height
+  uint32_t        frameWidth;         // the frame width
+  uint32_t        frameHeight;        // the frame height
   FrameRotation   rotation;           // the frame rotation
   uint32_t        stride;             // the row stride (zero if compressed data)
   uint32_t        pitch;              // the row pitch  (stride in bytes or the compressed frame size)
   uint32_t        offset;             // offset from the start of this header to the FrameBuffer header
   uint32_t        damageRectsCount;   // the number of damage rectangles (zero for full-frame damage)
   FrameDamageRect damageRects[KVMFR_MAX_DAMAGE_RECTS];
-  bool            blockScreensaver;   // whether the guest has requested to block screensavers
+  KVMFRFrameFlags flags;              // bit field combination of FRAME_FLAG_*
 }
 KVMFRFrame;
 

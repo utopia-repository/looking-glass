@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,6 +23,7 @@
 #include "common/windebug.h"
 #include "windows/mousehook.h"
 #include "windows/force_compose.h"
+#include "common/util.h"
 #include "common/array.h"
 #include "common/option.h"
 #include "common/framebuffer.h"
@@ -30,9 +31,12 @@
 #include "common/rects.h"
 #include "common/thread.h"
 #include "common/KVMFR.h"
+#include "common/vector.h"
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <windows.h>
+#include <dwmapi.h>
+#include <d3d9.h>
 
 #include <NvFBC/nvFBC.h>
 #include "wrapper.h"
@@ -47,18 +51,32 @@ struct FrameInfo
   uint8_t * diffMap;
 };
 
+typedef struct
+{
+  unsigned int id;
+  bool         greater;
+  unsigned int x;
+  unsigned int y;
+  unsigned int targetX;
+  unsigned int targetY;
+}
+DownsampleRule;
+
 struct iface
 {
   bool        stop;
   NvFBCHandle nvfbc;
 
   bool                       seperateCursor;
+  bool                       dwmFlush;
   CaptureGetPointerBuffer    getPointerBufferFn;
   CapturePostPointerBuffer   postPointerBufferFn;
   LGThread                 * pointerThread;
 
   unsigned int maxWidth , maxHeight;
   unsigned int width    , height;
+  bool         resChanged, scale;
+  unsigned int targetWidth, targetHeight;
 
   unsigned int formatVer;
   unsigned int grabWidth, grabHeight, grabStride;
@@ -80,6 +98,8 @@ struct iface
 
   struct FrameInfo frameInfo[LGMP_Q_FRAME_LEN];
 };
+
+static Vector downsampleRules = {0};
 
 static struct iface * this = NULL;
 
@@ -119,13 +139,81 @@ static void on_mouseMove(int x, int y)
 
 static const char * nvfbc_getName(void)
 {
-  return "NVFBC (NVidia Frame Buffer Capture)";
+  return "NVFBC";
 };
+
+static bool downsampleOptParser(struct Option * opt, const char * str)
+{
+  if (!str)
+    return false;
+
+  opt->value.x_string = strdup(str);
+
+  if (downsampleRules.data)
+    vector_destroy(&downsampleRules);
+
+  if (!vector_create(&downsampleRules, sizeof(DownsampleRule), 10))
+  {
+    DEBUG_ERROR("Failed to allocate ram");
+    return false;
+  }
+
+  char * tmp   = strdup(str);
+  char * token = strtok(tmp, ",");
+  int count = 0;
+  while(token)
+  {
+    DownsampleRule rule = {0};
+    if (token[0] == '>')
+    {
+      rule.greater = true;
+      ++token;
+    }
+
+    if (sscanf(token, "%ux%u:%ux%u",
+      &rule.x,
+      &rule.y,
+      &rule.targetX,
+      &rule.targetY) != 4)
+    {
+      DEBUG_INFO("Unable to parse NvFBC downsample rules");
+      return false;
+    }
+
+    rule.id = count++;
+
+    DEBUG_INFO(
+      "Rule %u: %ux%u IF X %s %4u %s Y %s %4u",
+      rule.id,
+      rule.targetX,
+      rule.targetY,
+      rule.greater ? "> "  : "==",
+      rule.x,
+      rule.greater ? "OR " : "AND",
+      rule.greater ? "> "  : "==",
+      rule.y
+    );
+    vector_push(&downsampleRules, &rule);
+
+    token = strtok(NULL, ",");
+  }
+  free(tmp);
+
+  return true;
+}
 
 static void nvfbc_initOptions(void)
 {
   struct Option options[] =
   {
+    {
+      .module         = "nvfbc",
+      .name           = "downsample", //dxgi:downsample=>1920x1080:1920x1080
+      .description    = "Downsample rules, format: [>](width)x(height):(toWidth)x(toHeight)",
+      .type           = OPTION_TYPE_STRING,
+      .value.x_string = NULL,
+      .parser         = downsampleOptParser
+    },
     {
       .module         = "nvfbc",
       .name           = "decoupleCursor",
@@ -139,6 +227,20 @@ static void nvfbc_initOptions(void)
       .description    = "The resolution of the diff map",
       .type           = OPTION_TYPE_INT,
       .value.x_int    = 128
+    },
+    {
+      .module         = "nvfbc",
+      .name           = "adapterIndex",
+      .description    = "The index of the adapter to capture from",
+      .type           = OPTION_TYPE_INT,
+      .value.x_int    = -1
+    },
+    {
+      .module         = "nvfbc",
+      .name           = "dwmFlush",
+      .description    = "Use DwmFlush to sync the capture to the windows presentation inverval",
+      .type           = OPTION_TYPE_BOOL,
+      .value.x_bool   = false
     },
     {0}
   };
@@ -156,16 +258,42 @@ static bool nvfbc_create(
   this = calloc(1, sizeof(*this));
 
   this->seperateCursor      = option_get_bool("nvfbc", "decoupleCursor");
+  this->dwmFlush            = option_get_bool("nvfbc", "dwmFlush"      );
   this->getPointerBufferFn  = getPointerBufferFn;
   this->postPointerBufferFn = postPointerBufferFn;
 
   return true;
 }
 
+static void updateScale(void)
+{
+  DownsampleRule * rule, * match = NULL;
+  vector_forEachRef(rule, &downsampleRules)
+  {
+    if (
+      ( rule->greater && (this->width  > rule->x || this->height  > rule->y)) ||
+      (!rule->greater && (this->width == rule->x && this->height == rule->y)))
+    {
+      match = rule;
+    }
+  }
+
+  if (match)
+  {
+    DEBUG_INFO("Matched downsample rule %d", rule->id);
+    this->scale        = true;
+    this->targetWidth  = match->targetX;
+    this->targetHeight = match->targetY;
+    return;
+  }
+
+  this->scale        = false;
+  this->targetWidth  = this->width;
+  this->targetHeight = this->height;
+}
+
 static bool nvfbc_init(void)
 {
-  this->stop = false;
-
   int       bufferLen   = GetEnvironmentVariable("NVFBC_PRIV_DATA", NULL, 0);
   uint8_t * privData    = NULL;
   int       privDataLen = 0;
@@ -187,15 +315,43 @@ static bool nvfbc_init(void)
     free(buffer);
   }
 
+  int adapterIndex = option_get_int("nvfbc", "adapterIndex");
   // NOTE: Calling this on hardware that doesn't support NvFBC such as GeForce
   // causes a substantial performance pentalty even if it fails! As such we only
   // attempt NvFBC as a last resort, or if configured via the app:capture
   // option.
-  if (!NvFBCToSysCreate(privData, privDataLen, &this->nvfbc, &this->maxWidth, &this->maxHeight))
+  if (adapterIndex < 0)
   {
-    free(privData);
-    return false;
+    IDirect3D9 * d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    int adapterCount = IDirect3D9_GetAdapterCount(d3d);
+    for(int i = 0; i < adapterCount; ++i)
+    {
+      D3DADAPTER_IDENTIFIER9 ident;
+      IDirect3D9_GetAdapterIdentifier(d3d, i, 0, &ident);
+      if (ident.VendorId != 0x10DE)
+        continue;
+
+      if (NvFBCToSysCreate(i, privData, privDataLen, &this->nvfbc,
+        &this->maxWidth, &this->maxHeight))
+      {
+        adapterIndex = i;
+        break;
+      }
+    }
+    IDirect3D9_Release(d3d);
+
+    if (adapterIndex < 0)
+    {
+      free(privData);
+      return false;
+    }
   }
+  else
+    if (!NvFBCToSysCreate(adapterIndex, privData, privDataLen, &this->nvfbc, &this->maxWidth, &this->maxHeight))
+    {
+      free(privData);
+      return false;
+    }
 
   int diffRes = option_get_int("nvfbc", "diffRes");
   enum DiffMapBlockSize blockSize;
@@ -203,6 +359,7 @@ static bool nvfbc_init(void)
   free(privData);
 
   getDesktopSize(&this->width, &this->height);
+  updateScale();
 
   HANDLE event;
   if (!NvFBCToSysSetup(
@@ -222,18 +379,6 @@ static bool nvfbc_init(void)
 
   if (this->seperateCursor)
     this->cursorEvent = lgWrapEvent(event);
-
-  if (!this->mouseHookCreated)
-  {
-    mouseHook_install(on_mouseMove);
-    this->mouseHookCreated = true;
-  }
-
-  if (!this->forceCompositionCreated)
-  {
-    dwmForceComposition();
-    this->forceCompositionCreated = true;
-  }
 
   if (diffRes != (1 << this->diffShift))
     DEBUG_WARN("DiffMap block size not supported: %dx%d", diffRes, diffRes);
@@ -258,16 +403,39 @@ static bool nvfbc_init(void)
     }
   }
 
-  Sleep(100);
+  ++this->formatVer;
+  this->stop = true;
+  return true;
+}
 
-  if (this->seperateCursor && !lgCreateThread("NvFBCPointer", pointerThread, NULL, &this->pointerThread))
+static bool nvfbc_start(void)
+{
+  if (!this->mouseHookCreated)
+  {
+    mouseHook_install(on_mouseMove);
+    this->mouseHookCreated = true;
+  }
+
+  if (!this->forceCompositionCreated)
+  {
+    dwmForceComposition();
+    this->forceCompositionCreated = true;
+  }
+
+  if (!this->stop)
+  {
+    DEBUG_ERROR("BUG: start called when not stopped");
+    return true;
+  }
+
+  this->stop = false;
+  if (this->seperateCursor &&
+      !lgCreateThread("NvFBCPointer", pointerThread, NULL, &this->pointerThread))
   {
     DEBUG_ERROR("Failed to create the NvFBCPointer thread");
-    nvfbc_deinit();
     return false;
   }
 
-  ++this->formatVer;
   return true;
 }
 
@@ -321,14 +489,30 @@ static void nvfbc_free(void)
 
 static CaptureResult nvfbc_capture(void)
 {
-  getDesktopSize(&this->width, &this->height);
+  // this is a bit of a hack as it causes this thread to block until the next
+  // present keeping us locked with the refresh rate of the monitor being
+  // captured
+  if (this->dwmFlush)
+    DwmFlush();
+
+  unsigned int width, height;
+  getDesktopSize(&width, &height);
+  if (this->width != width || this->height != height)
+  {
+    this->resChanged = true;
+    this->width      = width;
+    this->height     = height;
+    updateScale();
+  }
+
   NvFBCFrameGrabInfo grabInfo;
   CaptureResult result = NvFBCToSysCapture(
     this->nvfbc,
     1000,
     0, 0,
-    this->width,
-    this->height,
+    this->targetWidth,
+    this->targetHeight,
+    this->scale,
     &grabInfo
   );
 
@@ -336,8 +520,8 @@ static CaptureResult nvfbc_capture(void)
     return result;
 
   bool changed = false;
-  const unsigned int h = DIFF_MAP_DIM(this->height, this->diffShift);
-  const unsigned int w = DIFF_MAP_DIM(this->width,  this->diffShift);
+  const unsigned int h = DIFF_MAP_DIM(grabInfo.dwWidth , this->diffShift);
+  const unsigned int w = DIFF_MAP_DIM(grabInfo.dwHeight, this->diffShift);
   for (unsigned int y = 0; y < h; ++y)
     for (unsigned int x = 0; x < w; ++x)
       if (this->diffMap[(y*w)+x])
@@ -385,8 +569,8 @@ static void dsUnion(struct DisjointSet * ds, int a, int b)
 
 static void updateDamageRects(CaptureFrame * frame)
 {
-  const unsigned int h = DIFF_MAP_DIM(this->height, this->diffShift);
-  const unsigned int w = DIFF_MAP_DIM(this->width,  this->diffShift);
+  const unsigned int h = DIFF_MAP_DIM(this->grabHeight, this->diffShift);
+  const unsigned int w = DIFF_MAP_DIM(this->grabWidth,  this->diffShift);
 
   struct DisjointSet ds[w * h];
 
@@ -486,8 +670,8 @@ static void updateDamageRects(CaptureFrame * frame)
 
         int x1 = ds[c].x1 << this->diffShift;
         int y1 = ds[c].y1 << this->diffShift;
-        int x2 = min((ds[c].x2 + 1) << this->diffShift, this->width);
-        int y2 = min((ds[c].y2 + 1) << this->diffShift, this->height);
+        int x2 = min((ds[c].x2 + 1) << this->diffShift, this->grabWidth);
+        int y2 = min((ds[c].y2 + 1) << this->diffShift, this->grabHeight);
         frame->damageRects[rectId++] = (FrameDamageRect) {
           .x = x1,
           .y = y1,
@@ -510,25 +694,30 @@ static CaptureResult nvfbc_waitFrame(CaptureFrame * frame,
   if (
     this->grabInfo.dwWidth       != this->grabWidth  ||
     this->grabInfo.dwHeight      != this->grabHeight ||
-    this->grabInfo.dwBufferWidth != this->grabStride)
+    this->grabInfo.dwBufferWidth != this->grabStride ||
+    this->resChanged)
   {
     this->grabWidth  = this->grabInfo.dwWidth;
     this->grabHeight = this->grabInfo.dwHeight;
     this->grabStride = this->grabInfo.dwBufferWidth;
     // Round up stride in IVSHMEM to avoid issues with dmabuf import.
     this->shmStride  = ALIGN_PAD(this->grabStride, 32);
+
+    this->resChanged = false;
     ++this->formatVer;
   }
 
   const unsigned int maxHeight = maxFrameSize / (this->shmStride * 4);
 
-  frame->formatVer  = this->formatVer;
-  frame->width      = this->grabWidth;
-  frame->height     = maxHeight > this->grabHeight ? this->grabHeight : maxHeight;
-  frame->realHeight = this->grabHeight;
-  frame->pitch      = this->shmStride * 4;
-  frame->stride     = this->shmStride;
-  frame->rotation   = CAPTURE_ROT_0;
+  frame->formatVer    = this->formatVer;
+  frame->screenWidth  = this->width;
+  frame->screenHeight = this->height;
+  frame->frameWidth   = this->grabWidth;
+  frame->frameHeight  = min(maxHeight, this->grabHeight);
+  frame->truncated    = maxHeight < this->grabHeight;
+  frame->pitch        = this->shmStride * 4;
+  frame->stride       = this->shmStride;
+  frame->rotation     = CAPTURE_ROT_0;
 
   updateDamageRects(frame);
 
@@ -555,8 +744,8 @@ static CaptureResult nvfbc_waitFrame(CaptureFrame * frame,
 static CaptureResult nvfbc_getFrame(FrameBuffer * frame,
     const unsigned int height, int frameIndex)
 {
-  const unsigned int h = DIFF_MAP_DIM(this->height, this->diffShift);
-  const unsigned int w = DIFF_MAP_DIM(this->width,  this->diffShift);
+  const unsigned int h = DIFF_MAP_DIM(this->grabHeight, this->diffShift);
+  const unsigned int w = DIFF_MAP_DIM(this->grabWidth,  this->diffShift);
   uint8_t * frameData = framebuffer_get_data(frame);
   struct FrameInfo * info = this->frameInfo + frameIndex;
 
@@ -689,6 +878,7 @@ struct CaptureInterface Capture_NVFBC =
 
   .create          = nvfbc_create,
   .init            = nvfbc_init,
+  .start           = nvfbc_start,
   .stop            = nvfbc_stop,
   .deinit          = nvfbc_deinit,
   .free            = nvfbc_free,

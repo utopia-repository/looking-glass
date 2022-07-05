@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,10 +20,18 @@
 
 #include "common/appstrings.h"
 
-const char * LG_COPYRIGHT_STR =
-  "Copyright © 2017-2021 The Looking Glass Authors";
+const char * LG_DONATION_STR =
+  "Looking Glass is written and supported by a small group of developers in our "
+  "free time and has been given to the world free of charge. If you find this "
+  "program useful please consider supporting our efforts through the following "
+  "address:";
 
-const char * LG_WEBSITE_STR =
+const char * LG_DONATION_URL = "https://looking-glass.io/donations";
+
+const char * LG_COPYRIGHT_STR =
+  "Copyright © 2017-2022 The Looking Glass Authors";
+
+const char * LG_WEBSITE_URL =
   "https://looking-glass.io";
 
 const char * LG_LICENSE_STR =
@@ -72,30 +80,7 @@ const struct LGTeamMember LG_TEAM[] =
       "and direction of the project as a whole, focusing on the X11 "
       "platform as well as maintaining the Looking Glass community on "
       "Discord and the Level1Tech forums.",
-    .donate =
-    {
-      {
-        .name  = "GitHub Sponsors",
-        .value = "https://github.com/sponsors/gnif"
-      },
-      {
-        .name  = "Patreon",
-        .value = "https://www.patreon.com/gnif"
-      },
-      {
-        .name  = "Ko-Fi",
-        .value = "https://ko-fi.com/lookingglass"
-      },
-      {
-        .name  = "Bitcoin (BTC)",
-        .value = "14ZFcYjsKPiVreHqcaekvHGL846u3ZuT13"
-      },
-      {
-        .name  = "Ethereum (ETH)",
-        .value = "0x6f8aEe454384122bF9ed28f025FBCe2Bce98db85"
-      },
-      { 0 }
-    }
+    .donate = { { 0 } }
   },
   {
     .name   = "Guanzhong Chen (quantum)",
@@ -116,7 +101,17 @@ const struct LGTeamMember LG_TEAM[] =
   },
   {
     .name   = "Jonathan Rubenstein (JJRcop)",
-    .blurb  = "Documentation Guru and Discord Community Manager",
+    .blurb  =
+      "Documentation Guru and Discord Community Manager. Takes around four "
+      "or five tries and weeks of delay to turn ideas and spitballing into "
+      "tangible work, but tries to make the result look beautiful.",
+    .donate = { { 0 } }
+  },
+  {
+    .name   = "Chris Spencer (spencercw)",
+    .blurb  =
+      "Developer. Knows enough about audio programming to cause problems for "
+      "himself.",
     .donate = { { 0 } }
   },
   { 0 }

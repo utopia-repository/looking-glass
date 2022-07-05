@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -46,7 +46,8 @@ static void egl_texBuffer_cleanup(TextureBuffer * this)
 
 // common functions
 
-bool egl_texBufferInit(EGL_Texture ** texture, EGLDisplay * display)
+bool egl_texBufferInit(EGL_Texture ** texture, EGL_TexType type,
+    EGLDisplay * display)
 {
   TextureBuffer * this;
   if (!*texture)
@@ -111,11 +112,13 @@ static bool egl_texBufferUpdate(EGL_Texture * texture, const EGL_TexUpdate * upd
   DEBUG_ASSERT(update->type == EGL_TEXTYPE_BUFFER);
 
   glBindTexture(GL_TEXTURE_2D, this->tex[0]);
-  glPixelStorei(GL_UNPACK_ROW_LENGTH, texture->format.pitch);
+  glPixelStorei(GL_UNPACK_ROW_LENGTH, update->pitch);
   glTexSubImage2D(GL_TEXTURE_2D,
-      0, 0, 0,
-      texture->format.width,
-      texture->format.height,
+      0,
+      update->x,
+      update->y,
+      update->width,
+      update->height,
       texture->format.format,
       texture->format.dataType,
       update->buffer);
@@ -138,14 +141,30 @@ EGL_TexStatus egl_texBufferGet(EGL_Texture * texture, GLuint * tex)
 
 // streaming functions
 
-bool egl_texBufferStreamInit(EGL_Texture ** texture, EGLDisplay * display)
+bool egl_texBufferStreamInit(EGL_Texture ** texture, EGL_TexType type,
+    EGLDisplay * display)
 {
-  if (!egl_texBufferInit(texture, display))
+  if (!egl_texBufferInit(texture, type, display))
     return false;
 
   TextureBuffer * this = UPCAST(TextureBuffer, *texture);
 
-  this->texCount = 2;
+  switch(type)
+  {
+    case EGL_TEXTYPE_BUFFER_STREAM:
+    case EGL_TEXTYPE_FRAMEBUFFER:
+    case EGL_TEXTYPE_DMABUF:
+      this->texCount = 2;
+      break;
+
+    case EGL_TEXTYPE_BUFFER_MAP:
+      this->texCount = 1;
+      break;
+
+    default:
+      DEBUG_UNREACHABLE();
+  }
+
   LG_LOCK_INIT(this->copyLock);
   return true;
 }
@@ -166,8 +185,32 @@ static bool egl_texBufferStreamUpdate(EGL_Texture * texture,
   DEBUG_ASSERT(update->type == EGL_TEXTYPE_BUFFER);
 
   LG_LOCK(this->copyLock);
-  memcpy(this->buf[this->bufIndex].map, update->buffer,
-      texture->format.bufferSize);
+
+  uint8_t * dst = this->buf[this->bufIndex].map +
+    texture->format.stride * update->y +
+    update->x * texture->format.bpp;
+
+  if (update->topDown)
+  {
+    const uint8_t * src = update->buffer;
+    for(int y = 0; y < update->height; ++y)
+    {
+      memcpy(dst, src, update->stride);
+      dst += texture->format.stride;
+      src += update->stride;
+    }
+  }
+  else
+  {
+    const uint8_t * src = update->buffer + update->stride * update->height;
+    for(int y = 0; y < update->height; ++y)
+    {
+      src -= update->stride;
+      memcpy(dst, src, update->stride);
+      dst += texture->format.stride;
+    }
+  }
+
   this->buf[this->bufIndex].updated = true;
   LG_UNLOCK(this->copyLock);
 
@@ -225,7 +268,7 @@ EGL_TexStatus egl_texBufferStreamGet(EGL_Texture * texture, GLuint * tex)
 
   if (this->sync)
   {
-    switch(glClientWaitSync(this->sync, 0, 20000000)) // 20ms
+    switch(glClientWaitSync(this->sync, 0, 40000000)) // 40ms
     {
       case GL_ALREADY_SIGNALED:
       case GL_CONDITION_SATISFIED:

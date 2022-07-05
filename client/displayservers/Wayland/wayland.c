@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -87,6 +87,9 @@ static bool waylandInit(const LG_DSInitParams params)
     return false;
 
   if (!waylandRegistryInit())
+    return false;
+
+  if (!waylandActivationInit())
     return false;
 
   if (!waylandIdleInit())
@@ -187,6 +190,7 @@ struct LG_DisplayServerOps LGDS_Wayland =
   .warpPointer         = waylandWarpPointer,
   .realignPointer      = waylandRealignPointer,
   .isValidPointerPos   = waylandIsValidPointerPos,
+  .requestActivation   = waylandActivationRequestActivation,
   .inhibitIdle         = waylandInhibitIdle,
   .uninhibitIdle       = waylandUninhibitIdle,
   .wait                = waylandWait,

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -53,7 +53,7 @@ static void fps_earlyInit(void)
 
 static bool fps_init(void ** udata, const void * params)
 {
-  app_registerKeybind(KEY_D, showFPSKeybind, NULL, "FPS display toggle");
+  app_registerKeybind(0, 'D', showFPSKeybind, NULL, "FPS display toggle");
   showFPS = option_get_bool("win", "showFPS");
   return true;
 }
@@ -71,8 +71,8 @@ static int fps_render(void * udata, bool interactive, struct Rect * windowRects,
   ImVec2 pos = {0.0f, 0.0f};
   igSetNextWindowBgAlpha(0.6f);
   igSetNextWindowPos(pos, ImGuiCond_FirstUseEver, pos);
-  igPushStyleVarVec2(ImGuiStyleVar_WindowPadding, (ImVec2) { 4.0f , 4.0f });
-  igPushStyleVarVec2(ImGuiStyleVar_WindowMinSize, (ImVec2) { 0.0f , 0.0f });
+  igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2) { 4.0f , 4.0f });
+  igPushStyleVar_Vec2(ImGuiStyleVar_WindowMinSize, (ImVec2) { 0.0f , 0.0f });
 
   igBegin(
     "FPS",

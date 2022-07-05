@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -57,7 +57,6 @@ struct EGL_Desktop
   EGLDisplay * display;
 
   EGL_Texture          * texture;
-  GLuint                 sampler;
   struct DesktopShader shader;
   EGL_DesktopRects     * mesh;
   CountedBuffer        * matrix;
@@ -65,6 +64,10 @@ struct EGL_Desktop
   // internals
   int               width, height;
   LG_RendererRotate rotate;
+
+  bool useSpice;
+  int spiceWidth, spiceHeight;
+  EGL_Texture * spiceTexture;
 
   // scale algorithm
   int scaleAlgo;
@@ -126,7 +129,7 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
   desktop->display = display;
 
   if (!egl_textureInit(&desktop->texture, display,
-        useDMA ? EGL_TEXTYPE_DMABUF : EGL_TEXTYPE_FRAMEBUFFER, true))
+        useDMA ? EGL_TEXTYPE_DMABUF : EGL_TEXTYPE_FRAMEBUFFER))
   {
     DEBUG_ERROR("Failed to initialize the desktop texture");
     return false;
@@ -154,7 +157,7 @@ bool egl_desktopInit(EGL * egl, EGL_Desktop ** desktop_, EGLDisplay * display,
     return false;
   }
 
-  app_registerKeybind(KEY_N, toggleNV, desktop,
+  app_registerKeybind(0, 'N', toggleNV, desktop,
       "Toggle night vision mode");
 
   desktop->nvMax     = option_get_int("egl", "nvGainMax");
@@ -203,6 +206,7 @@ void egl_desktopFree(EGL_Desktop ** desktop)
     return;
 
   egl_textureFree    (&(*desktop)->texture      );
+  egl_textureFree    (&(*desktop)->spiceTexture );
   egl_shaderFree     (&(*desktop)->shader.shader);
   egl_desktopRectsFree(&(*desktop)->mesh        );
   countedBufferRelease(&(*desktop)->matrix      );
@@ -228,7 +232,8 @@ void egl_desktopConfigUI(EGL_Desktop * desktop)
     for (int i = 0; i < EGL_SCALE_MAX; ++i)
     {
       bool selected = i == desktop->scaleAlgo;
-      if (igSelectableBool(algorithmNames[i], selected, 0, (ImVec2) { 0.0f, 0.0f }))
+      if (igSelectable_Bool(algorithmNames[i], selected, 0,
+            (ImVec2) { 0.0f, 0.0f }))
         desktop->scaleAlgo = i;
       if (selected)
         igSetItemDefaultFocus();
@@ -280,26 +285,20 @@ bool egl_desktopSetup(EGL_Desktop * desktop, const LG_RendererFormat format)
       return false;
   }
 
-  desktop->width  = format.width;
-  desktop->height = format.height;
+  desktop->width  = format.frameWidth;
+  desktop->height = format.frameHeight;
 
   if (!egl_textureSetup(
     desktop->texture,
     pixFmt,
-    format.width,
-    format.height,
+    format.frameWidth,
+    format.frameHeight,
     format.pitch
   ))
   {
     DEBUG_ERROR("Failed to setup the desktop texture");
     return false;
   }
-
-  glGenSamplers(1, &desktop->sampler);
-  glSamplerParameteri(desktop->sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glSamplerParameteri(desktop->sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glSamplerParameteri(desktop->sampler, GL_TEXTURE_WRAP_S    , GL_CLAMP_TO_EDGE);
-  glSamplerParameteri(desktop->sampler, GL_TEXTURE_WRAP_T    , GL_CLAMP_TO_EDGE);
 
   return true;
 }
@@ -335,7 +334,7 @@ bool egl_desktopUpdate(EGL_Desktop * desktop, const FrameBuffer * frame, int dma
 
     egl_textureFree(&desktop->texture);
     if (!egl_textureInit(&desktop->texture, desktop->display,
-          EGL_TEXTYPE_FRAMEBUFFER, true))
+          EGL_TEXTYPE_FRAMEBUFFER))
     {
       DEBUG_ERROR("Failed to initialize the desktop texture");
       return false;
@@ -365,11 +364,27 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
     const float scaleX, const float scaleY, enum EGL_DesktopScaleType scaleType,
     LG_RendererRotate rotate, const struct DamageRects * rects)
 {
+  EGL_Texture * tex;
+  int width, height;
+
+  if (desktop->useSpice)
+  {
+    tex    = desktop->spiceTexture;
+    width  = desktop->spiceWidth;
+    height = desktop->spiceHeight;
+  }
+  else
+  {
+    tex    = desktop->texture;
+    width  = desktop->width;
+    height = desktop->height;
+  }
+
   if (outputWidth == 0 && outputHeight == 0)
     DEBUG_FATAL("outputWidth || outputHeight == 0");
 
   enum EGL_TexStatus status;
-  if ((status = egl_textureProcess(desktop->texture)) != EGL_TEX_STATUS_OK)
+  if ((status = egl_textureProcess(tex)) != EGL_TEX_STATUS_OK)
   {
     if (status != EGL_TEX_STATUS_NOTREADY)
       DEBUG_ERROR("Failed to process the desktop texture");
@@ -378,13 +393,13 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   int scaleAlgo = EGL_SCALE_NEAREST;
 
   egl_desktopRectsMatrix((float *)desktop->matrix->data,
-      desktop->width, desktop->height, x, y, scaleX, scaleY, rotate);
-  egl_desktopRectsUpdate(desktop->mesh, rects, desktop->width, desktop->height);
+      width, height, x, y, scaleX, scaleY, rotate);
+  egl_desktopRectsUpdate(desktop->mesh, rects, width, height);
 
   if (atomic_exchange(&desktop->processFrame, false) ||
       egl_postProcessConfigModified(desktop->pp))
-    egl_postProcessRun(desktop->pp, desktop->texture, desktop->mesh,
-        desktop->width, desktop->height, outputWidth, outputHeight);
+    egl_postProcessRun(desktop->pp, tex, desktop->mesh,
+        width, height, outputWidth, outputHeight);
 
   unsigned int finalSizeX, finalSizeY;
   GLuint texture = egl_postProcessGetOutput(desktop->pp,
@@ -395,9 +410,9 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
 
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, texture);
-  glBindSampler(0, desktop->sampler);
+  glBindSampler(0, tex->sampler);
 
-  if (finalSizeX > desktop->width || finalSizeY > desktop->height)
+  if (finalSizeX > width || finalSizeY > height)
     scaleType = EGL_DESKTOP_DOWNSCALE;
 
   switch (desktop->scaleAlgo)
@@ -431,7 +446,7 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
     {
       .type        = EGL_UNIFORM_TYPE_2F,
       .location    = shader->uDesktopSize,
-      .f           = { desktop->width, desktop->height },
+      .f           = { width, height },
     },
     {
       .type        = EGL_UNIFORM_TYPE_M3x2FV,
@@ -456,4 +471,60 @@ bool egl_desktopRender(EGL_Desktop * desktop, unsigned int outputWidth,
   egl_desktopRectsRender(desktop->mesh);
   glBindTexture(GL_TEXTURE_2D, 0);
   return true;
+}
+
+void egl_desktopSpiceConfigure(EGL_Desktop * desktop, int width, int height)
+{
+  if (!desktop->spiceTexture)
+    if (!egl_textureInit(&desktop->spiceTexture, desktop->display,
+          EGL_TEXTYPE_BUFFER_MAP))
+    {
+      DEBUG_ERROR("Failed to initialize the spice desktop texture");
+      return;
+    }
+
+  if (!egl_textureSetup(
+    desktop->spiceTexture,
+    EGL_PF_BGRA,
+    width,
+    height,
+    width * 4
+  ))
+  {
+    DEBUG_ERROR("Failed to setup the spice desktop texture");
+    return;
+  }
+
+  desktop->spiceWidth  = width;
+  desktop->spiceHeight = height;
+}
+
+void egl_desktopSpiceDrawFill(EGL_Desktop * desktop, int x, int y, int width,
+    int height, uint32_t color)
+{
+  /* this is a fairly hacky way to do this, but since it's only for the fallback
+   * spice display it's not really an issue */
+
+  uint32_t line[width];
+  for(int x = 0; x < width; ++x)
+    line[x] = color;
+
+  for(; y < height; ++y)
+    egl_textureUpdateRect(desktop->spiceTexture,
+        x, y, width, 1, sizeof(line), (uint8_t *)line, false);
+
+  atomic_store(&desktop->processFrame, true);
+}
+
+void egl_desktopSpiceDrawBitmap(EGL_Desktop * desktop, int x, int y, int width,
+    int height, int stride, uint8_t * data, bool topDown)
+{
+  egl_textureUpdateRect(desktop->spiceTexture,
+      x, y, width, height, stride, data, topDown);
+  atomic_store(&desktop->processFrame, true);
+}
+
+void egl_desktopSpiceShow(EGL_Desktop * desktop, bool show)
+{
+  desktop->useSpice = show;
 }

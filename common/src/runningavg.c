@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -19,6 +19,7 @@
  */
 
 #include "common/runningavg.h"
+#include "common/debug.h"
 
 #include <stdlib.h>
 
@@ -33,6 +34,12 @@ struct RunningAvg
 RunningAvg runningavg_new(int length)
 {
   struct RunningAvg * ra = calloc(1, sizeof(*ra) + sizeof(*ra->values) * length);
+  if (!ra)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
+
   ra->length = length;
   return ra;
 }

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,6 +21,7 @@
 #include "portal.h"
 #include "interface/capture.h"
 #include "interface/platform.h"
+#include "common/util.h"
 #include "common/debug.h"
 #include "common/stringutils.h"
 #include <string.h>
@@ -56,7 +57,7 @@ static struct pipewire * this = NULL;
 
 // forwards
 
-static bool pipewire_deinit();
+static bool pipewire_deinit(void);
 
 // implementation
 
@@ -95,7 +96,7 @@ static bool startStream(struct pw_stream * stream, uint32_t node)
     SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(6,
       SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBA,
       SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_RGBx,
-      SPA_VIDEO_FORMAT_r210, SPA_VIDEO_FORMAT_RGBA_F16),
+      SPA_VIDEO_FORMAT_xBGR_210LE, SPA_VIDEO_FORMAT_RGBA_F16),
     SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
       &SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(8192, 4320)),
     SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
@@ -151,7 +152,7 @@ static CaptureFormat convertSpaFormat(enum spa_video_format spa)
     case SPA_VIDEO_FORMAT_BGRx:
       return CAPTURE_FMT_BGRA;
 
-    case SPA_VIDEO_FORMAT_r210:
+    case SPA_VIDEO_FORMAT_xBGR_210LE:
       return CAPTURE_FMT_RGBA10;
 
     case SPA_VIDEO_FORMAT_RGBA_F16:
@@ -203,9 +204,21 @@ static void streamParamChangedCallback(void * opaque, uint32_t id,
   pw_thread_loop_signal(this->threadLoop, true);
 }
 
+static void streamStateChangedCallback(void * opaque,
+  enum pw_stream_state oldState, enum pw_stream_state newState,
+  const char * error)
+{
+  DEBUG_INFO("PipeWire stream state change: %s -> %s",
+    pw_stream_state_as_string(oldState), pw_stream_state_as_string(newState));
+
+  if (newState == PW_STREAM_STATE_ERROR)
+    DEBUG_ERROR("PipeWire stream error: %s", error);
+}
+
 static const struct pw_stream_events streamEvents = {
   PW_VERSION_STREAM_EVENTS,
   .process       = streamProcessCallback,
+  .state_changed = streamStateChangedCallback,
   .param_changed = streamParamChangedCallback,
 };
 
@@ -411,14 +424,16 @@ static CaptureResult pipewire_waitFrame(CaptureFrame * frame,
   const int bpp = this->format == CAPTURE_FMT_RGBA16F ? 8 : 4;
   const unsigned int maxHeight = maxFrameSize / (this->width * bpp);
 
-  frame->formatVer  = this->formatVer;
-  frame->format     = this->format;
-  frame->width      = this->width;
-  frame->height     = maxHeight > this->height ? this->height : maxHeight;
-  frame->realHeight = this->height;
-  frame->pitch      = this->width * bpp;
-  frame->stride     = this->width;
-  frame->rotation   = CAPTURE_ROT_0;
+  frame->formatVer    = this->formatVer;
+  frame->format       = this->format;
+  frame->screenWidth  = this->width;
+  frame->screenHeight = this->height;
+  frame->frameWidth   = this->width;
+  frame->frameHeight  = min(maxHeight, this->height);
+  frame->truncated    = maxHeight < this->height;
+  frame->pitch        = this->width * bpp;
+  frame->stride       = this->width;
+  frame->rotation     = CAPTURE_ROT_0;
 
   // TODO: implement damage.
   frame->damageRectsCount = 0;

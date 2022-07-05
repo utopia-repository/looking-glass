@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,7 +24,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores);
+bool lgCPUInfo(char * model, size_t modelSize, int * procs, int * cores,
+  int * sockets);
 void lgDebugCPU(void);
 
 #endif

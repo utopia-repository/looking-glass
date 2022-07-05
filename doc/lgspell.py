@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import re
 
+from lgrelease import release
+
 from enchant.tokenize import Filter
 
 reacronym = re.compile(r'^[A-Z]+s?$')
@@ -8,7 +10,7 @@ reoption = re.compile(r'^[a-z]+:\w+$')
 recamel = re.compile(r'^[A-Za-z]+[A-Z]\w+$')
 repackage = re.compile(r'^[\w-]+-(?:dev|bin)$|^fonts-[\w-]+-ttf$|^virt-manager$')
 repath = re.compile(r'^/dev/|.*\.\w+$')
-recrypto = re.compile(r'^[13][A-Za-z0-9]{25,34}$|^0x[0-9a-fA-F]{40}$')
+recrypto = re.compile(r'^[13][A-Za-z0-9]{25,34}$|^0x[0-9a-fA-F]{40}|^4([0-9]|[A-B])(.){93}$')
 
 
 class AcronymFilter(Filter):
@@ -34,6 +36,11 @@ class PathFilter(Filter):
 class CryptoAddressFilter(Filter):
     def _skip(self, word):
         return recrypto.match(word)
+
+
+class VersionFilter(Filter):
+    def _skip(self, word):
+        return word == release
 
 
 if __name__ == '__main__':

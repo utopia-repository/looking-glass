@@ -47,10 +47,24 @@ Installing Build Dependencies
 
 These required libraries and tools should be installed first.
 
+.. note::
+
+   The below list of dependencies is for Debian. A community maintained list of
+   dependencies for other distributions for the current **stable** version of
+   Looking Glass is maintained on the wiki at:
+   https://looking-glass.io/wiki/Installation_on_other_distributions
+
 .. _client_dependencies:
 
 Required Dependencies
 ^^^^^^^^^^^^^^^^^^^^^
+
+..
+   Editor note: Listed dependencies are Debian packages containing the
+   required resources. All dependencies must be explicitly defined.
+   Omitting required dependencies that happen to be pulled in via
+   Depends: or Recommends: from another listed package is not allowed.
+   All required packages must be listed.
 
 -  cmake
 -  gcc, g++ \| clang
@@ -93,6 +107,15 @@ feature is disabled when running :ref:`cmake <client_building>`.
    -  libwayland-dev
    -  wayland-protocols
 
+-  Disable with ``cmake -DENABLE_PIPEWIRE=no ..``
+
+   -  libpipewire-0.3-dev
+   -  libsamplerate0-dev
+
+-  Disable with ``cmake -DENABLE_PULSEAUDIO=no ..``
+
+   -  libpulse-dev
+   -  libsamplerate0-dev
 
 .. _client_deps_recommended:
 
@@ -109,15 +132,17 @@ Fetching with APT
 
 You can fetch these dependencies with the following command:
 
-``apt-get install binutils-dev cmake fonts-dejavu-core libfontconfig-dev
-gcc g++ pkg-config libegl-dev libgl-dev libgles-dev libspice-protocol-dev
-nettle-dev libx11-dev libxcursor-dev libxi-dev libxinerama-dev
-libxpresent-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols``
+.. code:: bash
+
+   apt-get install binutils-dev cmake fonts-dejavu-core libfontconfig-dev \
+   gcc g++ pkg-config libegl-dev libgl-dev libgles-dev libspice-protocol-dev \
+   nettle-dev libx11-dev libxcursor-dev libxi-dev libxinerama-dev \
+   libxpresent-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+   libpipewire-0.3-dev libpulse-dev libsamplerate0-dev
 
 You may omit some dependencies, if you disable the feature which requires them
 when running :ref:`cmake <client_building>`.
 (See :ref:`client_deps_may_be_disabled`)
-
 
 .. _client_building:
 
@@ -138,24 +163,40 @@ into the *LookingGlass* directory.
 This will build the **looking-glass-client** binary, which is used to display
 frames from the guest.
 
-.. note::
+You can then :ref:`continue installing Looking Glass <client_install>`, or run
+it directly from the build directory:
 
-   For users running GNOME on Wayland, you likely want to pass
-   ``-DENABLE_LIBDECOR=ON`` to ``cmake``, i.e. run ``cmake -DENABLE_LIBDECOR=ON ../``.
+.. code:: bash
 
-   For details, see :ref:`the FAQ <gnome_wayland_decorations>`.
+   ./looking-glass-client
 
 .. seealso::
 
-   -  :ref:`Installing the Client <client_install>`
+   -  :ref:`Client Installation <client_install>`
    -  :ref:`Client Usage <client_usage>`
 
 .. note::
 
-   The most common compile error is related to backtrace support. This can be
-   disabled by adding the following option to the cmake command:
-   ``-DENABLE_BACKTRACE=0``. However, if you disable this and need support for
-   a crash, use ``gdb`` to obtain a backtrace manually.
+   For users running GNOME on Wayland, you may want to enable libdecor when
+   building.
+
+   .. code:: bash
+
+      cmake -DENABLE_LIBDECOR=ON ../
+
+   For details, see :ref:`the FAQ <gnome_wayland_decorations>`.
+
+.. note::
+
+   The most common compile error is related to backtrace support. Try disabling
+   this when building:
+
+   .. code:: bash
+
+      cmake -DENABLE_BACKTRACE=0 ../
+
+   If you disable this and need support for crash, use ``gdb`` to obtain a
+   backtrace manually.
 
 .. _host_building:
 

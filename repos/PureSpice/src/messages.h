@@ -17,7 +17,12 @@ this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
+#ifndef _H_I_MESSAGES_
+#define _H_I_MESSAGES_
+
 #include <stdint.h>
+#include <spice/enums.h>
+#include "draw.h"
 
 #pragma pack(push,1)
 
@@ -47,10 +52,23 @@ typedef struct SpiceChannelID
 }
 SpiceChannelID;
 
+typedef struct SpiceMsgMainName
+{
+  uint32_t name_len;
+  uint8_t  name[]; //name_len
+}
+SpiceMsgMainName;
+
+typedef struct SpiceMsgMainUUID
+{
+  uint8_t uuid[16];
+}
+SpiceMsgMainUUID;
+
 typedef struct SpiceMsgMainChannelsList
 {
-  uint32_t num_of_channels;
-  //SpiceChannelID channels[num_of_channels]
+  uint32_t       num_of_channels;
+  SpiceChannelID channels[];
 }
 SpiceMainChannelsList;
 
@@ -88,7 +106,7 @@ typedef struct SpiceMsgNotify
   uint32_t visibility;
   uint32_t what;
   uint32_t message_len;
-  //char message[message_len+1]
+  char     message[]; //message_len+1
 }
 SpiceMsgNotify;
 
@@ -139,14 +157,133 @@ typedef struct SpiceMsgcDisconnecting
 }
 SpiceMsgcDisconnecting;
 
-// spice is missing these defines, the offical reference library incorrectly uses the VD defines
-#define COMMON_CAPS_BYTES (((SPICE_COMMON_CAP_MINI_HEADER + 32) / 8) & ~3)
-#define COMMON_SET_CAPABILITY(caps, index) \
+typedef struct SpiceMsgPlaybackStart
+{
+  uint32_t      channels;
+  SpiceAudioFmt format:16;
+  uint32_t      frequency;
+  uint32_t      time;
+}
+SpiceMsgPlaybackStart;
+
+typedef struct SpiceMsgRecordStart
+{
+  uint32_t channels;
+  uint16_t format;
+  uint32_t frequency;
+}
+SpiceMsgRecordStart;
+
+typedef struct SpiceMsgPlaybackPacket
+{
+  uint32_t time;
+  uint8_t  data[];
+}
+SpiceMsgPlaybackPacket,
+SpiceMsgcRecordPacket;
+
+typedef struct SpiceMsgAudioVolume
+{
+  uint8_t  nchannels;
+  uint16_t volume[];
+}
+SpiceMsgAudioVolume;
+
+typedef struct SpiceMsgAudioMute
+{
+  uint8_t mute;
+}
+SpiceMsgAudioMute;
+
+typedef struct SpiceMsgcPlaybackMode
+{
+  uint32_t           time;
+  SpiceAudioDataMode mode:16;
+  uint8_t            data[];
+}
+SpiceMsgPlaybackMode,
+SpiceMsgcRecordMode;
+
+typedef struct SpiceMsgcDisplayInit
+{
+  uint8_t  pixmap_cache_id;
+  int64_t  pixmap_cache_size;
+  uint8_t  glz_dictionary_id;
+  uint32_t glz_dictionary_window_size;
+}
+SpiceMsgcDisplayInit;
+
+typedef struct SpiceMsgcPreferredCompression
+{
+  uint8_t image_compression;
+}
+SpiceMsgcPreferredCompression;
+
+typedef struct SpiceMsgSurfaceCreate
+{
+  uint32_t surface_id;
+  uint32_t width;
+  uint32_t height;
+  uint32_t format;
+  uint32_t flags;
+}
+SpiceMsgSurfaceCreate;
+
+typedef struct SpiceMsgSurfaceDestroy
+{
+  uint32_t surface_id;
+}
+SpiceMsgSurfaceDestroy;
+
+typedef struct SpiceMsgDisplayBase
+{
+  uint32_t surface_id;
+  SpiceRect box;
+  SpiceClip clip;
+}
+SpiceMsgDisplayBase;
+
+typedef struct SpiceMsgDisplayDrawFill
+{
+  SpiceMsgDisplayBase base;
+  SpiceFill data;
+}
+SpiceMsgDisplayDrawFill;
+
+typedef struct SpiceMsgDisplayDrawCopy
+{
+  SpiceMsgDisplayBase base;
+  SpiceCopy data;
+}
+SpiceMsgDisplayDrawCopy;
+
+// spice is missing these defines, the offical reference library incorrectly
+// uses the VD defines
+
+#define HAS_CAPABILITY(caps, caps_size, index) \
+  ((index) < (caps_size * 32) && ((caps)[(index) / 32] & (1 << ((index) % 32))))
+
+#define _SET_CAPABILITY(caps, index) \
     { (caps)[(index) / 32] |= (1 << ((index) % 32)); }
+
+#define COMMON_CAPS_BYTES (((SPICE_COMMON_CAP_MINI_HEADER + 32) / 8) & ~3)
+#define COMMON_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
 
 #define MAIN_CAPS_BYTES (((SPICE_MAIN_CAP_SEAMLESS_MIGRATE + 32) / 8) & ~3)
-#define MAIN_SET_CAPABILITY(caps, index) \
-    { (caps)[(index) / 32] |= (1 << ((index) % 32)); }
+#define MAIN_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
 
+#define INPUT_CAPS_BYTES (((SPICE_INPUTS_CAP_KEY_SCANCODE + 32) / 8) & ~3)
+#define INPUT_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
+
+#define PLAYBACK_CAPS_BYTES (((SPICE_PLAYBACK_CAP_OPUS + 32) / 8) & ~3)
+#define PLAYBACK_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
+
+#define RECORD_CAPS_BYTES (((SPICE_RECORD_CAP_OPUS + 32) / 8) & ~3)
+#define RECORD_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
+
+#define DISPLAY_CAPS_BYTES (((SPICE_DISPLAY_CAP_CODEC_H265 + 32) / 8) & ~3)
+#define DISPLAY_SET_CAPABILITY(caps, index) _SET_CAPABILITY(caps, index)
 
 #pragma pack(pop)
+
+#endif
