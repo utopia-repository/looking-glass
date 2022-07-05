@@ -1,3 +1,10 @@
+looking-glass (0+b5+git408~e98913f1-0utopia1) UNRELEASED; urgency=medium
+
+  * New upstream git snapshot.
+    - Add support for routing audio via SPICE
+
+ -- James Lu <james@overdrivenetworks.com>  Mon, 04 Jul 2022 23:32:35 -0700
+
 looking-glass (0+b5.0.1-2) unstable; urgency=medium
 
   * Added new binary package obs-plugin-looking-glass
