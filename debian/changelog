@@ -2,6 +2,7 @@ looking-glass (0+b5+git408~e98913f1-0utopia1) UNRELEASED; urgency=medium
 
   * New upstream git snapshot.
     - Add support for routing audio via SPICE
+  * Add B-D: libpipewire-0.3-dev, libpulse-dev, libsamplerate0-dev
 
  -- James Lu <james@overdrivenetworks.com>  Mon, 04 Jul 2022 23:32:35 -0700
 
