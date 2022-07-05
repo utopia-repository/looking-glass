@@ -1,4 +1,4 @@
-looking-glass (0+b5+git408~e98913f1-0utopia1) UNRELEASED; urgency=medium
+looking-glass (0+b5.git408~e98913f1-0utopia1) UNRELEASED; urgency=medium
 
   * New upstream git snapshot.
     - Add support for routing audio via SPICE
