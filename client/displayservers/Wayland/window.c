@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -57,6 +57,12 @@ void waylandWindowUpdateScale(void)
 static void wlSurfaceEnterHandler(void * data, struct wl_surface * surface, struct wl_output * output)
 {
   struct SurfaceOutput * node = malloc(sizeof(*node));
+  if (!node)
+  {
+    DEBUG_ERROR("out of memory");
+    return;
+  }
+
   node->output = output;
   wl_list_insert(&wlWm.surfaceOutputs, &node->link);
   waylandWindowUpdateScale();

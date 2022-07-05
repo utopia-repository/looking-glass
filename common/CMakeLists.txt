@@ -4,7 +4,7 @@ project(lg_common LANGUAGES C)
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake/")
 
 include_directories(
-	${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/include
 )
 
 add_definitions(-D_GNU_SOURCE)
@@ -34,14 +34,16 @@ set(COMMON_SOURCES
   src/ringbuffer.c
   src/vector.c
   src/cpuinfo.c
+  src/debug.c
+  src/ll.c
 )
 
 add_library(lg_common STATIC ${COMMON_SOURCES})
 target_link_libraries(lg_common lg_common_platform)
 
 target_include_directories(lg_common
-	INTERFACE
-		include
-	PRIVATE
-		src
+  INTERFACE
+    include
+  PRIVATE
+    src
 )

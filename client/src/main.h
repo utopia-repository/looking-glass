@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,8 +31,9 @@
 #include "common/locking.h"
 #include "common/ringbuffer.h"
 #include "common/event.h"
+#include "common/ll.h"
 
-#include "spice/spice.h"
+#include <purespice.h>
 #include <lgmp/client.h>
 
 #include "cimgui.h"
@@ -44,6 +45,12 @@ enum RunState
   APP_STATE_SHUTDOWN
 };
 
+enum MicDefaultState {
+  MIC_DEFAULT_PROMPT,
+  MIC_DEFAULT_ALLOW,
+  MIC_DEFAULT_DENY
+};
+
 struct AppState
 {
   enum RunState state;
@@ -53,6 +60,7 @@ struct AppState
   struct ll      * overlays;
   char           * fontName;
   ImFont         * fontLarge;
+  ImVector_ImWchar fontRange;
   bool             overlayInput;
   ImGuiMouseCursor cursorLast;
   char           * imGuiIni;
@@ -61,15 +69,20 @@ struct AppState
   bool             modAlt;
   bool             modSuper;
   uint64_t         lastImGuiFrame;
-
-  bool        alertShow;
-  char      * alertMessage;
-  LG_MsgAlert alertType;
-  uint64_t    alertTimeout;
+  bool             renderImGuiTwice;
 
   struct LG_DisplayServerOps * ds;
   bool                         dsInitialized;
   bool                         jitRender;
+
+  uint8_t spiceUUID[16];
+  bool    spiceReady;
+  bool    initialSpiceDisplay;
+  uint8_t guestUUID[16];
+  bool    guestUUIDValid;
+  KVMFROS guestOS;
+
+  bool lgHostConnected;
 
   bool                 stopVideo;
   bool                 ignoreInput;
@@ -77,8 +90,7 @@ struct AppState
   uint64_t             escapeTime;
   int                  escapeAction;
   bool                 escapeHelp;
-  KeybindHandle        bindings[KEY_MAX];
-  const char *         keyDescription[KEY_MAX];
+  struct ll          * bindings;
   bool                 keyDown[KEY_MAX];
 
   bool                 haveSrcSize;
@@ -93,6 +105,7 @@ struct AppState
   LG_RendererRect      dstRect;
   bool                 posInfoValid;
   bool                 alignToGuest;
+  bool                 spiceClose;
 
   LG_Renderer        * lgr;
   atomic_int           lgrResize;
@@ -100,7 +113,7 @@ struct AppState
   bool                 useDMA;
 
   bool                 cbAvailable;
-  SpiceDataType        cbType;
+  PSDataType           cbType;
   bool                 cbChunked;
   size_t               cbXfer;
   struct ll          * cbRequestList;
@@ -108,6 +121,7 @@ struct AppState
   struct IVSHMEM       shm;
   PLGMPClient          lgmp;
   PLGMPClientQueue     pointerQueue;
+  LG_Lock              pointerQueueLock;
   KVMFRFeatureFlags    kvmfrFeatures;
 
   LGThread            * cursorThread;
@@ -137,75 +151,86 @@ struct AppState
 
 struct AppParams
 {
-  bool              autoResize;
-  bool              allowResize;
-  bool              keepAspect;
-  bool              forceAspect;
-  bool              dontUpscale;
-  bool              shrinkOnUpscale;
-  bool              borderless;
-  bool              fullscreen;
-  bool              maximize;
-  bool              minimizeOnFocusLoss;
-  bool              center;
-  int               x, y;
-  unsigned int      w, h;
-  int               fpsMin;
-  LG_RendererRotate winRotate;
-  bool              useSpiceInput;
-  bool              useSpiceClipboard;
-  const char *      spiceHost;
-  unsigned int      spicePort;
-  bool              clipboardToVM;
-  bool              clipboardToLocal;
-  bool              scaleMouseInput;
-  bool              hideMouse;
-  bool              ignoreQuit;
-  bool              noScreensaver;
-  bool              autoScreensaver;
-  bool              grabKeyboard;
-  bool              grabKeyboardOnFocus;
-  int               escapeKey;
-  bool              ignoreWindowsKeys;
-  bool              releaseKeysOnFocusLoss;
-  bool              showAlerts;
-  bool              captureOnStart;
-  bool              quickSplash;
-  bool              alwaysShowCursor;
-  uint64_t          helpMenuDelayUs;
-  const char *      uiFont;
-  int               uiSize;
-  bool              jitRender;
+  bool                 autoResize;
+  bool                 allowResize;
+  bool                 keepAspect;
+  bool                 forceAspect;
+  bool                 dontUpscale;
+  bool                 intUpscale;
+  bool                 shrinkOnUpscale;
+  bool                 borderless;
+  bool                 fullscreen;
+  bool                 maximize;
+  bool                 minimizeOnFocusLoss;
+  bool                 center;
+  int                  x, y;
+  unsigned int         w, h;
+  int                  fpsMin;
+  LG_RendererRotate    winRotate;
+  bool                 useSpice;
+  bool                 useSpiceInput;
+  bool                 useSpiceClipboard;
+  bool                 useSpiceAudio;
+  const char *         spiceHost;
+  unsigned int         spicePort;
+  bool                 clipboardToVM;
+  bool                 clipboardToLocal;
+  bool                 scaleMouseInput;
+  bool                 hideMouse;
+  bool                 ignoreQuit;
+  bool                 noScreensaver;
+  bool                 autoScreensaver;
+  bool                 grabKeyboard;
+  bool                 grabKeyboardOnFocus;
+  int                  escapeKey;
+  bool                 ignoreWindowsKeys;
+  bool                 releaseKeysOnFocusLoss;
+  bool                 showAlerts;
+  bool                 captureOnStart;
+  bool                 quickSplash;
+  bool                 overlayDim;
+  bool                 alwaysShowCursor;
+  uint64_t             helpMenuDelayUs;
+  const char *         uiFont;
+  int                  uiSize;
+  bool                 jitRender;
 
-  unsigned int      cursorPollInterval;
-  unsigned int      framePollInterval;
-  bool              allowDMA;
+  unsigned int         cursorPollInterval;
+  unsigned int         framePollInterval;
+  bool                 allowDMA;
 
-  bool              forceRenderer;
-  unsigned int      forceRendererIndex;
+  bool                 forceRenderer;
+  unsigned int         forceRendererIndex;
 
-  const char *      windowTitle;
-  bool              mouseRedraw;
-  int               mouseSens;
-  bool              mouseSmoothing;
-  bool              rawMouse;
-  bool              autoCapture;
-  bool              captureInputOnly;
-  bool              showCursorDot;
+  const char *         windowTitle;
+  bool                 mouseRedraw;
+  int                  mouseSens;
+  bool                 mouseSmoothing;
+  bool                 rawMouse;
+  bool                 autoCapture;
+  bool                 captureInputOnly;
+  bool                 showCursorDot;
+
+  int                  audioPeriodSize;
+  int                  audioBufferLatency;
+  bool                 micShowIndicator;
+  enum MicDefaultState micDefaultState;
 };
 
 struct CBRequest
 {
-  SpiceDataType       type;
+  PSDataType          type;
   LG_ClipboardReplyFn replyFn;
   void              * opaque;
 };
 
 struct KeybindHandle
 {
-  int       sc;
-  KeybindFn callback;
-  void    * opaque;
+  int          sc;
+  int          charcode;
+  KeybindFn    callback;
+  const char * description;
+  void *       opaque;
 };
 
 enum WarpState
@@ -245,6 +270,9 @@ struct CursorState
 
   /* true if the guest should be realigned to the host when next drawn */
   bool realign;
+
+  /* true if the guest is currently realigning to the host */
+  bool realigning;
 
   /* true if the cursor needs re-drawing/updating */
   bool redraw;

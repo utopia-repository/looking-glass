@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,7 +23,7 @@
 #include "texture.h"
 
 #include "common/debug.h"
-#include "ll.h"
+#include "common/ll.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -124,10 +124,31 @@ void egl_modelSetDefault(EGL_Model * model, bool flipped)
 void egl_modelAddVerts(EGL_Model * model, const GLfloat * verticies, const GLfloat * uvs, const size_t count)
 {
   struct FloatList * fl = malloc(sizeof(*fl));
+  if (!fl)
+  {
+    DEBUG_ERROR("out of memory");
+    return;
+  }
 
   fl->count = count;
-  fl->v     = malloc(sizeof(GLfloat) * count * 3);
-  fl->u     = malloc(sizeof(GLfloat) * count * 2);
+
+  fl->v = malloc(sizeof(GLfloat) * count * 3);
+  if (!fl->v)
+  {
+    DEBUG_ERROR("out of memory");
+    free(fl);
+    return;
+  }
+
+  fl->u = malloc(sizeof(GLfloat) * count * 2);
+  if (!fl->u)
+  {
+    DEBUG_ERROR("out of memory");
+    free(fl->v);
+    free(fl);
+    return;
+  }
+
   memcpy(fl->v, verticies, sizeof(GLfloat) * count * 3);
 
   if (uvs)
@@ -164,18 +185,20 @@ void egl_modelRender(EGL_Model * model)
 
     /* buffer the verticies */
     struct FloatList * fl;
-    for(ll_reset(model->verticies); ll_walk(model->verticies, (void **)&fl);)
+    ll_lock(model->verticies);
+    ll_forEachNL(model->verticies, item, fl)
     {
       glBufferSubData(GL_ARRAY_BUFFER, offset, sizeof(GLfloat) * fl->count * 3, fl->v);
       offset += sizeof(GLfloat) * fl->count * 3;
     }
 
     /* buffer the uvs */
-    for(ll_reset(model->verticies); ll_walk(model->verticies, (void **)&fl);)
+    ll_forEachNL(model->verticies, item, fl)
     {
       glBufferSubData(GL_ARRAY_BUFFER, offset, sizeof(GLfloat) * fl->count * 2, fl->u);
       offset += sizeof(GLfloat) * fl->count * 2;
     }
+    ll_unlock(model->verticies);
 
     /* set up vertex arrays in the VAO */
     glEnableVertexAttribArray(0);
@@ -199,11 +222,13 @@ void egl_modelRender(EGL_Model * model)
   /* draw the arrays */
   GLint offset = 0;
   struct FloatList * fl;
-  for(ll_reset(model->verticies); ll_walk(model->verticies, (void **)&fl);)
+  ll_lock(model->verticies);
+  ll_forEachNL(model->verticies, item, fl)
   {
     glDrawArrays(GL_TRIANGLE_STRIP, offset, fl->count);
     offset += fl->count;
   }
+  ll_unlock(model->verticies);
 
   /* unbind and cleanup */
   glBindTexture(GL_TEXTURE_2D, 0);

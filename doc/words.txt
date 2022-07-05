@@ -4,8 +4,10 @@ cgroups
 clang
 cmake
 config
+Debian
 dejavu
 deuteranope
+dev
 dir
 distros
 dmabuf
@@ -19,6 +21,8 @@ ini
 kvmfr
 laggy
 libdecor
+libpipewire
+libpulse
 libvirt
 linux
 LookingGlass

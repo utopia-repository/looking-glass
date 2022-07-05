@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,23 +22,50 @@
 #define _H_OVERLAYS_H
 
 #include "interface/overlay.h"
+#include "overlay/msg.h"
 
+struct Overlay
+{
+  const struct LG_OverlayOps * ops;
+  const void * params;
+  void       * udata;
+  int          lastRectCount;
+  struct Rect  lastRects[MAX_OVERLAY_RECTS];
+};
+
+extern struct LG_OverlayOps LGOverlaySplash;
 extern struct LG_OverlayOps LGOverlayAlert;
 extern struct LG_OverlayOps LGOverlayFPS;
 extern struct LG_OverlayOps LGOverlayGraphs;
 extern struct LG_OverlayOps LGOverlayHelp;
 extern struct LG_OverlayOps LGOverlayConfig;
+extern struct LG_OverlayOps LGOverlayMsg;
+extern struct LG_OverlayOps LGOverlayStatus;
+
+void overlayAlert_show(LG_MsgAlert type, const char * fmt, va_list args);
 
 GraphHandle overlayGraph_register(const char * name, RingBuffer buffer,
-    float min, float max);
-void overlayGraph_unregister();
+    float min, float max, GraphFormatFn formatFn);
+void overlayGraph_unregister(GraphHandle handle);
 void overlayGraph_iterate(void (*callback)(GraphHandle handle, const char * name,
     bool * enabled, void * udata), void * udata);
+void overlayGraph_invalidate(GraphHandle handle);
 
 void overlayConfig_register(const char * title,
     void (*callback)(void * udata, int * id), void * udata);
 
 void overlayConfig_registerTab(const char * title,
     void (*callback)(void * udata, int * id), void * udata);
+
+typedef enum LG_UserStatus
+{
+  LG_USER_STATUS_SPICE,
+  LG_USER_STATUS_RECORDING,
+  LG_USER_STATUS_MAX
+}
+LGUserStatus;
+
+void overlaySplash_show(bool show);
+void overlayStatus_set(LGUserStatus, bool value);
 
 #endif

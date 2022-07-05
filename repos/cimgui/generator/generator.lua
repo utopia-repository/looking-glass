@@ -8,12 +8,13 @@ local script_args = {...}
 local COMPILER = script_args[1]
 local INTERNAL_GENERATION = script_args[2]:match("internal") and true or false
 local FREETYPE_GENERATION = script_args[2]:match("freetype") and true or false
+local IMGUI_PATH = os.getenv"IMGUI_PATH" or "../imgui"
 local CFLAGS = ""
 local CPRE,CTEST
 --get implementations
 local implementations = {}
 for i=3,#script_args do
-    if script_args[i]:match(COMPILER == cl and "^/" or "^%-") then
+    if script_args[i]:match(COMPILER == "cl" and "^/" or "^%-") then
         local key, value = script_args[i]:match("^(.+)=(.+)$")
         if key and value then
             CFLAGS = CFLAGS .. " " .. key .. "=\"" .. value:gsub("\"", "\\\"") .. "\"";
@@ -25,11 +26,15 @@ for i=3,#script_args do
     end
 end
 
+if FREETYPE_GENERATION then
+	CFLAGS = CFLAGS .. " -DIMGUI_ENABLE_FREETYPE "
+end
+
 if COMPILER == "gcc" or COMPILER == "clang" then
     CPRE = COMPILER..[[ -E -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DIMGUI_API="" -DIMGUI_IMPL_API="" ]] .. CFLAGS
     CTEST = COMPILER.." --version"
 elseif COMPILER == "cl" then
-    CPRE = COMPILER..[[ /E /DIMGUI_DISABLE_OBSOLETE_FUNCTIONS /DIMGUI_API="" /DIMGUI_IMPL_API="" ]] .. CFLAGS
+    CPRE = COMPILER..[[ /E /DIMGUI_DISABLE_OBSOLETE_FUNCTIONS /DIMGUI_DEBUG_PARANOID /DIMGUI_API="" /DIMGUI_IMPL_API="" ]] .. CFLAGS
     CTEST = COMPILER
 else
     print("Working without compiler ")
@@ -58,6 +63,7 @@ assert(HAVE_COMPILER,"gcc, clang or cl needed to run script")
 print("HAVE_COMPILER",HAVE_COMPILER)
 print("INTERNAL_GENERATION",INTERNAL_GENERATION)
 print("FREETYPE_GENERATION",FREETYPE_GENERATION)
+print("CPRE",CPRE)
 --------------------------------------------------------------------------
 --this table has the functions to be skipped in generation
 --------------------------------------------------------------------------
@@ -115,7 +121,8 @@ local function func_header_impl_generate(FP)
 			else
                 
                 if def.stname == "" then --ImGui namespace or top level
-                    table.insert(outtab,"CIMGUI_API".." "..def.ret.." "..def.ov_cimguiname..def.args..";"..addcoment.."\n")
+                    local empty = def.args:match("^%(%)") --no args
+                    table.insert(outtab,"CIMGUI_API".." "..def.ret.." "..def.ov_cimguiname..(empty and "(void)" or def.args)..";"..addcoment.."\n")
                 else
 					cpp2ffi.prtable(def)
                     error("class function in implementations")
@@ -135,14 +142,16 @@ local func_implementation = cpp2ffi.func_implementation
 
 -------------------functions for getting and setting defines
 local function get_defines(t)
-    if COMPILER == "cl" then print"can't get defines with cl compiler"; return {} end
-    print(COMPILER..[[ -E -dM -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DIMGUI_API="" -DIMGUI_IMPL_API="" ../imgui/imgui.h]] .. CFLAGS)
-    local pipe,err = io.popen(COMPILER..[[ -E -dM -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DIMGUI_API="" -DIMGUI_IMPL_API="" ../imgui/imgui.h]] .. CFLAGS,"r")
+    local compiler_cmd = COMPILER == "cl"
+                         and COMPILER..[[ /TP /nologo /c /Fo"NUL" /I "]]..IMGUI_PATH..[[" print_defines.cpp]]..CFLAGS
+                         or COMPILER..[[ -E -dM -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS -DIMGUI_API="" -DIMGUI_IMPL_API="" ]]..IMGUI_PATH..[[/imgui.h]]..CFLAGS
+    print(compiler_cmd)
+    local pipe,err = io.popen(compiler_cmd,"r")
     local defines = {}
     while true do
         local line = pipe:read"*l"
         if not line then break end
-        local key,value = line:match([[#define%s+(%S+)%s*(.*)]])
+        local key,value = line:match([[^#define%s+(%S+)%s*(.*)]])
         if not key then --or not value then 
             --print(line)
         else
@@ -158,7 +167,7 @@ local function get_defines(t)
         local aa = defines[v]
         while true do
             local tmp = defines[aa]
-            if not tmp then 
+            if not tmp then
                 break
             else
                 aa = tmp
@@ -240,36 +249,7 @@ local function repair_defaults(defsT,str_and_enu)
 	end
 end
 
-----------custom ImVector templates
-local table_do_sorted = cpp2ffi.table_do_sorted
-local function generate_templates(code,codeimpool,templates)
-    table.insert(code,"\n"..[[typedef struct ImVector{int Size;int Capacity;void* Data;} ImVector;]].."\n")
-	table_do_sorted(templates , function (ttype, v)
-		if ttype == "ImVector" then
-			table_do_sorted(v, function(te,newte)
-				table.insert(code,"typedef struct ImVector_"..newte.." {int Size;int Capacity;"..te.."* Data;} ImVector_"..newte..";\n")
-			end)
-		elseif ttype == "ImPool" then
-			--declare ImGuiStorage
-			table_do_sorted(v, function(te, newte)
-				table.insert(codeimpool,"typedef struct ImVector_"..newte.." {int Size;int Capacity;"..te.."* Data;} ImVector_"..newte..";\n")
-				table.insert(codeimpool,"typedef struct ImPool_"..newte.." {ImVector_"..te.." Buf;ImGuiStorage Map;ImPoolIdx FreeIdx;} ImPool_"..newte..";\n")
-			end)
-		elseif ttype == "ImChunkStream" then
-			table_do_sorted(v, function(te,newte)
-				table.insert(code,"typedef struct ImVector_"..newte.." {int Size;int Capacity;"..te.."* Data;} ImVector_"..newte..";\n")
-				table.insert(code,"typedef struct ImChunkStream_"..newte.." {ImVector_"..te.." Buf;} ImChunkStream_"..newte..";\n")
-			end)
-		elseif ttype == "ImSpan" then
-			table_do_sorted(v, function(te,newte)
-				table.insert(code,"typedef struct ImSpan_"..newte.." {"..te.."* Data;" ..te.."* DataEnd;} ImSpan_"..newte..";\n")
-			end)
-		else
-			print("generate_templates ttype not done",ttype)
-			error"generate templates"
-		end
-	end)
-end
+
 --generate cimgui.cpp cimgui.h 
 local function cimgui_generation(parser)
 
@@ -300,15 +280,9 @@ local function cimgui_generation(parser)
 	cpp2ffi.prtable(parser.templates)
 	cpp2ffi.prtable(parser.typenames)
 	
-	local outtab = {}
-	local outtabpool = {}
-    generate_templates(outtab, outtabpool, parser.templates)
-	
-	--move outtabpool after ImGuiStorage definition
-	local outpost1, outpost2 = outpost:match("^(.+struct ImGuiStorage%s*\n%b{};\n)(.+)$")
-	outpost = outpost1..table.concat(outtabpool)..outpost2
 
-	local cstructsstr = outpre..table.concat(outtab,"")..outpost --..(extra or "")
+	local  tdt = parser:generate_templates()
+	local cstructsstr = outpre..tdt..outpost 
     
 	if gdefines.IMGUI_HAS_DOCK then
 		cstructsstr = cstructsstr.."\n#define IMGUI_HAS_DOCK       1\n"
@@ -328,41 +302,21 @@ local function cimgui_generation(parser)
     local hstrfile = read_data"./cimgui_template.cpp"
 
     hstrfile = hstrfile:gsub([[#include "auto_funcs%.cpp"]],cimplem)
-    save_data("./output/cimgui.cpp",cimgui_header,hstrfile)
+	local ftdef = FREETYPE_GENERATION and "#define IMGUI_ENABLE_FREETYPE\n" or ""
+    save_data("./output/cimgui.cpp",cimgui_header, ftdef, hstrfile)
 
 end
 --------------------------------------------------------
 -----------------------------do it----------------------
 --------------------------------------------------------
 --get imgui.h version and IMGUI_HAS_DOCK--------------------------
---get some defines wont work for cl ----------------
+--defines for the cl compiler must be present in the print_defines.cpp file
 gdefines = get_defines{"IMGUI_VERSION","FLT_MAX","FLT_MIN","IMGUI_HAS_DOCK","IMGUI_HAS_IMSTR"}
---this will work for cl
-local pipe,err = io.open("../imgui/imgui.h","r")
-if not pipe then
-    error("could not open file:"..err)
-end
-local imgui_version,has_dock,has_imstr 
-while true do
-    local line = pipe:read"*l"
-	if not line then break end
-	if not imgui_version then
-		imgui_version = line:match([[#define%s+IMGUI_VERSION%s+(".+")]])
-	end
-	if not has_dock then
-		has_dock = line:match([[#define%s+IMGUI_HAS_DOCK]])--%s*(".+")]])
-	end
-	if not has_imstr then
-		has_imstr = line:match([[#define%s+IMGUI_HAS_IMSTR]])--%s*(".+")]])
-	end
-    if imgui_version and has_dock and has_imstr then break end
-end
-pipe:close()
 
-if has_dock then gdefines.IMGUI_HAS_DOCK = true end
-if has_imstr then gdefines.IMGUI_HAS_IMSTR = true end
+if gdefines.IMGUI_HAS_DOCK then gdefines.IMGUI_HAS_DOCK = true end
+if gdefines.IMGUI_HAS_IMSTR then gdefines.IMGUI_HAS_IMSTR = true end
 
-cimgui_header = cimgui_header:gsub("XXX",imgui_version)
+cimgui_header = cimgui_header:gsub("XXX",gdefines.IMGUI_VERSION)
 if INTERNAL_GENERATION then
 	cimgui_header = cimgui_header..[[//with imgui_internal.h api
 ]]
@@ -378,7 +332,7 @@ if gdefines.IMGUI_HAS_DOCK then
 end
 print("IMGUI_HAS_IMSTR",gdefines.IMGUI_HAS_IMSTR)
 print("IMGUI_HAS_DOCK",gdefines.IMGUI_HAS_DOCK)
-print("IMGUI_VERSION",imgui_version)
+print("IMGUI_VERSION",gdefines.IMGUI_VERSION)
 
 
 --funtion for parsing imgui headers
@@ -393,6 +347,7 @@ local function parseImGuiHeader(header,names)
 	parser.cname_overloads = cimgui_overloads
 	parser.manuals = cimgui_manuals
 	parser.UDTs = {"ImVec2","ImVec4","ImColor","ImRect"}
+	--parser.gen_template_typedef = gen_template_typedef --use auto
 	
 	local defines = parser:take_lines(CPRE..header,names,COMPILER)
 	
@@ -401,24 +356,24 @@ end
 --generation
 print("------------------generation with "..COMPILER.."------------------------")
 local parser1
-local headers = [[#include "../imgui/imgui.h" 
+local headers = [[#include "]]..IMGUI_PATH..[[/imgui.h" 
 ]]
 local headersT = {[[imgui]]}
 if INTERNAL_GENERATION then
-	headers = headers .. [[#include "../imgui/imgui_internal.h"
+	headers = headers .. [[#include "]]..IMGUI_PATH..[[/imgui_internal.h"
 	]]
 	headersT[#headersT + 1] = [[imgui_internal]]
 	headersT[#headersT + 1] = [[imstb_textedit]]
 end
 if FREETYPE_GENERATION then
 	headers = headers .. [[
-	#include "../imgui/misc/freetype/imgui_freetype.h"
+	#include "]]..IMGUI_PATH..[[/misc/freetype/imgui_freetype.h"
 	]]
 	headersT[#headersT + 1] = [[imgui_freetype]]
 end
 save_data("headers.h",headers)
 local include_cmd = COMPILER=="cl" and [[ /I ]] or [[ -I ]]
-local extra_includes = include_cmd.." ../imgui "
+local extra_includes = include_cmd.." " ..IMGUI_PATH.." "
 local parser1 = parseImGuiHeader(extra_includes .. [[headers.h]],headersT)
 os.remove("headers.h")
 parser1:do_parse()
@@ -429,6 +384,10 @@ cimgui_generation(parser1)
 ----------save struct and enums lua table in structs_and_enums.lua for using in bindings
 
 local structs_and_enums_table = parser1.structs_and_enums_table
+structs_and_enums_table.templated_structs = parser1.templated_structs
+structs_and_enums_table.typenames = parser1.typenames
+structs_and_enums_table.templates_done = parser1.templates_done
+
 save_data("./output/structs_and_enums.lua",serializeTableF(structs_and_enums_table))
 save_data("./output/typedefs_dict.lua",serializeTableF(parser1.typedefs_dict))
 
@@ -447,12 +406,12 @@ save_data("./output/definitions.lua",serializeTableF(parser1.defsT))
 
 --=================================Now implementations
 local backends_folder 
-local ff,err = io.open ("../imgui/examples/imgui_impl_glfw.h" ,"r")
+local ff,err = io.open (IMGUI_PATH .. "/examples/imgui_impl_glfw.h" ,"r")
 if ff then
-	backends_folder = "../imgui/examples/"
+	backends_folder = IMGUI_PATH .. "/examples/"
 	ff:close()
 else
-	backends_folder = "../imgui/backends/"
+	backends_folder = IMGUI_PATH .. "/backends/"
 end
  
 local parser2
@@ -471,7 +430,7 @@ if #implementations > 0 then
 		local extra_defines = ""
 		if impl == "opengl3" then extra_defines = define_cmd .. "IMGUI_IMPL_OPENGL_LOADER_GL3W " end
 		local include_cmd = COMPILER=="cl" and [[ /I ]] or [[ -I ]]
-		local extra_includes = include_cmd.." ../imgui "
+		local extra_includes = include_cmd.." ".. IMGUI_PATH .." "
 		if config[impl] then
 			for j,inc in ipairs(config[impl]) do
 				extra_includes = extra_includes .. include_cmd .. inc .. " "
@@ -510,6 +469,10 @@ end
 ---[[
 local json = require"json"
 save_data("./output/definitions.json",json.encode(json_prepare(parser1.defsT),{dict_on_empty={defaults=true}}))
+--delete extra info for json
+structs_and_enums_table.templated_structs = nil
+structs_and_enums_table.typenames = nil
+structs_and_enums_table.templates_done = nil
 save_data("./output/structs_and_enums.json",json.encode(structs_and_enums_table))
 save_data("./output/typedefs_dict.json",json.encode(parser1.typedefs_dict))
 if parser2 then

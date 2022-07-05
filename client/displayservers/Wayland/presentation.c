@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -86,7 +86,8 @@ bool waylandPresentationInit(void)
   if (wlWm.presentation)
   {
     wlWm.photonTimings = ringbuffer_new(256, sizeof(float));
-    wlWm.photonGraph   = app_registerGraph("PHOTON", wlWm.photonTimings, 0.0f, 30.0f);
+    wlWm.photonGraph   = app_registerGraph("PHOTON", wlWm.photonTimings,
+        0.0f, 30.0f, NULL);
     wp_presentation_add_listener(wlWm.presentation, &presentationListener, NULL);
   }
   return true;

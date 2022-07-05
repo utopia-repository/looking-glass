@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -31,6 +31,8 @@
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <winternl.h>
+#include <dwmapi.h>
+#include <avrt.h>
 
 #include "interface/platform.h"
 #include "common/debug.h"
@@ -39,6 +41,7 @@
 #include "common/locking.h"
 #include "common/thread.h"
 #include "common/time.h"
+#include "common/stringutils.h"
 
 #define ID_MENU_SHOW_LOG 3000
 #define ID_MENU_EXIT     3001
@@ -54,11 +57,16 @@ struct AppState
 
   char           executable[MAX_PATH + 1];
   char           systemLogDir[MAX_PATH];
+  char         * osVersion;
   HWND           messageWnd;
+  UINT           shellHookMsg;
   NOTIFYICONDATA iconData;
   UINT           trayRestartMsg;
   HMENU          trayMenu;
   HANDLE         exitWait;
+  HANDLE         taskHandle;
+
+  _Atomic(bool)  hasPendingActivationRequest;
 };
 
 static struct AppState app = {0};
@@ -249,6 +257,14 @@ LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     default:
       if (msg == app.trayRestartMsg)
         RegisterTrayIcon();
+      else if (msg == app.shellHookMsg)
+      {
+        switch (LOWORD(wParam))
+        {
+          case HSHELL_FLASH:
+            atomic_store(&app.hasPendingActivationRequest, true);
+        }
+      }
       break;
   }
 
@@ -284,7 +300,7 @@ const char *getSystemLogDirectory(void)
   return app.systemLogDir;
 }
 
-static void populateSystemLogDirectory()
+static void populateSystemLogDirectory(void)
 {
   char programData[MAX_PATH];
   if (GetEnvironmentVariableA("ProgramData", programData, sizeof(programData)) &&
@@ -398,6 +414,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
   // set the global
   MessageHWND = app.messageWnd;
 
+  // get shell events (e.g., for activation requests)
+  app.shellHookMsg = RegisterWindowMessage(TEXT("SHELLHOOK"));
+  RegisterShellHookWindow(app.messageWnd);
+
   app.trayMenu = CreatePopupMenu();
   AppendMenu(app.trayMenu, MF_STRING   , ID_MENU_SHOW_LOG, "Open Log File");
   AppendMenu(app.trayMenu, MF_SEPARATOR, 0               , NULL           );
@@ -445,9 +465,14 @@ shutdown:
 
 finish:
 
+  free(app.osVersion);
+
   for(int i = 0; i < app.argc; ++i)
     free(app.argv[i]);
   free(app.argv);
+
+  if (app.taskHandle)
+    AvRevertMmThreadCharacteristics(app.taskHandle);
 
   return result;
 }
@@ -477,6 +502,16 @@ void boostPriority(void)
     DEBUG_INFO("To fix this, install and run the Looking Glass host as a service.");
     DEBUG_INFO("looking-glass-host.exe InstallService");
   }
+
+  DWORD taskIndex = 0;
+  app.taskHandle =
+    AvSetMmThreadCharacteristicsA("Capture", &taskIndex);
+
+  if (!app.taskHandle)
+    DEBUG_WINERROR("AvSetMmThreadCharacteristicsA failed", GetLastError());
+
+  if (!AvSetMmThreadPriority(app.taskHandle, AVRT_PRIORITY_CRITICAL))
+    DEBUG_WINERROR("Failed to set thread priority", GetLastError());
 }
 
 void CALLBACK exitEventCallback(PVOID opaque, BOOLEAN timedOut)
@@ -553,7 +588,12 @@ HWND os_getMessageWnd(void)
   return app.messageWnd;
 }
 
-bool os_blockScreensaver()
+bool os_getAndClearPendingActivationRequest(void)
+{
+  return atomic_exchange(&app.hasPendingActivationRequest, false);
+}
+
+bool os_blockScreensaver(void)
 {
   static bool      lastResult = false;
   static ULONGLONG lastCheck  = 0;
@@ -588,4 +628,191 @@ bool os_hasSetCursorPos(void)
 void os_setCursorPos(int x, int y)
 {
   SetCursorPos(x, y);
+}
+
+KVMFROS os_getKVMFRType(void)
+{
+  return KVMFR_OS_WINDOWS;
+}
+
+static bool getProductName(char * buffer, DWORD bufferSize)
+{
+  LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE,
+    "Software\\Microsoft\\Windows NT\\CurrentVersion", "ProductName",
+    RRF_RT_REG_SZ, NULL, buffer, &bufferSize);
+
+  if (status != ERROR_SUCCESS)
+  {
+    DEBUG_WINERROR("Failed to read ProductName from registry", status);
+    return false;
+  }
+
+  return true;
+}
+
+const char * os_getOSName(void)
+{
+  if (app.osVersion)
+    return app.osVersion;
+
+  OSVERSIONINFOA osvi = { 0 };
+  osvi.dwOSVersionInfoSize = sizeof(osvi);
+  GetVersionExA(&osvi);
+
+  char productName[1024];
+  if (getProductName(productName, sizeof(productName)))
+  {
+    alloc_sprintf(
+      &app.osVersion,
+      "%s (Build: %lu) %s",
+      productName,
+      osvi.dwBuildNumber,
+      osvi.szCSDVersion
+    );
+  }
+  else
+  {
+    alloc_sprintf(
+      &app.osVersion,
+      "Windows %lu.%lu (Build: %lu) %s",
+      osvi.dwMajorVersion,
+      osvi.dwMinorVersion,
+      osvi.dwBuildNumber,
+      osvi.szCSDVersion
+    );
+  }
+
+  return app.osVersion;
+}
+
+#define TABLE_SIG(x) (\
+    ((uint32_t)(x[0]) << 24) | \
+    ((uint32_t)(x[1]) << 16) | \
+    ((uint32_t)(x[2]) << 8 ) | \
+    ((uint32_t)(x[3]) << 0 ))
+
+#define SMBVER(major, minor) \
+  ((smbData->SMBIOSMajorVersion == major && \
+    smbData->SMBIOSMinorVersion >= minor) || \
+    (smbData->SMBIOSMajorVersion > major))
+
+#define SMB_SST_SystemInformation 1
+
+#define REVERSE32(x) \
+  *(uint32_t*)(x) = ((*(uint32_t*)(x) & 0xFFFF0000) >> 16) | \
+                    ((*(uint32_t*)(x) & 0x0000FFFF) << 16)
+
+#define REVERSE16(x) \
+  *(uint16_t*)(x) = ((*(uint16_t*)(x) & 0xFF00) >> 8) | \
+                    ((*(uint16_t*)(x) & 0x00FF) << 8)
+
+
+static void * smbParseData(uint8_t ** data, char * strings[])
+{
+  typedef struct
+  {
+    uint8_t type;
+    uint8_t length;
+  }
+  __attribute__((packed)) SMBHeader;
+
+  SMBHeader *h = (SMBHeader *)*data;
+
+  *data += h->length;
+  if (**data)
+    for(int i = 1; i < 256 && **data; ++i)
+    {
+      strings[i] = (char *)*data;
+      *data += strlen((char *)*data) + 1;
+    }
+  else
+    ++*data;
+
+  ++*data;
+  return h;
+}
+
+const uint8_t * os_getUUID(void)
+{
+  static uint8_t uuid[16] = {0};
+  static bool uuidValid = false;
+
+  if (uuidValid)
+    return uuid;
+
+  typedef struct
+  {
+    BYTE  Used20CallingMethod;
+    BYTE  SMBIOSMajorVersion;
+    BYTE  SMBIOSMinorVersion;
+    BYTE  DmiRevision;
+    DWORD Length;
+    BYTE  SMBIOSTableData[];
+  }
+  RawSMBIOSData;
+
+  typedef struct
+  {
+    uint8_t  type;
+    uint8_t  length;
+    uint16_t handle;
+    uint8_t  manufacturerStr;
+    uint8_t  productStr;
+    uint8_t  versionStr;
+    uint8_t  serialStr;
+    uint8_t  uuid[16];
+    uint8_t  wakeupType;
+    uint8_t  skuNumberStr;
+    uint8_t  familyStr;
+  }
+  __attribute__((packed)) SMBSystemInformation;
+
+  DWORD           smbDataSize;
+  RawSMBIOSData * smbData;
+
+  smbDataSize = GetSystemFirmwareTable(TABLE_SIG("RSMB"), 0, NULL, 0);
+  smbData     = (RawSMBIOSData *)malloc(smbDataSize);
+  if (!smbData)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
+
+  if (GetSystemFirmwareTable(TABLE_SIG("RSMB"), 0, smbData, smbDataSize)
+      != smbDataSize)
+  {
+    DEBUG_ERROR("Failed to read the RSMB table");
+    goto err;
+  }
+
+  uint8_t * data         = (uint8_t *)smbData->SMBIOSTableData;
+  uint8_t * end          = (uint8_t *)smbData->SMBIOSTableData + smbData->Length;
+  char    * strings[256] = {0};
+
+  while(data != end)
+  {
+    if (data[0] == SMB_SST_SystemInformation)
+    {
+      SMBSystemInformation * info = smbParseData(&data, strings);
+      memcpy(uuid, &info->uuid, 16);
+
+      // convert to the same format that SPICE is using
+      REVERSE32(&uuid[0]);
+      REVERSE16(&uuid[0]);
+      REVERSE16(&uuid[2]);
+      REVERSE16(&uuid[4]);
+      REVERSE16(&uuid[6]);
+      uuidValid = true;
+      break;
+    }
+
+    smbParseData(&data, strings);
+  }
+
+  free(smbData);
+  return uuid;
+
+err:
+  free(smbData);
+  return NULL;
 }

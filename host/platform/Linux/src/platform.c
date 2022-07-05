@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -24,17 +24,20 @@
 #include "common/stringutils.h"
 #include "common/thread.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
 #include <pwd.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 
 struct app
 {
   const char * executable;
   char * dataPath;
+  char * osVersion;
 };
 
 struct app app = { 0 };
@@ -52,6 +55,7 @@ int main(int argc, char * argv[])
   int result = app_main(argc, argv);
 
   free(app.dataPath);
+  free(app.osVersion);
   return result;
 }
 
@@ -77,7 +81,13 @@ const char * os_getDataPath(void)
   return app.dataPath;
 }
 
-bool os_blockScreensaver()
+bool os_getAndClearPendingActivationRequest(void)
+{
+  // TODO
+  return false;
+}
+
+bool os_blockScreensaver(void)
 {
   return false;
 }
@@ -94,4 +104,91 @@ bool os_hasSetCursorPos(void)
 
 void os_setCursorPos(int x, int y)
 {
+}
+
+KVMFROS os_getKVMFRType(void)
+{
+  return KVMFR_OS_LINUX;
+}
+
+static const char * getPrettyName(void)
+{
+  static char buffer[256];
+
+  FILE * fp = fopen("/etc/os-release", "r");
+  if (fp == NULL)
+  {
+    fp = fopen("/usr/lib/os-release", "r");
+    if (fp == NULL)
+      return NULL;
+  }
+
+  while (fgets(buffer, sizeof(buffer), fp))
+  {
+    if (strstr(buffer, "PRETTY_NAME"))
+    {
+      char * ptr = strchr(buffer, '=') + 1;
+      while (isspace(*ptr))
+        ++ptr;
+
+      size_t len = strlen(ptr);
+      while (isspace(ptr[len - 1]))
+        --len;
+
+      if (*ptr == '"' || *ptr == '\'')
+      {
+        ++ptr;
+        len -= 2;
+      }
+
+      ptr[len] = '\0';
+      fclose(fp);
+      return ptr;
+    }
+
+    // If a line is too long, skip it.
+    while (buffer[strlen(buffer) - 1] != '\n')
+      if (!fgets(buffer, sizeof(buffer), fp))
+        goto done;
+  }
+
+done:
+  fclose(fp);
+  return NULL;
+}
+
+const char * os_getOSName(void)
+{
+  if (app.osVersion)
+    return app.osVersion;
+
+  const char * pretty = getPrettyName();
+  struct utsname utsname;
+  uname(&utsname);
+
+  if (!pretty)
+    alloc_sprintf(
+      &app.osVersion,
+      "%s %s on %s",
+      utsname.sysname,
+      utsname.release,
+      utsname.machine
+    );
+  else
+    alloc_sprintf(
+      &app.osVersion,
+      "%s, kernel: %s %s on %s",
+      pretty,
+      utsname.sysname,
+      utsname.release,
+      utsname.machine
+    );
+
+  return app.osVersion;
+}
+
+const uint8_t * os_getUUID(void)
+{
+  //TODO
+  return NULL;
 }

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -72,6 +72,9 @@ static void registryGlobalHandler(void * data, struct wl_registry * registry,
     wlWm.xdgOutputManager = wl_registry_bind(wlWm.registry, name,
         // we only need v2 to run, but v3 saves a callback
         &zxdg_output_manager_v1_interface, version > 3 ? 3 : version);
+  else if (!strcmp(interface, xdg_activation_v1_interface.name))
+    wlWm.xdgActivation = wl_registry_bind(wlWm.registry, name,
+        &xdg_activation_v1_interface, 1);
 }
 
 static void registryGlobalRemoveHandler(void * data,

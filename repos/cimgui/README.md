@@ -11,7 +11,7 @@ History:
 Initially cimgui was developed by Stephan Dilly as hand-written code but lately turned into an auto-generated version by sonoro1234 in order to keep up with imgui more easily (letting the user select the desired branch and commit)
 
 Notes:
-* currently this wrapper is based on version [1.82 of Dear ImGui with internal api]
+* currently this wrapper is based on version [1.87 of Dear ImGui with internal api]
 * only functions, structs and enums from imgui.h (an optionally imgui_internal.h) are wrapped.
 * if you are interested in imgui backends you should look [LuaJIT-ImGui](https://github.com/sonoro1234/LuaJIT-ImGui) project.
 * All naming is algorithmic except for those names that were coded in cimgui_overloads table (https://github.com/cimgui/cimgui/blob/master/generator/generator.lua#L60). In the official version this table is empty.
@@ -24,10 +24,10 @@ Notes:
   * `git submodule update --init --recursive` (If already cloned)
 * compile 
   * using makefile on linux/macOS/mingw (Or use CMake to generate project)
-  * cmake options are IMGUI_STATIC (compiling as static library), IMGUI_FREETYPE (for using Freetype2) and FREETYPE_PATH (Freetype2 cmake install location)
+  * cmake options are IMGUI_STATIC (compiling as static library), IMGUI_FREETYPE (for using Freetype2) and FREETYPE_PATH (Freetype2 cmake install location) (only if cimgui is generated with freetype option)
   * or as in https://github.com/sonoro1234/LuaJIT-ImGui/tree/master/build
   
-  For compiling with backends there is now an example with SDL2 and opengl3 in folder backend_test. It will generate a cimgui_sdl module and a test_sdl executable. You only need to provide SDL_PATH telling cmake where to look for SDL2 cmake installation.
+  For compiling with backends there is now an example with SDL2 and opengl3 in folder backend_test. It will generate a cimgui_sdl module and a test_sdl executable.
 
 # using generator
 

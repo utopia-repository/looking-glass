@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,6 +20,6 @@
 
 #include <stdbool.h>
 
-void config_init();
+void config_init(void);
 bool config_load(int argc, char * argv[]);
-void config_free();
+void config_free(void);

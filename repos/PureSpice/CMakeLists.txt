@@ -11,10 +11,25 @@ pkg_check_modules(SPICE_PKGCONFIG REQUIRED
 
 add_definitions(-D USE_NETTLE)
 
+add_compile_options(
+  "-Wall"
+  "-Wextra"
+  "-Werror"
+  "-Wfatal-errors"
+  "-Wstrict-prototypes"
+)
 add_library(purespice STATIC
-	src/spice.c
+	src/ps.c
+	src/log.c
 	src/rsa.c
 	src/queue.c
+	src/channel.c
+	src/channel_main.c
+	src/channel_inputs.c
+	src/channel_playback.c
+	src/channel_record.c
+	src/channel_display.c
+	src/agent.c
 )
 
 target_link_libraries(purespice

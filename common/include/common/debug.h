@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -130,5 +130,14 @@ void printBacktrace(void);
 #else
   #define DEBUG_PROTO(fmt, ...) do {} while(0)
 #endif
+
+void debug_info(const char * file, unsigned int line, const char * function,
+    const char * format, ...) __attribute__((format (printf, 4, 5)));
+
+void debug_warn(const char * file, unsigned int line, const char * function,
+    const char * format, ...) __attribute__((format (printf, 4, 5)));
+
+void debug_error(const char * file, unsigned int line, const char * function,
+    const char * format, ...) __attribute__((format (printf, 4, 5)));
 
 #endif

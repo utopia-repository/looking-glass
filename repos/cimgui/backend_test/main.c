@@ -1,6 +1,5 @@
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
 #include "cimgui.h"
-#include "cimgui_extras.h"
 #include "cimgui_impl.h"
 #include <stdio.h>
 #define SDL_MAIN_HANDLED
@@ -12,11 +11,11 @@
 #include <GL/glu.h>
 
 #ifdef IMGUI_HAS_IMSTR
-#define igBegin igBegin_Strv
-#define igSliderFloat igSliderFloat_Strv
-#define igCheckbox igCheckbox_Strv
-#define igColorEdit3 igColorEdit3_Strv
-#define igButton igButton_Strv
+#define igBegin igBegin_Str
+#define igSliderFloat igSliderFloat_Str
+#define igCheckbox igCheckbox_Str
+#define igColorEdit3 igColorEdit3_Str
+#define igButton igButton_Str
 #endif
 
 SDL_Window *window = NULL;
@@ -66,13 +65,6 @@ int main(int argc, char* argv[])
   SDL_GLContext gl_context = SDL_GL_CreateContext(window);
   SDL_GL_SetSwapInterval(1);  // enable vsync
 
-  // Initialize OpenGL loader for cimgui_sdl
-  bool err = Do_gl3wInit() != 0;
-  if (err)
-  {
-    SDL_Log("Failed to initialize OpenGL loader for cimgui_sdl!");
-    return 1;
-  }
 
   // check opengl version sdl uses
   SDL_Log("opengl version: %s", (char*)glGetString(GL_VERSION));

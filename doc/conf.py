@@ -4,7 +4,12 @@
 # list see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-# -- Path setup --------------------------------------------------------------
+# -- Release import
+
+import sys, os
+sys.path.append(os.path.dirname(__file__))
+
+from lgrelease import release
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -14,15 +19,11 @@
 # import sys
 # sys.path.insert(0, os.path.abspath('.'))
 
-
 # -- Project information -----------------------------------------------------
 
 project = 'Looking Glass'
 copyright = '2021, Looking Glass team'
 author = 'Geoffrey McRae and the Looking Glass team'
-
-# The full version, including alpha/beta/rc tags
-release = 'B4'
 
 rst_prolog = """
 .. |license| replace:: GPLv2
@@ -33,7 +34,9 @@ rst_prolog = """
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
+
 extensions = [
+    'sphinx_rtd_theme',
 ]
 
 try:
@@ -44,11 +47,9 @@ else:
     del spelling
     extensions += ['sphinxcontrib.spelling']
 
-    import sys, os
-    sys.path.append(os.path.dirname(__file__))
     spelling_filters = [
         'lgspell.OptionFilter', 'lgspell.PackageFilter', 'lgspell.PathFilter',
-        'lgspell.CryptoAddressFilter'
+        'lgspell.CryptoAddressFilter', 'lgspell.VersionFilter'
     ]
     spelling_word_list_filename = [os.path.join(os.path.dirname(__file__), 'words.txt')]
 
@@ -68,11 +69,11 @@ master_doc = 'index'
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'alabaster'
+html_theme = 'sphinx_rtd_theme'
 
 html_theme_options = {
-    'logo': 'icon-128x128.png',
-    'fixed_sidebar': 'true',
+    'logo_only': True,
+    'style_nav_header_background': '#343131',
 }
 
 html_sidebars = {
@@ -86,7 +87,15 @@ html_sidebars = {
 
 html_favicon = '../resources/icon.ico'
 
+html_logo = '../resources/icon-128x128.png'
+
+html_css_files = [
+    'center-rtd.css',
+]
+
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['../resources/icon-128x128.png']
+html_static_path = [
+    'css/center-rtd.css',
+]

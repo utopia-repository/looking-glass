@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -109,6 +109,7 @@ void NvFBCFree()
 }
 
 bool NvFBCToSysCreate(
+  int            adapterIndex,
   void         * privData,
   unsigned int   privDataSize,
   NvFBCHandle  * handle,
@@ -121,7 +122,7 @@ bool NvFBCToSysCreate(
   params.dwVersion         = NVFBC_CREATE_PARAMS_VER;
   params.dwInterfaceType   = NVFBC_TO_SYS;
   params.pDevice           = NULL;
-  params.dwAdapterIdx      = 0;
+  params.dwAdapterIdx      = adapterIndex;
   params.dwPrivateDataSize = privDataSize;
   params.pPrivateData      = privData;
 
@@ -275,6 +276,7 @@ CaptureResult NvFBCToSysCapture(
   const unsigned int   y,
   const unsigned int   width,
   const unsigned int   height,
+  bool                 scale,
   NvFBCFrameGrabInfo * grabInfo
 )
 {
@@ -283,7 +285,8 @@ CaptureResult NvFBCToSysCapture(
   params.dwVersion           = NVFBC_TOSYS_GRAB_FRAME_PARAMS_VER;
   params.dwFlags             = NVFBC_TOSYS_WAIT_WITH_TIMEOUT;
   params.dwWaitTime          = waitTime;
-  params.eGMode              = NVFBC_TOSYS_SOURCEMODE_CROP;
+  params.eGMode              = scale ?
+    NVFBC_TOSYS_SOURCEMODE_SCALE : NVFBC_TOSYS_SOURCEMODE_CROP;
   params.dwStartX            = x;
   params.dwStartY            = y;
   params.dwTargetWidth       = width;

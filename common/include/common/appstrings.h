@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -21,8 +21,10 @@
 #include "common/types.h"
 
 extern const char * LG_COPYRIGHT_STR;
-extern const char * LG_WEBSITE_STR;
+extern const char * LG_WEBSITE_URL;
 extern const char * LG_LICENSE_STR;
+extern const char * LG_DONATION_STR;
+extern const char * LG_DONATION_URL;
 extern const StringPair LG_HELP_LINKS[];
 
 struct LGTeamMember

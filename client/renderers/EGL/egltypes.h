@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -25,6 +25,8 @@
 typedef enum EGL_TexType
 {
   EGL_TEXTYPE_BUFFER,
+  EGL_TEXTYPE_BUFFER_MAP,
+  EGL_TEXTYPE_BUFFER_STREAM,
   EGL_TEXTYPE_FRAMEBUFFER,
   EGL_TEXTYPE_DMABUF
 }

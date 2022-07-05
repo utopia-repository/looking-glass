@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -23,7 +23,6 @@
 
 #include "../main.h"
 
-#include "ll.h"
 #include "common/debug.h"
 #include "overlay_utils.h"
 
@@ -37,27 +36,30 @@ static struct GraphState gs = {0};
 
 struct OverlayGraph
 {
-  const char * name;
-  RingBuffer   buffer;
-  bool         enabled;
-  float        min;
-  float        max;
+  const char *  name;
+  RingBuffer    buffer;
+  bool          enabled;
+  float         min;
+  float         max;
+  GraphFormatFn formatFn;
 };
 
 
 static void configCallback(void * udata, int * id)
 {
-  igCheckbox("Show Timing Graphs", &gs.show);
+  igCheckbox("Show timing graphs", &gs.show);
   igSeparator();
 
   igBeginTable("split", 2, 0, (ImVec2){}, 0);
 
   GraphHandle graph;
-  for (ll_reset(gs.graphs); ll_walk(gs.graphs, (void **)&graph); )
+  ll_lock(gs.graphs);
+  ll_forEachNL(gs.graphs, item, graph)
   {
     igTableNextColumn();
     igCheckbox(graph->name, &graph->enabled);
   }
+  ll_unlock(gs.graphs);
 
   igEndTable();
 }
@@ -68,11 +70,15 @@ static void showTimingKeybind(int sc, void * opaque)
   app_invalidateWindow(false);
 }
 
-static bool graphs_init(void ** udata, const void * params)
+static void graphs_earlyInit(void)
 {
   gs.graphs = ll_new();
+}
+
+static bool graphs_init(void ** udata, const void * params)
+{
   app_overlayConfigRegister("Performance Metrics", configCallback, NULL);
-  app_registerKeybind(KEY_T, showTimingKeybind, NULL,
+  app_registerKeybind(0, 'T', showTimingKeybind, NULL,
       "Show frame timing information");
   return true;
 }
@@ -83,6 +89,7 @@ static void graphs_free(void * udata)
   while(ll_shift(gs.graphs, (void **)&graph))
     free(graph);
   ll_free(gs.graphs);
+  gs.graphs = NULL;
 }
 
 struct BufferMetrics
@@ -92,6 +99,7 @@ struct BufferMetrics
   float sum;
   float avg;
   float freq;
+  float last;
 };
 
 static bool rbCalcMetrics(int index, void * value_, void * udata_)
@@ -114,6 +122,7 @@ static bool rbCalcMetrics(int index, void * value_, void * udata_)
     udata->max = *value;
 
   udata->sum += *value;
+  udata->last = *value;
   return true;
 }
 
@@ -127,9 +136,12 @@ static int graphs_render(void * udata, bool interactive,
 
   GraphHandle graph;
   int graphCount = 0;
-  for (ll_reset(gs.graphs); ll_walk(gs.graphs, (void **)&graph); )
+  ll_lock(gs.graphs);
+  ll_forEachNL(gs.graphs, item, graph)
+  {
     if (graph->enabled)
       ++graphCount;
+  }
 
   ImVec2 pos = {0.0f, 0.0f};
   igSetNextWindowBgAlpha(0.4f);
@@ -152,7 +164,7 @@ static int graphs_render(void * udata, bool interactive,
   const float height = (winSize.y / graphCount)
     - igGetStyle()->ItemSpacing.y;
 
-  for (ll_reset(gs.graphs); ll_walk(gs.graphs, (void **)&graph); )
+  ll_forEachNL(gs.graphs, item, graph)
   {
     if (!graph->enabled)
       continue;
@@ -166,12 +178,20 @@ static int graphs_render(void * udata, bool interactive,
       metrics.freq = 1000.0f / metrics.avg;
     }
 
-    char title[64];
-    snprintf(title, sizeof(title),
-        "%s: min:%4.2f max:%4.2f avg:%4.2f/%4.2fHz",
-        graph->name, metrics.min, metrics.max, metrics.avg, metrics.freq);
+    const char * title;
+    if (graph->formatFn)
+      title = graph->formatFn(graph->name,
+          metrics.min, metrics.max, metrics.avg, metrics.freq, metrics.last);
+    else
+    {
+      static char _title[64];
+      snprintf(_title, sizeof(_title),
+          "%s: min:%4.2f max:%4.2f avg:%4.2f/%4.2fHz",
+          graph->name, metrics.min, metrics.max, metrics.avg, metrics.freq);
+      title = _title;
+    }
 
-    igPlotLinesFloatPtr(
+    igPlotLines_FloatPtr(
         "",
         (float *)ringbuffer_getValues(graph->buffer),
         ringbuffer_getLength(graph->buffer),
@@ -182,6 +202,7 @@ static int graphs_render(void * udata, bool interactive,
         (ImVec2){ winSize.x, height },
         sizeof(float));
   };
+  ll_unlock(gs.graphs);
 
   overlayGetImGuiRect(windowRects);
   igEnd();
@@ -191,32 +212,59 @@ static int graphs_render(void * udata, bool interactive,
 struct LG_OverlayOps LGOverlayGraphs =
 {
   .name           = "Graphs",
+  .earlyInit      = graphs_earlyInit,
   .init           = graphs_init,
   .free           = graphs_free,
   .render         = graphs_render
 };
 
-GraphHandle overlayGraph_register(const char * name, RingBuffer buffer, float min, float max)
+GraphHandle overlayGraph_register(const char * name, RingBuffer buffer,
+    float min, float max, GraphFormatFn formatFn)
 {
   struct OverlayGraph * graph = malloc(sizeof(*graph));
-  graph->name    = name;
-  graph->buffer  = buffer;
-  graph->enabled = true;
-  graph->min     = min;
-  graph->max     = max;
+  if (!graph)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
+
+  graph->name     = name;
+  graph->buffer   = buffer;
+  graph->enabled  = true;
+  graph->min      = min;
+  graph->max      = max;
+  graph->formatFn = formatFn;
   ll_push(gs.graphs, graph);
   return graph;
 }
 
 void overlayGraph_unregister(GraphHandle handle)
 {
-  handle->enabled = false;
+  if (!gs.graphs)
+    return;
+
+  ll_removeData(gs.graphs, handle);
+  free(handle);
+
+  if (gs.show)
+    app_invalidateWindow(false);
 }
 
 void overlayGraph_iterate(void (*callback)(GraphHandle handle, const char * name,
       bool * enabled, void * udata), void * udata)
 {
   GraphHandle graph;
-  for (ll_reset(gs.graphs); ll_walk(gs.graphs, (void **)&graph); )
+  ll_lock(gs.graphs);
+  ll_forEachNL(gs.graphs, item, graph)
     callback(graph, graph->name, &graph->enabled, udata);
+  ll_unlock(gs.graphs);
+}
+
+void overlayGraph_invalidate(GraphHandle handle)
+{
+  if (!gs.show)
+    return;
+
+  if (handle->enabled)
+    app_invalidateWindow(false);
 }

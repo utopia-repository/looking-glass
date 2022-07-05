@@ -18,6 +18,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
 #include "rsa.h"
+#include "log.h"
 
 #include <spice/protocol.h>
 #include <malloc.h>
@@ -63,7 +64,8 @@ static void sha1(uint8_t * hash, const uint8_t *data, unsigned int len)
   sha1_digest(&ctx, SHA1_HASH_LEN, hash);
 }
 
-static void oaep_mask(uint8_t * dest, size_t dest_len, const uint8_t * mask, size_t mask_len)
+static void oaep_mask(uint8_t * dest, size_t dest_len,
+    const uint8_t * mask, size_t mask_len)
 {
   uint8_t   hash[SHA1_HASH_LEN];
   uint8_t * seed = alloca(mask_len + 4);
@@ -89,7 +91,8 @@ static void oaep_mask(uint8_t * dest, size_t dest_len, const uint8_t * mask, siz
   }
 }
 
-static bool oaep_pad(mpz_t m, unsigned int key_size, const uint8_t * message, unsigned int len)
+static bool oaep_pad(mpz_t m, unsigned int key_size,
+    const uint8_t * message, unsigned int len)
 {
   if (len + SHA1_HASH_LEN * 2 + 2 > key_size)
     return false;
@@ -125,15 +128,21 @@ static bool oaep_pad(mpz_t m, unsigned int key_size, const uint8_t * message, un
 }
 #endif
 
-bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice_password * result)
+bool rsa_encryptPassword(uint8_t * pub_key, const char * password,
+    PSPassword * result)
 {
   result->size = 0;
   result->data = NULL;
 
 #if defined(USE_OPENSSL)
+  PS_LOG_INFO_ONCE("Using OpenSSL");
+
   BIO *bioKey = BIO_new(BIO_s_mem());
   if (!bioKey)
+  {
+    PS_LOG_ERROR("BIO_new failed");
     return false;
+  }
 
   BIO_write(bioKey, pub_key, SPICE_TICKET_PUBKEY_BYTES);
   EVP_PKEY *rsaKey = d2i_PUBKEY_bio(bioKey, NULL);
@@ -144,7 +153,7 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
 
   if (RSA_public_encrypt(
         strlen(password) + 1,
-        (uint8_t*)password,
+        (const uint8_t*)password,
         (uint8_t*)result->data,
         rsa,
         RSA_PKCS1_OAEP_PADDING
@@ -156,6 +165,7 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
 
     EVP_PKEY_free(rsaKey);
     BIO_free(bioKey);
+    PS_LOG_ERROR("RSA_public_encrypt failed");
     return false;
   }
 
@@ -165,11 +175,14 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
 #endif
 
 #if defined(USE_NETTLE)
+  PS_LOG_INFO_ONCE("Using Nettle");
+
   struct asn1_der_iterator der;
   struct asn1_der_iterator j;
   struct rsa_public_key    pub;
 
-  if (asn1_der_iterator_first(&der, SPICE_TICKET_PUBKEY_BYTES, pub_key) == ASN1_ITERATOR_CONSTRUCTED
+  if (asn1_der_iterator_first(&der, SPICE_TICKET_PUBKEY_BYTES, pub_key)
+      == ASN1_ITERATOR_CONSTRUCTED
       && der.type == ASN1_SEQUENCE
       && asn1_der_decode_constructed_last(&der) == ASN1_ITERATOR_CONSTRUCTED
       && der.type == ASN1_SEQUENCE
@@ -180,7 +193,10 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
       && asn1_der_decode_bitstring_last(&der))
   {
     if (j.length != 9)
+    {
+      PS_LOG_ERROR("asn1 length invalid");
       return false;
+    }
 
     if (asn1_der_iterator_next(&j) == ASN1_ITERATOR_PRIMITIVE
         && j.type == ASN1_NULL
@@ -191,6 +207,7 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
       if (!rsa_public_key_from_der_iterator(&pub, 0, &der))
       {
         rsa_public_key_clear(&pub);
+        PS_LOG_ERROR("rsa_public_key_from_der_iterator failed");
         return false;
       }
     }
@@ -198,7 +215,7 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
 
   mpz_t p;
   mpz_init(p);
-  oaep_pad(p, pub.size, (uint8_t *)password, strlen(password)+1);
+  oaep_pad(p, pub.size, (const uint8_t *)password, strlen(password)+1);
   mpz_powm(p, p, pub.e, pub.n);
 
   result->size = pub.size;
@@ -211,7 +228,7 @@ bool spice_rsa_encrypt_password(uint8_t * pub_key, char * password, struct spice
 #endif
 }
 
-void spice_rsa_free_password(struct spice_password * pass)
+void rsa_freePassword(PSPassword * pass)
 {
   free(pass->data);
   pass->size = 0;

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -45,8 +45,10 @@ bool egl_cursorSetShape(
 
 void egl_cursorSetSize(EGL_Cursor * cursor, const float x, const float y);
 
+void egl_cursorSetScale(EGL_Cursor * cursor, const float scale);
+
 void egl_cursorSetState(EGL_Cursor * cursor, const bool visible,
-    const float x, const float y);
+    const float x, const float y, const float hx, const float hy);
 
 struct CursorState egl_cursorRender(EGL_Cursor * cursor,
     LG_RendererRotate rotate, int width, int height);

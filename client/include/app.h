@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -58,9 +58,9 @@ void app_resyncMouseBasic(void);
 void app_handleButtonPress(int button);
 void app_handleButtonRelease(int button);
 void app_handleWheelMotion(double motion);
-void app_handleKeyPress(int scancode);
-void app_handleKeyRelease(int scancode);
 void app_handleKeyboardTyped(const char * typed);
+void app_handleKeyPress(int scancode, int charcode);
+void app_handleKeyRelease(int scancode, int charcode);
 void app_handleKeyboardModifiers(bool ctrl, bool shift, bool alt, bool super);
 void app_handleKeyboardLEDs(bool numLock, bool capsLock, bool scrollLock);
 void app_handleEnterEvent(bool entered);
@@ -102,11 +102,21 @@ int app_renderOverlay(struct Rect * rects, int maxRects);
 
 void app_freeOverlays(void);
 
+/**
+ * invalidate the window to update the overlay, if renderTwice is set the imgui
+ * render code will run twice so that auto sized windows are calculated correctly
+ */
+void app_invalidateOverlay(bool renderTwice);
+
 struct OverlayGraph;
 typedef struct OverlayGraph * GraphHandle;
+typedef const char * (*GraphFormatFn)(const char * name,
+    float min, float max, float avg, float freq, float last);
 
-GraphHandle app_registerGraph(const char * name, RingBuffer buffer, float min, float max);
+GraphHandle app_registerGraph(const char * name, RingBuffer buffer,
+    float min, float max, GraphFormatFn formatFn);
 void app_unregisterGraph(GraphHandle handle);
+void app_invalidateGraph(GraphHandle handle);
 
 void app_overlayConfigRegister(const char * title,
     void (*callback)(void * udata, int * id), void * udata);
@@ -128,18 +138,31 @@ void app_clipboardRequest(const LG_ClipboardReplyFn replyFn, void * opaque);
  */
 void app_alert(LG_MsgAlert type, const char * fmt, ...);
 
+typedef struct MsgBoxHandle * MsgBoxHandle;
+MsgBoxHandle app_msgBox(const char * caption, const char * fmt, ...);
+
+typedef void (*MsgBoxConfirmCallback)(bool yes, void * opaque);
+MsgBoxHandle app_confirmMsgBox(const char * caption,
+    MsgBoxConfirmCallback callback, void * opaque, const char * fmt, ...);
+
+void app_msgBoxClose(MsgBoxHandle handle);
+
 typedef struct KeybindHandle * KeybindHandle;
 typedef void (*KeybindFn)(int sc, void * opaque);
+
+void app_showRecord(bool show);
 
 /**
  * Register a handler for the <super>+<key> combination
  * @param sc       The scancode to register
+ * @param charcode The charcode to register (used instead of sc if non zero)
  * @param callback The function to be called when the combination is pressed
  * @param opaque   A pointer to be passed to the callback, may be NULL
  * @retval A handle for the binding or NULL on failure.
  *         The caller is required to release the handle via `app_releaseKeybind` when it is no longer required
  */
-KeybindHandle app_registerKeybind(int sc, KeybindFn callback, void * opaque, const char * description);
+KeybindHandle app_registerKeybind(int sc, int charcode, KeybindFn callback,
+    void * opaque, const char * description);
 
 /**
  * Release an existing key binding
@@ -151,5 +174,21 @@ void app_releaseKeybind(KeybindHandle * handle);
  * Release all keybindings
  */
 void app_releaseAllKeybinds(void);
+
+bool app_guestIsLinux(void);
+bool app_guestIsWindows(void);
+bool app_guestIsOSX(void);
+bool app_guestIsBSD(void);
+bool app_guestIsOther(void);
+
+/**
+ * Enable/disable the LG display
+ */
+void app_stopVideo(bool stop);
+
+/**
+ * Enable/disable the spice display
+ */
+bool app_useSpiceDisplay(bool enable);
 
 #endif

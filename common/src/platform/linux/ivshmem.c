@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -120,7 +120,7 @@ bool ivshmemOpenDev(struct IVSHMEM * dev, const char * shmDevice)
   DEBUG_ASSERT(dev);
 
   unsigned int devSize;
-  int devFd = -1;
+  int devFd;
   bool hasDMA;
 
   dev->opaque = NULL;

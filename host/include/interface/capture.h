@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -22,8 +22,15 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include "common/framebuffer.h"
 #include "common/KVMFR.h"
+
+#ifdef __cplusplus
+/* using common/framebuffer.h breaks compatibillity with C++ due to it's usage
+ * of stdatomic.h, so we need to forward declare the structure here */
+typedef struct stFrameBuffer FrameBuffer;
+#else
+#include "common/framebuffer.h"
+#endif
 
 typedef enum CaptureResult
 {
@@ -63,9 +70,11 @@ CaptureRotation;
 typedef struct CaptureFrame
 {
   unsigned int    formatVer;
-  unsigned int    width;
-  unsigned int    height;
-  unsigned int    realHeight;
+  unsigned int    screenWidth;
+  unsigned int    screenHeight;
+  unsigned int    frameWidth;
+  unsigned int    frameHeight;
+  bool            truncated;
   unsigned int    pitch;
   unsigned int    stride;
   CaptureFormat   format;
@@ -96,20 +105,21 @@ typedef struct CaptureInterface
 {
   const char * shortName;
   const bool   asyncCapture;
-  const char * (*getName        )();
-  void         (*initOptions    )();
+  const char * (*getName        )(void);
+  void         (*initOptions    )(void);
 
   bool(*create)(
     CaptureGetPointerBuffer  getPointerBufferFn,
     CapturePostPointerBuffer postPointerBufferFn
   );
 
-  bool          (*init         )();
-  void          (*stop         )();
-  bool          (*deinit       )();
-  void          (*free         )();
+  bool          (*init         )(void);
+  bool          (*start        )(void);
+  void          (*stop         )(void);
+  bool          (*deinit       )(void);
+  void          (*free         )(void);
 
-  CaptureResult (*capture   )();
+  CaptureResult (*capture   )(void);
   CaptureResult (*waitFrame )(CaptureFrame * frame, const size_t maxFrameSize);
   CaptureResult (*getFrame  )(FrameBuffer  * frame, const unsigned int height, int frameIndex);
 }

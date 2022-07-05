@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -33,20 +33,25 @@
 #include <string.h>
 
 // forwards
-static bool       optRendererParse   (struct Option * opt, const char * str);
-static StringList optRendererValues  (struct Option * opt);
-static char *     optRendererToString(struct Option * opt);
-static bool       optPosParse        (struct Option * opt, const char * str);
-static StringList optPosValues       (struct Option * opt);
-static char *     optPosToString     (struct Option * opt);
-static bool       optSizeParse       (struct Option * opt, const char * str);
-static StringList optSizeValues      (struct Option * opt);
-static char *     optSizeToString    (struct Option * opt);
-static bool       optScancodeValidate(struct Option * opt, const char ** error);
-static char *     optScancodeToString(struct Option * opt);
-static bool       optRotateValidate  (struct Option * opt, const char ** error);
+static bool       optRendererParse     (struct Option * opt, const char * str);
+static StringList optRendererValues    (struct Option * opt);
+static char *     optRendererToString  (struct Option * opt);
+static bool       optPosParse          (struct Option * opt, const char * str);
+static StringList optPosValues         (struct Option * opt);
+static char *     optPosToString       (struct Option * opt);
+static bool       optSizeParse         (struct Option * opt, const char * str);
+static StringList optSizeValues        (struct Option * opt);
+static char *     optSizeToString      (struct Option * opt);
+static bool       optScancodeParse     (struct Option * opt, const char * str);
+static StringList optScancodeValues    (struct Option * opt);
+static bool       optScancodeValidate  (struct Option * opt, const char ** error);
+static char *     optScancodeToString  (struct Option * opt);
+static bool       optRotateValidate    (struct Option * opt, const char ** error);
+static bool       optMicDefaultParse   (struct Option * opt, const char * str);
+static StringList optMicDefaultValues  (struct Option * opt);
+static char *     optMicDefaultToString(struct Option * opt);
 
-static void doLicense();
+static void doLicense(void);
 
 static struct Option options[] =
 {
@@ -165,6 +170,13 @@ static struct Option options[] =
   },
   {
     .module         = "win",
+    .name           = "intUpscale",
+    .description    = "Allow only integer upscaling",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = false,
+  },
+  {
+    .module         = "win",
     .name           = "shrinkOnUpscale",
     .description    = "Limit the window dimensions when dontUpscale is enabled",
     .type           = OPTION_TYPE_BOOL,
@@ -249,6 +261,13 @@ static struct Option options[] =
   },
   {
     .module         = "win",
+    .name           = "overlayDimsDesktop",
+    .description    = "Dim the desktop when in interactive overlay mode",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true,
+  },
+  {
+    .module         = "win",
     .name           = "rotate",
     .description    = "Rotate the displayed image (0, 90, 180, 270)",
     .type           = OPTION_TYPE_INT,
@@ -303,10 +322,12 @@ static struct Option options[] =
   {
     .module         = "input",
     .name           = "escapeKey",
-    .description    = "Specify the escape key, see <linux/input-event-codes.h> for valid values",
+    .description    = "Specify the escape/menu key to use (use \"help\" to see valid values)",
     .shortopt       = 'm',
     .type           = OPTION_TYPE_INT,
     .value.x_int    = KEY_SCROLLLOCK,
+    .parser         = optScancodeParse,
+    .getValues      = optScancodeValues,
     .validator      = optScancodeValidate,
     .toString       = optScancodeToString,
   },
@@ -430,6 +451,13 @@ static struct Option options[] =
   },
   {
     .module         = "spice",
+    .name           = "audio",
+    .description    = "Enable SPICE audio support",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true
+  },
+  {
+    .module         = "spice",
     .name           = "scaleCursor",
     .description    = "Scale cursor input position to screen size when up/down scaled",
     .shortopt       = 'j',
@@ -457,6 +485,38 @@ static struct Option options[] =
     .type          = OPTION_TYPE_BOOL,
     .value.x_bool  = true
   },
+
+  // audio options
+  {
+    .module         = "audio",
+    .name           = "periodSize",
+    .description    = "Requested audio device period size in samples",
+    .type           = OPTION_TYPE_INT,
+    .value.x_int    = 2048
+  },
+  {
+    .module         = "audio",
+    .name           = "bufferLatency",
+    .description    = "Additional buffer latency in milliseconds",
+    .type           = OPTION_TYPE_INT,
+    .value.x_int    = 13
+  },
+  {
+    .module         = "audio",
+    .name           = "micDefault",
+    .description    = "Default action when an application opens the microphone (prompt, allow, deny)",
+    .type           = OPTION_TYPE_CUSTOM,
+    .parser         = optMicDefaultParse,
+    .getValues      = optMicDefaultValues,
+    .toString       = optMicDefaultToString
+  },
+  {
+    .module         = "audio",
+    .name           = "micShowIndicator",
+    .description    = "Display microphone usage indicator",
+    .type           = OPTION_TYPE_BOOL,
+    .value.x_bool   = true
+  },
   {0}
 };
 
@@ -482,22 +542,38 @@ bool config_load(int argc, char * argv[])
 
   // load config from user's home directory
   struct passwd * pw = getpwuid(getuid());
-  char * localFile;
-  alloc_sprintf(&localFile, "%s/.looking-glass-client.ini", pw->pw_dir);
-  if (stat(localFile, &st) >= 0 && S_ISREG(st.st_mode))
+  if (!pw)
+    DEBUG_WARN("getpwuid failed, unable to load user configuration");
+  else
   {
-    DEBUG_INFO("Loading config from: %s", localFile);
-    if (!option_load(localFile))
+    char * localFile;
+    alloc_sprintf(&localFile, "%s/.looking-glass-client.ini", pw->pw_dir);
+    if (!localFile)
     {
-      free(localFile);
+      DEBUG_ERROR("out of memory");
       return false;
     }
+
+    if (stat(localFile, &st) >= 0 && S_ISREG(st.st_mode))
+    {
+      DEBUG_INFO("Loading config from: %s", localFile);
+      if (!option_load(localFile))
+      {
+        free(localFile);
+        return false;
+      }
+    }
+    free(localFile);
   }
-  free(localFile);
 
   // load config from XDG_CONFIG_HOME
   char * xdgFile;
   alloc_sprintf(&xdgFile, "%s/client.ini", lgConfigDir());
+  if (!xdgFile)
+  {
+    DEBUG_ERROR("out of memory");
+    return false;
+  }
 
   if (xdgFile && stat(xdgFile, &st) >= 0 && S_ISREG(st.st_mode))
   {
@@ -544,25 +620,27 @@ bool config_load(int argc, char * argv[])
   g_params.framePollInterval  = option_get_int   ("app"  , "framePollInterval" );
   g_params.allowDMA           = option_get_bool  ("app"  , "allowDMA"          );
 
-  g_params.windowTitle     = option_get_string("win", "title"          );
-  g_params.autoResize      = option_get_bool  ("win", "autoResize"     );
-  g_params.allowResize     = option_get_bool  ("win", "allowResize"    );
-  g_params.keepAspect      = option_get_bool  ("win", "keepAspect"     );
-  g_params.forceAspect     = option_get_bool  ("win", "forceAspect"    );
-  g_params.dontUpscale     = option_get_bool  ("win", "dontUpscale"    );
-  g_params.shrinkOnUpscale = option_get_bool  ("win", "shrinkOnUpscale");
-  g_params.borderless      = option_get_bool  ("win", "borderless"     );
-  g_params.fullscreen      = option_get_bool  ("win", "fullScreen"     );
-  g_params.maximize        = option_get_bool  ("win", "maximize"       );
-  g_params.fpsMin          = option_get_int   ("win", "fpsMin"         );
-  g_params.ignoreQuit      = option_get_bool  ("win", "ignoreQuit"     );
-  g_params.noScreensaver   = option_get_bool  ("win", "noScreensaver"  );
-  g_params.autoScreensaver = option_get_bool  ("win", "autoScreensaver");
-  g_params.showAlerts      = option_get_bool  ("win", "alerts"         );
-  g_params.quickSplash     = option_get_bool  ("win", "quickSplash"    );
-  g_params.uiFont          = option_get_string("win"  , "uiFont"       );
-  g_params.uiSize          = option_get_int   ("win"  , "uiSize"       );
-  g_params.jitRender       = option_get_bool  ("win"  , "jitRender"    );
+  g_params.windowTitle     = option_get_string("win", "title"             );
+  g_params.autoResize      = option_get_bool  ("win", "autoResize"        );
+  g_params.allowResize     = option_get_bool  ("win", "allowResize"       );
+  g_params.keepAspect      = option_get_bool  ("win", "keepAspect"        );
+  g_params.forceAspect     = option_get_bool  ("win", "forceAspect"       );
+  g_params.dontUpscale     = option_get_bool  ("win", "dontUpscale"       );
+  g_params.intUpscale      = option_get_bool  ("win", "intUpscale"        );
+  g_params.shrinkOnUpscale = option_get_bool  ("win", "shrinkOnUpscale"   );
+  g_params.borderless      = option_get_bool  ("win", "borderless"        );
+  g_params.fullscreen      = option_get_bool  ("win", "fullScreen"        );
+  g_params.maximize        = option_get_bool  ("win", "maximize"          );
+  g_params.fpsMin          = option_get_int   ("win", "fpsMin"            );
+  g_params.ignoreQuit      = option_get_bool  ("win", "ignoreQuit"        );
+  g_params.noScreensaver   = option_get_bool  ("win", "noScreensaver"     );
+  g_params.autoScreensaver = option_get_bool  ("win", "autoScreensaver"   );
+  g_params.showAlerts      = option_get_bool  ("win", "alerts"            );
+  g_params.quickSplash     = option_get_bool  ("win", "quickSplash"       );
+  g_params.overlayDim      = option_get_bool  ("win", "overlayDimsDesktop");
+  g_params.uiFont          = option_get_string("win", "uiFont"            );
+  g_params.uiSize          = option_get_int   ("win", "uiSize"            );
+  g_params.jitRender       = option_get_bool  ("win", "jitRender"         );
 
   if (g_params.noScreensaver && g_params.autoScreensaver)
   {
@@ -602,13 +680,14 @@ bool config_load(int argc, char * argv[])
 
   g_params.minimizeOnFocusLoss = option_get_bool("win", "minimizeOnFocusLoss");
 
-  if (option_get_bool("spice", "enable"))
+  if ((g_params.useSpice = option_get_bool("spice", "enable")))
   {
     g_params.spiceHost         = option_get_string("spice", "host");
     g_params.spicePort         = option_get_int   ("spice", "port");
 
     g_params.useSpiceInput     = option_get_bool("spice", "input"    );
     g_params.useSpiceClipboard = option_get_bool("spice", "clipboard");
+    g_params.useSpiceAudio     = option_get_bool("spice", "audio"    );
 
     if (g_params.useSpiceClipboard)
     {
@@ -628,6 +707,10 @@ bool config_load(int argc, char * argv[])
     g_params.showCursorDot    = option_get_bool("spice", "showCursorDot");
   }
 
+  g_params.audioPeriodSize = option_get_int("audio", "periodSize");
+  g_params.audioBufferLatency = option_get_int("audio", "bufferLatency");
+  g_params.micShowIndicator   = option_get_bool("audio", "micShowIndicator");
+
   return true;
 }
 
@@ -642,7 +725,7 @@ static void doLicense(void)
     // BEGIN LICENSE BLOCK
     "\n"
     "Looking Glass\n"
-    "Copyright © 2017-2021 The Looking Glass Authors\n"
+    "Copyright © 2017-2022 The Looking Glass Authors\n"
     "https://looking-glass.io\n"
     "\n"
     "This program is free software; you can redistribute it and/or modify it under\n"
@@ -687,6 +770,8 @@ static bool optRendererParse(struct Option * opt, const char * str)
 static StringList optRendererValues(struct Option * opt)
 {
   StringList sl = stringlist_new(false);
+  if (!sl)
+    return NULL;
 
   // this typecast is safe as the stringlist doesn't own the values
   for(unsigned int i = 0; i < LG_RENDERER_COUNT; ++i)
@@ -729,6 +814,9 @@ static bool optPosParse(struct Option * opt, const char * str)
 static StringList optPosValues(struct Option * opt)
 {
   StringList sl = stringlist_new(false);
+  if (!sl)
+    return NULL;
+
   stringlist_push(sl, "center");
   stringlist_push(sl, "<left>x<top>, e.g. 100x100");
   return sl;
@@ -741,6 +829,11 @@ static char * optPosToString(struct Option * opt)
 
   int len = snprintf(NULL, 0, "%dx%d", g_params.x, g_params.y);
   char * str = malloc(len + 1);
+  if (!str)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
   sprintf(str, "%dx%d", g_params.x, g_params.y);
 
   return str;
@@ -764,6 +857,9 @@ static bool optSizeParse(struct Option * opt, const char * str)
 static StringList optSizeValues(struct Option * opt)
 {
   StringList sl = stringlist_new(false);
+  if (!sl)
+    return NULL;
+
   stringlist_push(sl, "<left>x<top>, e.g. 100x100");
   return sl;
 }
@@ -772,9 +868,28 @@ static char * optSizeToString(struct Option * opt)
 {
   int len = snprintf(NULL, 0, "%ux%u", g_params.w, g_params.h);
   char * str = malloc(len + 1);
+  if (!str)
+  {
+    DEBUG_ERROR("out of memory");
+    return NULL;
+  }
   sprintf(str, "%ux%u", g_params.w, g_params.h);
 
   return str;
+}
+
+static StringList optScancodeValues(struct Option * opt)
+{
+  StringList sl = stringlist_new(false);
+  if (!sl)
+    return NULL;
+
+  // this typecast is safe as the stringlist doesn't own the values
+  for(unsigned int i = 0; i < KEY_MAX; ++i)
+    if (linux_to_str[i])
+      stringlist_push(sl, (char *)linux_to_str[i]);
+
+  return sl;
 }
 
 static bool optScancodeValidate(struct Option * opt, const char ** error)
@@ -784,6 +899,29 @@ static bool optScancodeValidate(struct Option * opt, const char ** error)
 
   *error = "Out of range";
   return false;
+}
+
+static bool optScancodeParse(struct Option * opt, const char * str)
+{
+  for(unsigned int i = 0; i < KEY_MAX; ++i)
+  {
+    if (!linux_to_str[i])
+      continue;
+
+    if (strcasecmp(linux_to_str[i], str) == 0)
+    {
+      opt->value.x_int = i;
+      return true;
+    }
+  }
+
+  // fallback for pre-keycode name support
+  char * end;
+  opt->value.x_int = strtol(str, &end, 10);
+  if (*end)
+    return false;
+
+  return true;
 }
 
 static char * optScancodeToString(struct Option * opt)
@@ -807,4 +945,48 @@ static bool optRotateValidate(struct Option * opt, const char ** error)
 
   *error = "Rotation angle must be one of 0, 90, 180 or 270";
   return false;
+}
+
+static bool optMicDefaultParse(struct Option * opt, const char * str)
+{
+  if (!str)
+    return false;
+
+  if (strcasecmp(str, "prompt") == 0)
+    g_params.micDefaultState = MIC_DEFAULT_PROMPT;
+  else if (strcasecmp(str, "allow") == 0)
+    g_params.micDefaultState = MIC_DEFAULT_ALLOW;
+  else if (strcasecmp(str, "deny") == 0)
+    g_params.micDefaultState = MIC_DEFAULT_DENY;
+  else
+    return false;
+
+  return true;
+}
+
+static StringList optMicDefaultValues(struct Option * opt)
+{
+  StringList sl = stringlist_new(false);
+  if (!sl)
+    return NULL;
+
+  stringlist_push(sl, (char *)"prompt");
+  stringlist_push(sl, (char *)"allow");
+  stringlist_push(sl, (char *)"deny");
+  return sl;
+}
+
+static char * optMicDefaultToString(struct Option * opt)
+{
+  switch (g_params.micDefaultState)
+  {
+    case MIC_DEFAULT_PROMPT:
+      return strdup("prompt");
+    case MIC_DEFAULT_ALLOW:
+      return strdup("allow");
+    case MIC_DEFAULT_DENY:
+      return strdup("deny");
+  }
+
+  return NULL;
 }

@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -48,10 +48,11 @@ enum DiffMapBlockSize
   DIFFMAP_BLOCKSIZE_64X64
 };
 
-bool NvFBCInit();
-void NvFBCFree();
+bool NvFBCInit(void);
+void NvFBCFree(void);
 
 bool NvFBCToSysCreate(
+  int            adapterIndex,
   void         * privData,
   unsigned int   privDataSize,
   NvFBCHandle  * handle,
@@ -87,6 +88,7 @@ CaptureResult NvFBCToSysCapture(
   const unsigned int   y,
   const unsigned int   width,
   const unsigned int   height,
+  bool                 scale,
   NvFBCFrameGrabInfo * grabInfo
 );
 

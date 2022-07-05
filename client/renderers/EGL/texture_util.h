@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -35,7 +35,7 @@ typedef struct EGL_TexFormat
   unsigned int fourcc;
   size_t       bufferSize;
 
-  size_t       width, height;
+  size_t       width , height;
   size_t       stride, pitch;
 }
 EGL_TexFormat;

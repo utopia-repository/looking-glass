@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -38,13 +38,14 @@ typedef struct TexFB
 }
 TexFB;
 
-static bool egl_texFBInit(EGL_Texture ** texture, EGLDisplay * display)
+static bool egl_texFBInit(EGL_Texture ** texture, EGL_TexType type,
+    EGLDisplay * display)
 {
   TexFB * this = calloc(1, sizeof(*this));
   *texture = &this->base.base;
 
   EGL_Texture * parent = &this->base.base;
-  if (!egl_texBufferStreamInit(&parent, display))
+  if (!egl_texBufferStreamInit(&parent, type, display))
   {
     free(this);
     *texture = NULL;

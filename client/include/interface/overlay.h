@@ -1,6 +1,6 @@
 /**
  * Looking Glass
- * Copyright © 2017-2021 The Looking Glass Authors
+ * Copyright © 2017-2022 The Looking Glass Authors
  * https://looking-glass.io
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -25,6 +25,8 @@
 
 #include "common/types.h"
 
+#define TICK_RATE 25
+
 struct LG_OverlayOps
 {
   /* internal name of the overlay for debugging */
@@ -43,6 +45,10 @@ struct LG_OverlayOps
    * optional, if omitted assumes false */
   bool (*needs_render)(void * udata, bool interactive);
 
+  /* return true if the overlay currently requires overlay mode
+   * optional, if omitted assumes false */
+  bool (*needs_overlay)(void * udata);
+
   /* perform the actual drawing/rendering
    *
    * `interactive` is true if the application is currently in overlay interaction
@@ -58,6 +64,15 @@ struct LG_OverlayOps
    */
   int (*render)(void * udata, bool interactive, struct Rect * windowRects,
       int maxRects);
+
+  /* called TICK_RATE times a second by the application
+   *
+   * Note: This may not run in the same context as `render`!
+   *
+   * return true if the frame needs to be rendered
+   * optional, if omitted assumes false
+   */
+  bool (*tick)(void * udata, unsigned long long tickCount);
 
   /* TODO: add load/save settings capabillity */
 };
