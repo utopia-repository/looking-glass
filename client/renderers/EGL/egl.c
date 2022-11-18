@@ -119,6 +119,7 @@ struct Inst
   GraphHandle importGraph;
 
   bool showSpice;
+  int  spiceWidth, spiceHeight;
 };
 
 static struct Option egl_options[] =
@@ -324,6 +325,17 @@ static void egl_onRestart(LG_Renderer * renderer)
 
 static void egl_calc_mouse_size(struct Inst * this)
 {
+  if (this->showSpice)
+  {
+    this->mouseScaleX = 2.0f / this->spiceWidth;
+    this->mouseScaleY = 2.0f / this->spiceHeight;
+    egl_cursorSetSize(this->cursor,
+      (this->mouseWidth  * (1.0f / this->spiceWidth )) * this->scaleX,
+      (this->mouseHeight * (1.0f / this->spiceHeight)) * this->scaleY
+    );
+    return;
+  }
+
   if (!this->formatValid)
     return;
 
@@ -373,6 +385,19 @@ static void egl_calc_mouse_size(struct Inst * this)
 
 static void egl_calc_mouse_state(struct Inst * this)
 {
+  if (this->showSpice)
+  {
+    egl_cursorSetState(
+      this->cursor,
+      this->cursorVisible,
+      (((float)this->cursorX  * this->mouseScaleX) - 1.0f) * this->scaleX,
+      (((float)this->cursorY  * this->mouseScaleY) - 1.0f) * this->scaleY,
+      ((float)this->cursorHX * this->mouseScaleX) * this->scaleX,
+      ((float)this->cursorHY * this->mouseScaleY) * this->scaleY
+    );
+    return;
+  }
+
   if (!this->formatValid)
     return;
 
@@ -455,8 +480,8 @@ static void egl_onResize(LG_Renderer * renderer, const int width, const int heig
 
   if (destRect.valid)
   {
-    this->translateX     = 1.0f - (((this->destRect.w / 2) + this->destRect.x) * 2) / (float)this->width;
-    this->translateY     = 1.0f - (((this->destRect.h / 2) + this->destRect.y) * 2) / (float)this->height;
+    this->translateX     = -1.0f + (((this->destRect.w / 2) + this->destRect.x) * 2) / (float)this->width;
+    this->translateY     =  1.0f - (((this->destRect.h / 2) + this->destRect.y) * 2) / (float)this->height;
     this->scaleX         = (float)this->destRect.w / (float)this->width;
     this->scaleY         = (float)this->destRect.h / (float)this->height;
     this->viewportWidth  = this->destRect.w;
@@ -962,21 +987,26 @@ inline static void renderLetterBox(struct Inst * this)
 
     if (hLB)
     {
-      glScissor(0.0f, 0.0f, this->destRect.x + 0.5f, this->height + 0.5f);
+      // left
+      glScissor(0, 0, this->destRect.x, this->height);
       glClear(GL_COLOR_BUFFER_BIT);
 
+      // right
       float x2 = this->destRect.x + this->destRect.w;
-      glScissor(x2 - 0.5f, 0.0f, this->width - x2 + 1.0f, this->height + 1.0f);
+      glScissor(x2, 0, this->width - x2, this->height);
       glClear(GL_COLOR_BUFFER_BIT);
     }
 
     if (vLB)
     {
-      glScissor(0.0f, 0.0f, this->width + 0.5f, this->destRect.y + 0.5f);
+      // top
+      glScissor(0, this->height - this->destRect.y,
+          this->width, this->destRect.y);
       glClear(GL_COLOR_BUFFER_BIT);
 
-      float y2 = this->destRect.y + this->destRect.h;
-      glScissor(0.0f, y2 - 0.5f, this->width + 1.0f, this->height - y2 + 1.0f);
+      // bottom
+      int y2 = this->destRect.y + this->destRect.h;
+      glScissor(0, 0, this->width, this->height - y2);
       glClear(GL_COLOR_BUFFER_BIT);
     }
 
@@ -1075,10 +1105,9 @@ static bool egl_render(LG_Renderer * renderer, LG_RendererRotate rotate,
         this->scaleX    , this->scaleY    ,
         this->scaleType , rotate, renderAll ? NULL : accumulated))
     {
-      if (!this->showSpice)
-        cursorState = egl_cursorRender(this->cursor,
-            (this->format.rotate + rotate) % LG_ROTATE_MAX,
-            this->width, this->height);
+      cursorState = egl_cursorRender(this->cursor,
+          (this->format.rotate + rotate) % LG_ROTATE_MAX,
+          this->width, this->height);
     }
     else
       hasOverlay = true;
@@ -1189,6 +1218,8 @@ static void egl_freeTexture(LG_Renderer * renderer, void * texture)
 static void egl_spiceConfigure(LG_Renderer * renderer, int width, int height)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
+  this->spiceWidth   = width;
+  this->spiceHeight  = height;
   egl_desktopSpiceConfigure(this->desktop, width, height);
 }
 
@@ -1211,6 +1242,7 @@ static void egl_spiceShow(LG_Renderer * renderer, bool show)
 {
   struct Inst * this = UPCAST(struct Inst, renderer);
   this->showSpice = show;
+  egl_calc_mouse_size(this);
   egl_desktopSpiceShow(this->desktop, show);
 }
 
