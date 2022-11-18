@@ -15,8 +15,11 @@ Build-Depends: cmake,
                libsamplerate0-dev,
                libsdl2-dev,
                libsdl2-ttf-dev,
+               libspa-0.2-dev,
                libspice-protocol-dev,
                libx11-dev,
+               libxcb-shm0-dev,
+               libxcb-xfixes0-dev,
                nettle-dev,
                libxpresent-dev,
                wayland-protocols
@@ -38,6 +41,17 @@ Description: Low latency KVM FrameRelay implementation for VGA Passthrough
  A LookingGlass Host implementation is required to run on the guest virtual
  machine. It is recommended that the client and host versions match. See the
  README.Debian for more information.
+
+Package: looking-glass-host
+Architecture: amd64
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: Low latency KVM FrameRelay implementation for VGA Passthrough (host)
+ LookingGlass enables you to use shared memory to pass rendered frames from a
+ virtual machine back to the host system.
+ .
+ This package provides the LookingGlass Host server for Linux, which supports X11
+ (XCB) and Pipewire as backends.
 
 Package: obs-plugin-looking-glass
 Architecture: amd64

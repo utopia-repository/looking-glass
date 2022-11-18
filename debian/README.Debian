@@ -2,7 +2,6 @@ Looking Glass Documentation
 ===========================
 
 ### Client
-This package currently only supplies the client part of Looking Glass.
 The client requires some manual changes to the configuration of libvirt to work with your virtual machine.
 
 1. Configuration
