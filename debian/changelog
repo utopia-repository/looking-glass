@@ -1,9 +1,9 @@
-looking-glass (0+b6~rc1-0utopia1) UNRELEASED; urgency=medium
+looking-glass (0+b6~rc1-0utopia1) unstable; urgency=medium
 
   * New upstream release candidate.
   * Update d/control fields to point to Utopia Repository sources
 
- -- James Lu <james@overdrivenetworks.com>  Thu, 17 Nov 2022 22:29:07 -0800
+ -- James Lu <james@overdrivenetworks.com>  Thu, 17 Nov 2022 22:55:09 -0800
 
 looking-glass (0+b5.git408~e98913f1-0utopia1) unstable; urgency=medium
 
