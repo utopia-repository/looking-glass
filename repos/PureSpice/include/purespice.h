@@ -66,6 +66,7 @@ typedef enum PSChannelType
   PS_CHANNEL_PLAYBACK,
   PS_CHANNEL_RECORD,
   PS_CHANNEL_DISPLAY,
+  PS_CHANNEL_CURSOR,
 
   PS_CHANNEL_MAX
 }
@@ -247,6 +248,32 @@ typedef struct PSConfig
         uint32_t color);
   }
   display;
+
+  struct
+  {
+    /* enable the cursor channel if available */
+    bool enable;
+
+    /* automatically connect to the channel as soon as it's available */
+    bool autoConnect;
+
+    /* called to indicate the cursor image has changed to an RGBA bitmap
+     * with hotspot at (hx, hy) */
+    void (*setRGBAImage)(int width, int height, int hx, int hy,
+      const void * data);
+
+    /* called to indicate the cursor image has changed to an monochrome bitmap
+     * with hotspot at (hx, hy) */
+    void (*setMonoImage)(int width, int height, int hx, int hy,
+      const void * xorMask, const void * andMask);
+
+    /* called to indicate that the mouse position is set as follows */
+    void (*setState)(bool visible, int x, int y);
+
+    /* called to indicate that the mouse trail is set as follows (optional) */
+    void (*setTrail)(int length, int frequency);
+  }
+  cursor;
 }
 PSConfig;
 

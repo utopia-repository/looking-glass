@@ -350,6 +350,21 @@ static bool x11Init(const LG_DSInitParams params)
   // check for Extended Window Manager Hints support
   x11CheckEWMHSupport();
 
+  if (x11atoms._NET_WM_PID)
+  {
+    pid_t pid = getpid();
+    XChangeProperty(
+      x11.display,
+      x11.window,
+      x11atoms._NET_WM_PID,
+      XA_CARDINAL,
+      32,
+      PropModeReplace,
+      (unsigned char *)&pid,
+      1
+    );
+  }
+
   if (params.borderless)
   {
     if (x11atoms._MOTIF_WM_HINTS)
@@ -1922,6 +1937,7 @@ static void x11Minimize(void)
 
 struct LG_DisplayServerOps LGDS_X11 =
 {
+  .name               = "X11",
   .setup              = x11Setup,
   .probe              = x11Probe,
   .earlyInit          = x11EarlyInit,

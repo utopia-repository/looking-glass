@@ -10,8 +10,9 @@ systems for legacy programs that require high-performance graphics.
 .. toctree::
    :maxdepth: 2
 
-   usage
+   requirements
    install
+   usage
    build
    troubleshooting
    obs

@@ -1,18 +1,18 @@
 .. _kernel_module:
 
-Kernel Module
+Kernel module
 #############
 
 This kernel module implements a basic interface to the IVSHMEM device
-for Looking Glass in VM->VM mode.
+for Looking Glass in VM → VM mode.
 
-Additionally in VM->host mode, it can be used to generate a shared
+Additionally in VM → host mode, it can be used to generate a shared
 memory device on the host machine that supports dmabuf.
 
 Prerequisites
 -------------
 
-The linux kernel headers for your kernel version are required for building.
+The Linux kernel headers for your kernel version are required for building.
 Install them with ``apt-get``
 
 .. code:: bash
@@ -27,7 +27,7 @@ Then switch to the ``module/`` directory
 
 .. _module_dkms:
 
-Using DKMS (Recommended)
+Using DKMS (recommended)
 ------------------------
 
 You can use the kernel's DKMS feature to keep the module across upgrades.
@@ -53,11 +53,11 @@ To install the module into DKMS, run
 Loading
 ~~~~~~~
 
-For VM->VM, simply modprobe the module::
+For VM → VM, simply ``modprobe`` the module::
 
    modprobe kvmfr
 
-For VM->host with dmabuf, modprobe with the parameter
+For VM → host with dmabuf, ``modprobe`` with the parameter
 ``static_size_mb``:
 
 .. code:: bash
@@ -70,7 +70,7 @@ with commas.
 
 .. _module_manual:
 
-Compiling & Loading (Manual)
+Compiling & loading (manual)
 ----------------------------
 
 To compile the module manually, run ``make`` in the module directory.
@@ -80,15 +80,15 @@ To compile the module manually, run ``make`` in the module directory.
 Loading
 ~~~~~~~
 
-For VM->VM mode, run:
+For VM → VM mode, run:
 
 .. code:: bash
 
    insmod kvmfr.ko
 
-For VM->host mode with dmabuf, instead of creating a shared memory file,
+For VM → host mode with dmabuf, instead of creating a shared memory file,
 load this module with the parameter ``static_size_mb``. For example, a
-32 MB shared memory device can be created with:
+32 MiB shared memory device can be created with:
 
 .. code:: bash
 
@@ -96,7 +96,7 @@ load this module with the parameter ``static_size_mb``. For example, a
 
 Multiple devices can be created by separating the sizes with commas. For
 example, ``static_size_mb=128,64`` would create two kvmfr devices:
-``kvmfr0`` would be 128 MB and ``kvmfr1`` would be 64 MB.
+``kvmfr0`` would be 128 MB and ``kvmfr1`` would be 64 MiB.
 
 .. note::
 
@@ -145,10 +145,10 @@ You may also use a config file: ``~/.looking-glass-client.ini``, or
 
 .. _module_vm_to_host:
 
-VM->Host
-~~~~~~~~
+VM → Host
+~~~~~~~~~~~~
 
-In VM->host mode, use this device in place of the shared memory file.
+In VM → host mode, use this device in place of the shared memory file.
 
 QEMU
 ^^^^
@@ -166,8 +166,8 @@ Add the following arguments to your ``qemu`` command line::
 libvirt
 ^^^^^^^
 
-Starting with QEMU 6.2 and libvirt 7.9, JSON style QEMU configuration is the 
-default syntax. Users running QEMU 6.2 or later **and** libvirt 7.9 or later, 
+Starting with QEMU 6.2 and libvirt 7.9, JSON style QEMU configuration is the
+default syntax. Users running QEMU 6.2 or later **and** libvirt 7.9 or later,
 should use this XML block to configure their VM for kvmfr:
 
 .. code:: xml
@@ -181,9 +181,9 @@ should use this XML block to configure their VM for kvmfr:
 
 .. note::
 
-   -  The ``"size"`` tag represents the size of the shared memory device in 
+   -  The ``"size"`` tag represents the size of the shared memory device in
       bytes. Once you determine the proper size of the device as per
-      :ref:`Determining Memory <client_determining_memory>`, use the figure you
+      :ref:`Determining Memory <libvirt_determining_memory>`, use the figure you
       got to calculate the size in bytes:
 
      ``size_in_MB x 1024 x 1024 = size_in_bytes``
@@ -202,7 +202,7 @@ legacy syntax for IVSHMEM setup:
 
 .. note::
 
-   -  Using the legacy syntax on QEMU 6.2/libvirt 7.9 may cause QEMU to 
+   -  Using the legacy syntax on QEMU 6.2/libvirt 7.9 may cause QEMU to
       abort with the following error message:
       "``error: internal error: ... PCI: slot 1 function 0 not available for pcie-root-port, in use by ivshmem-plain``"
 
@@ -238,12 +238,12 @@ We can use the ``systemd-modules-load.service(8)`` service for this task.
 Create the file ``/etc/modules-load.d/kvmfr.conf`` with the following
 contents::
 
-   #KVMFR Looking Glass module
+   # KVMFR Looking Glass module
    kvmfr
 
 This will now run the next time you start your machine.
 
-If you are running in VM->host mode, you must additionally create another file
+If you are running in VM → host mode, you must additionally create another file
 ``/etc/modprobe.d/kvmfr.conf`` to properly set the size. It should have the
 following contents::
 
