@@ -1,0 +1,2 @@
+#!/bin/sh
+echo 'module/*' "/usr/src/kvmfr-${KVMFR_PACKAGE_VERSION}"

@@ -2,8 +2,10 @@ looking-glass (0+b6~rc1-0utopia1) unstable; urgency=medium
 
   * New upstream release candidate.
   * Update d/control fields to point to Utopia Repository sources
-  * Add looking-glass-host package for Linux host server
-    - Add B-D: libspa-0.2-dev, libxcb-shm0-dev, libxcb-xfixes0-dev
+  * Add looking-glass-host and looking-glass-kvmfr-dkms packages for Linux host
+    server
+    - Add B-D: dh-sequence-dkms, libspa-0.2-dev, libxcb-shm0-dev,
+      libxcb-xfixes0-dev
 
  -- James Lu <james@overdrivenetworks.com>  Thu, 17 Nov 2022 22:55:09 -0800
 

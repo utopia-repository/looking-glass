@@ -7,6 +7,7 @@ Build-Depends: cmake,
                debhelper (>= 12),
                debhelper-compat (= 12),
                dh-exec (>= 0.3),
+               dh-sequence-dkms,
                fonts-freefont-ttf,
                libfontconfig1-dev,
                libobs-dev,
@@ -15,7 +16,7 @@ Build-Depends: cmake,
                libsamplerate0-dev,
                libsdl2-dev,
                libsdl2-ttf-dev,
-               libspa-0.2-dev,
+               libspa-0.2-dev (>= 0.3.58~),
                libspice-protocol-dev,
                libx11-dev,
                libxcb-shm0-dev,
@@ -46,12 +47,28 @@ Package: looking-glass-host
 Architecture: amd64
 Pre-Depends: ${misc:Pre-Depends}
 Depends: ${misc:Depends}, ${shlibs:Depends}
+Suggests: looking-glass-kvmfr-dkms
 Description: Low latency KVM FrameRelay implementation for VGA Passthrough (host)
  LookingGlass enables you to use shared memory to pass rendered frames from a
  virtual machine back to the host system.
  .
  This package provides the LookingGlass Host server for Linux, which supports X11
- (XCB) and Pipewire as backends.
+ (XCB) and Pipewire as backends. It is only needed when running Linux guests
+ with Looking Glass - otherwise see the looking-glass-client package instead.
+ .
+ Note: The Linux host is NOT officially supported upstream!
+
+Package: looking-glass-kvmfr-dkms
+Architecture: amd64
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${misc:Depends}, dkms
+Description: Looking Glass KVM FrameRelay kernel driver (DKMS)
+ LookingGlass enables you to use shared memory to pass rendered frames from a
+ virtual machine back to the host system.
+ .
+ This package provides the kvmfr kernel driver, for use on Linux hosts. It is
+ only needed when running Linux guests with Looking Glass - otherwise see
+ the looking-glass-client package instead.
 
 Package: obs-plugin-looking-glass
 Architecture: amd64
